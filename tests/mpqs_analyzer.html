@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MPQS Relation Mathematical Analyzer</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --text-main: #f1f5f9;
+            --accent: #38bdf8;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --success: #10b981;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+            line-height: 1.5;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header {
+            display: flex; justify-content: space-between; align-items: center;
+            border-bottom: 2px solid var(--card-bg); padding-bottom: 10px; margin-bottom: 20px;
+        }
+        h1 { margin: 0; color: var(--accent); font-size: 1.5rem; }
+        
+        .upload-zone {
+            background: var(--card-bg); border: 2px dashed #475569; padding: 20px;
+            text-align: center; border-radius: 8px; margin-bottom: 20px; transition: 0.3s;
+        }
+        .upload-zone:hover { border-color: var(--accent); }
+        input[type="file"] { display: none; }
+        
+        .btn {
+            background: var(--accent); color: var(--bg-color); border: none;
+            padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 0.9rem;
+        }
+        .btn:hover { opacity: 0.9; }
+        
+        .tabs {
+            display: flex; gap: 10px; margin-bottom: 20px;
+            border-bottom: 2px solid var(--card-bg); padding-bottom: 10px;
+        }
+        .tab-btn {
+            background: transparent; color: #94a3b8; border: none;
+            padding: 10px 20px; font-size: 1rem; cursor: pointer; font-weight: bold; border-radius: 4px;
+        }
+        .tab-btn:hover { background: var(--card-bg); color: #fff; }
+        .tab-btn.active { background: var(--accent); color: var(--bg-color); }
+        
+        .tab-content { display: none; }
+        
+        .grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px;
+        }
+        .card {
+            background: var(--card-bg); padding: 15px; border-radius: 8px; border-left: 4px solid var(--accent);
+        }
+        .card.error { border-left-color: var(--danger); }
+        .card.warning { border-left-color: var(--warning); }
+        .card h3 { margin: 0 0 10px 0; font-size: 0.9rem; color: #94a3b8; text-transform: uppercase; }
+        .card .value { font-size: 1.4rem; font-weight: bold; font-family: monospace; }
+        
+        .canvas-container {
+            background: var(--bg-color); border: 1px solid #334155; border-radius: 4px;
+            padding: 10px; margin-top: 10px;
+        }
+        
+        .controls-row {
+            display: flex; gap: 15px; align-items: center; background: var(--card-bg);
+            padding: 15px; border-radius: 8px; margin-bottom: 20px; flex-wrap: wrap;
+        }
+        .controls-row label { font-weight: bold; color: #94a3b8; }
+        input[type="number"], select {
+            background: var(--bg-color); color: #fff; border: 1px solid #334155;
+            padding: 6px 10px; border-radius: 4px; outline: none;
+        }
+        
+        table {
+            width: 100%; border-collapse: collapse; background: var(--bg-color);
+            border-radius: 8px; overflow: hidden; margin-top: 10px; font-size: 0.9rem;
+        }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #334155; }
+        th { background: #334155; color: var(--accent); }
+        tr:hover { background: #1e293b; }
+        .corrupt { color: var(--danger); font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>MPQS Relation Analyzer</h1>
+        <div id="status" style="color: #94a3b8;">Select a .bin file to begin analysis</div>
+    </header>
+
+    <div class="upload-zone">
+        <label for="fileInput" class="btn">Load Binary File</label>
+        <input type="file" id="fileInput" accept=".bin">
+        <span id="fileNameDisplay" style="margin-left: 15px; color: #94a3b8;">No file loaded</span>
+    </div>
+
+    <div id="results-container" style="display: none;">
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('overview')">Statistics & Histograms</button>
+            <button class="tab-btn" onclick="switchTab('explorer')">Relation Explorer</button>
+        </div>
+
+        <!-- TAB: OVERVIEW -->
+        <div id="tab-overview" class="tab-content" style="display: block;">
+            <div class="grid">
+                <div class="card"><h3>Total Relations</h3><div class="value" id="stat-total">--</div></div>
+                <div class="card"><h3>Min Factors</h3><div class="value" id="stat-min">--</div></div>
+                <div class="card"><h3>Avg Factors</h3><div class="value" id="stat-avg">--</div></div>
+                <div class="card"><h3>Max Factors</h3><div class="value" id="stat-max">--</div></div>
+                <div class="card"><h3>Largest P_Index</h3><div class="value" id="stat-largest-prime">--</div></div>
+                <div class="card error"><h3>Corrupt (>64 factors)</h3><div class="value" id="stat-corrupt">--</div></div>
+            </div>
+
+            <div class="card" style="border-left-color: #8b5cf6;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h3>Factor Base Occurrences</h3>
+                    <div>
+                        <label>Limit P_Index:</label>
+                        <input type="number" id="fb-limit" onchange="renderHistograms()">
+                    </div>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="canvas-fb" width="1000" height="250" style="width: 100%;"></canvas>
+                </div>
+                <p style="font-size: 0.8rem; color: #94a3b8; margin: 5px 0 0 0;">X-Axis: Prime Index (p_index) | Y-Axis: Number of Relations containing this prime</p>
+            </div>
+
+            <div class="card" style="border-left-color: #10b981;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h3>Maximal Exponents</h3>
+                    <div>
+                        <label>Limit to first N primes:</label>
+                        <input type="number" id="exp-limit" value="100" onchange="renderHistograms()">
+                    </div>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="canvas-exp" width="1000" height="250" style="width: 100%;"></canvas>
+                </div>
+                <p style="font-size: 0.8rem; color: #94a3b8; margin: 5px 0 0 0;">X-Axis: Prime Index (p_index) | Y-Axis: Maximum Exponent found across all relations</p>
+            </div>
+        </div>
+
+        <!-- TAB: EXPLORER -->
+        <div id="tab-explorer" class="tab-content">
+            <div class="controls-row">
+                <div>
+                    <label>Sort By:</label>
+                    <select id="sort-mode">
+                        <option value="chrono">Chronological (File Order)</option>
+                        <option value="length">Length (Number of Factors)</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Filter by Prime Index:</label>
+                    <input type="number" id="filter-prime" placeholder="e.g. 5">
+                </div>
+                <button class="btn" onclick="updateExplorerView()">Apply Sort & Filter</button>
+            </div>
+
+            <div class="controls-row" id="explorer-pagination" style="display: none; justify-content: center;">
+                <button class="btn" onclick="expPrev()">« Prev</button>
+                <div style="font-weight: bold; font-family: monospace; width: 250px; text-align: center;">
+                    Relation <input type="number" id="jump-idx" style="width: 80px; text-align: center;" onchange="jumpToViewIdx(this.value)"> of <span id="page-total"></span>
+                </div>
+                <button class="btn" onclick="expNext()">Next »</button>
+            </div>
+
+            <div id="explorer-content">
+                <!-- Relation details rendered here -->
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.getElementById('fileInput').addEventListener('change', handleFile);
+
+    let globalBuffer = null;
+    let structSize = 0;
+    let relationCount = 0;
+    
+    // Arrays for stats & sorting
+    let relLengths = null;
+    let fbOccurrences = null;
+    let maxExponents = null;
+    
+    // Explorer state
+    let currentView = new Uint32Array(0);
+    let currentViewIdx = 0;
+
+    function switchTab(tabId) {
+        document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+        
+        document.getElementById('tab-' + tabId).style.display = 'block';
+        event.currentTarget.classList.add('active');
+        
+        if (tabId === 'overview') renderHistograms();
+        if (tabId === 'explorer' && currentView.length === 0 && relationCount > 0) updateExplorerView();
+    }
+
+    function handleFile(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        document.getElementById('fileNameDisplay').textContent = `${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
+        document.getElementById('status').textContent = "Processing binary data...";
+        
+        const reader = new FileReader();
+        reader.onload = e => parseBinary(e.target.result);
+        reader.readAsArrayBuffer(file);
+    }
+
+    function parseBinary(buffer) {
+        globalBuffer = buffer;
+        const dv = new DataView(buffer);
+        if (buffer.byteLength < 32) { alert("File too small."); return; }
+        
+        relationCount = Number(dv.getBigUint64(12, true));
+        structSize = dv.getUint32(20, true);
+        
+        let minFactors = Infinity, maxFactors = 0, sumFactors = 0;
+        let corruptCount = 0, suspectCount = 0, max_p_index = 0;
+        
+        // Pass 1: Find limits
+        for (let i = 0; i < relationCount; i++) {
+            const offset = 32 + i * structSize;
+            if (offset + structSize > buffer.byteLength) break;
+            
+            const num_factors = dv.getUint32(offset + 152, true);
+            if (num_factors > 64) { corruptCount++; continue; }
+            
+            for (let j = 0; j < num_factors; j++) {
+                const p_idx = dv.getUint32(offset + 156 + j * 8, true);
+                if (p_idx > max_p_index && p_idx < 100000000) max_p_index = p_idx;
+            }
+        }
+        
+        // Allocate
+        fbOccurrences = new Uint32Array(max_p_index + 1);
+        maxExponents = new Uint8Array(max_p_index + 1);
+        relLengths = new Uint32Array(relationCount);
+        
+        let validRels = 0;
+        
+        // Pass 2: Populate
+        for (let i = 0; i < relationCount; i++) {
+            const offset = 32 + i * structSize;
+            if (offset + structSize > buffer.byteLength) break;
+            
+            const num_factors = dv.getUint32(offset + 152, true);
+            relLengths[i] = num_factors;
+            if (num_factors > 64) continue;
+            
+            validRels++;
+            if (num_factors < minFactors) minFactors = num_factors;
+            if (num_factors > maxFactors) maxFactors = num_factors;
+            sumFactors += num_factors;
+            
+            for (let j = 0; j < num_factors; j++) {
+                const p_idx = dv.getUint32(offset + 156 + j * 8, true);
+                const count = dv.getUint8(offset + 156 + j * 8 + 4);
+                if (p_idx <= max_p_index) {
+                    fbOccurrences[p_idx]++;
+                    if (count > maxExponents[p_idx]) maxExponents[p_idx] = count;
+                }
+            }
+        }
+        
+        // Update UI
+        document.getElementById('stat-total').textContent = relationCount;
+        document.getElementById('stat-min').textContent = minFactors === Infinity ? 0 : minFactors;
+        document.getElementById('stat-avg').textContent = validRels > 0 ? (sumFactors / validRels).toFixed(2) : 0;
+        document.getElementById('stat-max').textContent = maxFactors;
+        document.getElementById('stat-largest-prime').textContent = max_p_index;
+        document.getElementById('stat-corrupt').textContent = corruptCount;
+        
+        document.getElementById('fb-limit').value = max_p_index;
+        document.getElementById('results-container').style.display = 'block';
+        document.getElementById('status').textContent = "Analysis Complete";
+        
+        renderHistograms();
+        updateExplorerView();
+    }
+
+    function renderHistograms() {
+        if (!fbOccurrences) return;
+        const fbLimit = parseInt(document.getElementById('fb-limit').value) || fbOccurrences.length;
+        drawHistogram('canvas-fb', fbOccurrences, fbLimit, false);
+        
+        const expLimit = parseInt(document.getElementById('exp-limit').value) || 100;
+        drawHistogram('canvas-exp', maxExponents, expLimit, true);
+    }
+
+    function drawHistogram(canvasId, dataArray, limit, isAvgBucket) {
+        const canvas = document.getElementById(canvasId);
+        const ctx = canvas.getContext('2d');
+        const w = canvas.width, h = canvas.height;
+        ctx.clearRect(0, 0, w, h);
+        
+        if (!dataArray || limit <= 0) return;
+        limit = Math.min(limit, dataArray.length);
+        
+        const graphH = h - 25;
+        let maxVal = 0;
+        let buckets = [];
+        
+        if (limit <= w) {
+            for (let i = 0; i < limit; i++) {
+                buckets.push(dataArray[i] || 0);
+                if (dataArray[i] > maxVal) maxVal = dataArray[i];
+            }
+        } else {
+            const bucketSize = limit / w;
+            buckets = new Array(w).fill(0);
+            for (let i = 0; i < limit; i++) {
+                const b = Math.floor(i / bucketSize);
+                if (b < w) {
+                    if (isAvgBucket) buckets[b] = Math.max(buckets[b], dataArray[i] || 0);
+                    else buckets[b] += (dataArray[i] || 0);
+                }
+            }
+            for (let i = 0; i < w; i++) if (buckets[i] > maxVal) maxVal = buckets[i];
+        }
+        
+        // Draw Labels
+        ctx.fillStyle = '#94a3b8'; ctx.font = '12px sans-serif';
+        ctx.fillText('0', 5, h - 5);
+        ctx.fillText('P_Idx: ' + limit.toString(), w - 80, h - 5);
+        if (maxVal > 0) ctx.fillText('Max: ' + maxVal.toString(), 5, 12);
+        
+        if (maxVal === 0) return;
+        
+        // Draw Bars
+        ctx.fillStyle = canvasId === 'canvas-fb' ? '#8b5cf6' : '#10b981';
+        const barW = w / buckets.length;
+        for (let i = 0; i < buckets.length; i++) {
+            if (buckets[i] > 0) {
+                const barH = (buckets[i] / maxVal) * (graphH - 15);
+                ctx.fillRect(i * barW, graphH - barH, Math.max(1, barW - 0.5), barH);
+            }
+        }
+    }
+
+    // --- Explorer Logic ---
+
+    function containsPrime(rel_idx, targetPrime) {
+        const dv = new DataView(globalBuffer);
+        const offset = 32 + rel_idx * structSize;
+        if (offset + structSize > globalBuffer.byteLength) return false;
+        const num_factors = dv.getUint32(offset + 152, true);
+        if (num_factors > 64) return false;
+        for (let j = 0; j < num_factors; j++) {
+            if (dv.getUint32(offset + 156 + j * 8, true) === targetPrime) return true;
+        }
+        return false;
+    }
+
+    function updateExplorerView() {
+        const fVal = document.getElementById('filter-prime').value;
+        const fPrime = fVal.trim() === '' ? null : parseInt(fVal);
+        const sMode = document.getElementById('sort-mode').value;
+        
+        let view = [];
+        for (let i = 0; i < relationCount; i++) {
+            if (fPrime !== null) {
+                if (containsPrime(i, fPrime)) view.push(i);
+            } else { view.push(i); }
+        }
+        
+        if (sMode === 'length') {
+            view.sort((a, b) => relLengths[a] - relLengths[b]);
+        }
+        
+        currentView = new Uint32Array(view);
+        currentViewIdx = 0;
+        renderCurrentRelation();
+    }
+
+    function jumpToViewIdx(val) {
+        let idx = parseInt(val) - 1;
+        if (isNaN(idx)) return;
+        if (idx < 0) idx = 0;
+        if (idx >= currentView.length) idx = currentView.length - 1;
+        currentViewIdx = idx;
+        renderCurrentRelation();
+    }
+
+    function expPrev() { if (currentViewIdx > 0) { currentViewIdx--; renderCurrentRelation(); } }
+    function expNext() { if (currentViewIdx < currentView.length - 1) { currentViewIdx++; renderCurrentRelation(); } }
+
+    function renderCurrentRelation() {
+        if (currentView.length === 0) {
+            document.getElementById('explorer-content').innerHTML = "<p>No relations found.</p>";
+            document.getElementById('explorer-pagination').style.display = 'none';
+            return;
+        }
+        
+        document.getElementById('explorer-pagination').style.display = 'flex';
+        document.getElementById('jump-idx').value = currentViewIdx + 1;
+        document.getElementById('page-total').textContent = currentView.length;
+        
+        const rel_idx = currentView[currentViewIdx];
+        const dv = new DataView(globalBuffer);
+        const offset = 32 + rel_idx * structSize;
+        
+        const g_index = dv.getBigUint64(offset, true);
+        const sign = dv.getInt8(offset + 144);
+        const v2 = dv.getUint32(offset + 148, true);
+        const nf = dv.getUint32(offset + 152, true);
+        const isErr = nf > 64;
+        
+        let html = `
+            <div class="card">
+                <h3 style="color:var(--accent)">Relation Original Index: ${rel_idx}</h3>
+                <div class="grid" style="grid-template-columns: 1fr 1fr 1fr 1fr; margin-bottom: 0;">
+                    <div><strong>Rel ID:</strong> ${g_index}</div>
+                    <div><strong>Length:</strong> ${nf} ${isErr ? '<span class="corrupt">[ERR]</span>' : ''}</div>
+                    <div><strong>Sign of Q:</strong> ${sign}</div>
+                    <div><strong>Val 2 Exp:</strong> ${v2}</div>
+                </div>
+            </div>
+            <div class="card">
+                <h3>Factors (P_Index : Exponent)</h3>`;
+        
+        if (!isErr && nf > 0) {
+            html += `<table><thead><tr><th>Factor Base Index (p_index)</th><th>Exponent (count)</th></tr></thead><tbody>`;
+            for (let j = 0; j < nf; j++) {
+                const p = dv.getUint32(offset + 156 + j * 8, true);
+                const c = dv.getUint8(offset + 156 + j * 8 + 4);
+                html += `<tr><td>${p}</td><td>${c}</td></tr>`;
+            }
+            html += `</tbody></table>`;
+        } else if (isErr) {
+            html += `<p class="corrupt">Data corrupted (length > 64). Cannot render factors safely.</p>`;
+        } else {
+            html += `<p>No prime factors (only sign/2).</p>`;
+        }
+        
+        html += `</div>`;
+        document.getElementById('explorer-content').innerHTML = html;
+    }
+</script>
+
+</body>
+</html>

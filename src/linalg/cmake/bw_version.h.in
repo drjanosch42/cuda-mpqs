@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// This file is part of the Block Wiedemann implementation.
+// Auto-generated from cmake/bw_version.h.in — do not edit the generated copy.
+#pragma once
+#include <string>
+
+#define LINALGBW_VERSION_MAJOR  @LINALGBW_VERSION_MAJOR@
+#define LINALGBW_VERSION_MINOR  @LINALGBW_VERSION_MINOR@
+#define LINALGBW_VERSION_PATCH  @LINALGBW_VERSION_PATCH@
+#define LINALGBW_VERSION_STRING "@LINALGBW_VERSION@"
+#define LINALGBW_GIT_HASH       "@LINALGBW_GIT_HASH@"
+
+namespace lingen {
+
+inline std::string version_string() {
+    return std::string(LINALGBW_VERSION_STRING) + " (git " + LINALGBW_GIT_HASH + ")";
+}
+
+std::string version_banner();
+
+}  // namespace lingen

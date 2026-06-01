@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "cuda-mpqs: A GPU-accelerated Self-Initializing Multiple Polynomial Quadratic Sieve"
+abstract: >-
+  cuda-mpqs is a high-performance GPU implementation of the Self-Initializing
+  Multiple Polynomial Quadratic Sieve (SIQS/MPQS) for integer factorization.
+  It factors composite integers up to 512 bits end-to-end on a single GPU or
+  across a small cluster of GPUs, combining a fully on-device sieve with a
+  packed sparse GF(2) preprocessor and a Block Wiedemann linear algebra solver.
+authors:
+  - family-names: Heinrichs
+    given-names: Christoph
+  - family-names: Januszewski
+    given-names: Fabian
+version: "1.0.0"
+date-released: "2026-06-01"
+license: LGPL-3.0-only
+repository-code: "https://github.com/drjanosch42/cuda-mpqs"
+url: "https://github.com/drjanosch42/cuda-mpqs"
+keywords:
+  - integer-factorization
+  - quadratic-sieve
+  - GPU
+  - CUDA
+  - MPQS

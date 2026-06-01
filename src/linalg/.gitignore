@@ -1,0 +1,12 @@
+*~
+\#*\#
+.\#*
+*.pyc
+__pycache__/
+build/
+prototype_spmm/build/
+cuda_spmm/build/
+build_standalone/
+test_A.bin
+logs/*
+!logs/.gitkeep

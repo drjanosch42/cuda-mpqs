@@ -1,0 +1,23 @@
+# cuda-mpqs — build artefacts and runtime state
+build/
+build_*/
+*.o
+*.a
+*.so
+*.ptx
+*.pyc
+__pycache__/
+
+# Editor / IDE backups
+*~
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime artefacts
+mpqs_work/
+autotune_history.json
+benign_history.json
+logs/
+*.log
