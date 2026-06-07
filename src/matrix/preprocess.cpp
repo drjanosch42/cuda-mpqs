@@ -143,7 +143,9 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
     uint32_t compact_cycles,
     uint32_t truncation_excess,
     double gf2_floor_factor,
-    uint32_t gf2_min_floor)
+    uint32_t gf2_min_floor,
+    CharMode char_mode,
+    uint64_t lp1_bound)
 {
     LOG_SET_MODULE("Matrix");
     using clock = std::chrono::high_resolution_clock;
@@ -262,8 +264,7 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
     //    Merges reduce the matrix first; truncation selects rows by coverage-greedy
     //    policy on the clean binary CSR from GF(2) extraction. Truncation runs
     //    *before* product char cols are appended, so the target accounts for the
-    //    32 char cols via `n_extra_cols=32`. See M12-S1 in
-    //    docs/audits/matrix/matrix_module_audit_2026_04_27.md (sec 5, App C).
+    //    32 char cols via `n_extra_cols=32` (M12-S1).
     HostMatrixCSR* active_csr = &gf2.gf2_csr;
     std::vector<uint32_t>* active_row_map = &gf2.row_map;
     TruncationResult truncation;
@@ -286,7 +287,18 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
         }
     }
 
-    // 6. [M9f] Product character columns (Jacobi-only on merged sqrt_Q)
+    // 6. [M9f] Character columns appended on the FINAL reduced rows.
+    //    Two modes, selected by char_mode:
+    //      NORM   : genus-blind norm symbol re-evaluated on the merged sqrt_Q
+    //               (gpuProductCharCols_packed) — byte-identical to before.
+    //      BRANCH : (Stage 6) the per-row branch char vector was XOR-composed through
+    //               the packed reduction in lockstep with the Montgomery sqrt_Q product
+    //               (seed in gpuBuildPackedMatrix → carried through singleton/merge/
+    //               compaction via d_char_bits / d_ws_char_bits). Here we gather the
+    //               composed vector for each alive row via the SAME ptr_val/ws_idx
+    //               row-map gather as sqrt_Q, unpack its bits into the 32 columns, and
+    //               append. NO symbol re-evaluation on a merged sqrt_Q (that is the
+    //               norm bug). Bit-identical to computeProductCharacterColumns(BRANCH).
     auto t_char = clock::now();
     {
         // Collect merged sqrt_Q for alive rows into contiguous device array
@@ -294,10 +306,78 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
         const auto& workspace = compact_merge.final_merge.workspace;
         const uint32_t n_alive = static_cast<uint32_t>(active_row_map->size());
 
-        if (n_alive == 0) {
+        if (char_mode == CharMode::NONE) {
+            // --char_mode none (scientific null control): append zero character columns
+            // so the reduced GF(2) CSR keeps exactly its FB(+LP) columns (k == 0). No
+            // sqrt_Q gather, no aux-prime selection, no device Jacobi. Applies for any
+            // n_alive (including the degenerate 0-row case, which needs no char cols).
+            LOG(LOG_INFO) << "  M9f: Appended 0 char cols (--char_mode none, scientific "
+                          << "control) → " << active_csr->n_rows << " x "
+                          << active_csr->n_cols << ".";
+        } else if (n_alive == 0) {
             LOG(LOG_WARNING) << "  GPU preprocess: degenerate matrix (0 alive rows). "
                              << "Skipping product char cols.";
+        } else if (char_mode == CharMode::BRANCH) {
+        // --- Stage 6 BRANCH path: gather composed d_char_bits + unpack 32 columns ---
+        // Mirror the NORM sqrt_Q gather EXACTLY (same ptr_val / ROW_WS_BIT selector),
+        // but over the char-vector arrays. The bits are already composed (XOR through
+        // the reduction); we only select per-alive-row and unpack — no device Jacobi.
+        uint64_t dual_counter_val = 0;
+        CUDA_CHECK(cudaMemcpy(&dual_counter_val, workspace.d_dual_counter,
+                              sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        uint32_t ws_row_count = static_cast<uint32_t>(dual_counter_val >> 32);
+
+        std::vector<uint32_t> h_ws_char_bits(ws_row_count);
+        if (ws_row_count > 0) {
+            CUDA_CHECK(cudaMemcpy(h_ws_char_bits.data(), workspace.d_ws_char_bits,
+                                  ws_row_count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        }
+
+        std::vector<uint32_t> h_orig_char_bits(compact_merge.final_csr.n_rows);
+        CUDA_CHECK(cudaMemcpy(h_orig_char_bits.data(), compact_merge.final_csr.d_char_bits,
+                              compact_merge.final_csr.n_rows * sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+
+        // Gather the composed char vector per alive row (same row-map gather as sqrt_Q).
+        std::vector<uint32_t> alive_char_bits(n_alive);
+        for (uint32_t i = 0; i < n_alive; i++) {
+            uint32_t merged_row = (*active_row_map)[i];
+            uint32_t ptr_val = h_row_ptr[merged_row];
+            if (ptr_val & ROW_WS_BIT) {
+                uint32_t ws_idx = ptr_val & 0x7FFFFFFFu;
+                alive_char_bits[i] = h_ws_char_bits[ws_idx];
+            } else {
+                alive_char_bits[i] = h_orig_char_bits[ptr_val];
+            }
+        }
+
+        // Select branch aux primes to fix r (== column count); branch char bits are
+        // already evaluated/composed, so only the count matters here. Matches the CPU
+        // branch path (computeProductCharacterColumns BRANCH) and initBranchCharData.
+        CharacterColumnComputer cc;
+        cc.selectAuxPrimes(N, fb, CharMode::BRANCH, lp1_bound);
+        const uint32_t k = static_cast<uint32_t>(cc.auxPrimes().size());
+
+        // Unpack the composed bits into column-major CharacterColumns (bit j → col j),
+        // identical to the CPU branch unpack in compute()/computeProductCharacterColumns.
+        CharacterColumns branch_chars;
+        branch_chars.aux_primes = cc.auxPrimes();
+        branch_chars.k = k;
+        branch_chars.columns.resize(k);
+        for (uint32_t j = 0; j < k; ++j)
+            branch_chars.columns[j].resize(n_alive, 0);
+        for (uint32_t i = 0; i < n_alive; ++i) {
+            const uint32_t cb = alive_char_bits[i];
+            for (uint32_t j = 0; j < k; ++j)
+                branch_chars.columns[j][i] = static_cast<uint8_t>((cb >> j) & 1u);
+        }
+
+        AppendCharacterColumns(*active_csr, branch_chars, n_alive);
+        LOG(LOG_INFO) << "  M9f: Appended " << branch_chars.k
+                      << " BRANCH char cols (XOR-composed via d_char_bits) → "
+                      << active_csr->n_rows << " x " << active_csr->n_cols << ".";
         } else {
+        // --- NORM path (default): byte-identical to before ---
         // Build contiguous device sqrt_Q array from alive rows
         // Download workspace sqrt_Q and original sqrt_Q as needed
         uint64_t dual_counter_val = 0;
@@ -336,12 +416,19 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
         CUDA_CHECK(cudaMemcpy(d_alive_sqrt_Q, alive_sqrt_Q.data(),
                               n_alive * sizeof(uint512), cudaMemcpyHostToDevice));
 
-        // Select aux primes and compute product char cols
+        // Select aux primes and compute product char cols.
+        // NORM char mode: select with explicit NORM / lp1_bound=0 so selection is
+        // byte-identical to today. Aux primes are stored 64-bit but stay < 2^32 in
+        // NORM; the packed char kernel (uint32 aux primes) consumes a value-preserving
+        // narrowed copy.
         CharacterColumnComputer cc;
-        cc.selectAuxPrimes(N, fb);
+        cc.selectAuxPrimes(N, fb, CharMode::NORM, /*lp1_bound=*/0);
+
+        const std::vector<uint64_t>& aux_primes64 = cc.auxPrimes();
+        std::vector<uint32_t> aux_primes32(aux_primes64.begin(), aux_primes64.end());
 
         auto product_chars = gpuProductCharCols_packed(
-            d_alive_sqrt_Q, n_alive, cc.auxPrimes(), cc.nModQ());
+            d_alive_sqrt_Q, n_alive, aux_primes32, cc.nModQ());
 
         CUDA_CHECK(cudaFree(d_alive_sqrt_Q));
 

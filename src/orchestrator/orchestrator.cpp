@@ -122,7 +122,11 @@ MPQSOrchestrator::MPQSOrchestrator(const MPQSConfig& config)
 
 MPQSOrchestrator::~MPQSOrchestrator() {
     // Explicitly clear remaining buffers
-    
+
+    // Stage 4: free branch char aux-prime device buffers (no-op if never allocated).
+    if (d_branch_aux_primes_) { cudaFree(d_branch_aux_primes_); d_branch_aux_primes_ = nullptr; }
+    if (d_branch_aux_t_s_)    { cudaFree(d_branch_aux_t_s_);    d_branch_aux_t_s_ = nullptr; }
+
     if (!config_.silent)
         LOG(LOG_INFO) << "=== MPQS Orchestrator Shutting Down ===";
 }
@@ -535,6 +539,15 @@ void MPQSOrchestrator::Run() {
                         meta.factor_base = f_data_.factorBase;
                         meta.lp_bound = config_.lp1_bound;
                         meta.sieve_bound = config_.sieve_bound;
+                        // Stage 4: persist branch aux primes/roots so a branch-mode .v2
+                        // round-trips its char vectors and the matrix stage can rebuild
+                        // the same columns. Empty under norm mode (flag stays clear).
+                        if (config_.char_mode == matrix::CharMode::BRANCH
+                            && !branch_aux_primes_.empty()) {
+                            meta.aux_primes = branch_aux_primes_;
+                            meta.t_s        = branch_aux_t_s_;
+                            meta.r          = static_cast<uint32_t>(branch_aux_primes_.size());
+                        }
                         if (mpqs::io::serialize_v2(v2_path, host_relations_soa_,
                                                    host_partials_soa_, meta)) {
                             LOG(LOG_INFO) << "Wrote v2 relations: "
@@ -1067,10 +1080,12 @@ void MPQSOrchestrator::Run() {
                 } else if (force_preprocess) {
                     used_expanded_matrix_ = true;
                 } else {
-                    // AUTO: expand when LP fraction exceeds threshold and partials exist.
+                    // AUTO no longer auto-selects preprocess from LP fraction —
+                    // preprocessing degrades obstructed high-LP cases, so use
+                    // --matrix_mode preprocess to opt in. AUTO only expands for the
+                    // explicit MATRIX_ONLY replay mode.
                     used_expanded_matrix_ = (host_partials_soa_.num_relations > 0 &&
-                                             (lp_fraction > config_.lp_preprocess_threshold ||
-                                              config_.mode == ExecutionMode::MATRIX_ONLY));
+                                             config_.mode == ExecutionMode::MATRIX_ONLY);
                 }
 
                 LOG(LOG_INFO) << "LP fraction: " << std::fixed << std::setprecision(1)
@@ -1230,7 +1245,9 @@ void MPQSOrchestrator::Run() {
                             config_.compact_cycles,
                             config_.matrix_truncation_excess,
                             config_.matrix_gf2_floor_factor,
-                            config_.matrix_gf2_min_floor);
+                            config_.matrix_gf2_min_floor,
+                            config_.char_mode,        // Stage 6: branch char propagation
+                            config_.lp1_bound);
                         double preproc_sec = std::chrono::duration<double>(
                             clock::now() - t_preproc).count();
 
@@ -1312,13 +1329,22 @@ void MPQSOrchestrator::Run() {
                         merge_tree_ = std::move(preproc.merge_tree);
                         preproc_row_map_ = std::move(preproc.row_map);
 
-                        // M7: Product character columns via merge-tree sqrt_Q products
-                        {
+                        // M7: Product character columns via merge-tree sqrt_Q products.
+                        // --char_mode none (scientific null control): skip compute+append
+                        // entirely so the reduced matrix keeps exactly its preprocessed
+                        // columns (k == 0). No merge-tree expansion, no Legendre symbols.
+                        if (config_.char_mode == matrix::CharMode::NONE) {
+                            LOG(LOG_INFO) << "M7: Appended 0 product character columns "
+                                          << "(--char_mode none, scientific control). "
+                                          << "Reduced matrix: " << preproc.reduced.n_rows
+                                          << " x " << preproc.reduced.n_cols << ".";
+                        } else {
                             auto product_chars = matrix::computeProductCharacterColumns(
                                 preproc_row_map_, merge_tree_,
                                 raw_smooths_soa_, host_partials_soa_,
                                 raw_smooths_soa_.num_relations,
-                                config_.N, f_data_.factorBase);
+                                config_.N, f_data_.factorBase,
+                                config_.char_mode, config_.lp1_bound);
                             matrix::AppendCharacterColumns(
                                 preproc.reduced, product_chars,
                                 preproc.reduced.n_rows);
@@ -1351,6 +1377,26 @@ void MPQSOrchestrator::Run() {
 
                 time_matrix_sec = std::chrono::duration<double>(clock::now() - t_matrix).count();
                 if (is_jetson_) logGpuMemory("After matrix");
+            }
+        }
+
+        // 3a. Diagnostic: dump finalized GF(2) matrix (strictly opt-in via --dump_matrix).
+        //     matrix_A_ is finalized at this point on every path (legacy MatrixStage,
+        //     inline preprocess GPU/CPU). No-op and zero overhead when the flag is unset.
+        if (!skip_downstream && config_.dump_matrix && matrix_A_.n_rows > 0) {
+            std::filesystem::create_directories(config_.work_dir);
+            const std::string mat_path = config_.work_dir + "/matrix.csr";
+            const std::string leg_path = config_.work_dir + "/matrix_columns.txt";
+            if (matrix::DumpHostMatrixCSR(mat_path, matrix_A_)) {
+                LOG(LOG_INFO) << "[dump_matrix] Wrote matrix CSR (" << matrix_A_.n_rows
+                              << " x " << matrix_A_.n_cols << ") to " << mat_path;
+            } else {
+                LOG(LOG_ERROR_CRITICAL) << "[dump_matrix] Failed to write matrix CSR to " << mat_path;
+            }
+            if (matrix::DumpMatrixColumnLegend(leg_path, f_data_.factorBase, matrix_A_.n_cols)) {
+                LOG(LOG_INFO) << "[dump_matrix] Wrote column legend to " << leg_path;
+            } else {
+                LOG(LOG_ERROR_CRITICAL) << "[dump_matrix] Failed to write column legend to " << leg_path;
             }
         }
 
@@ -1682,6 +1728,72 @@ void MPQSOrchestrator::Run() {
             LOG(LOG_INFO) << "Kernel vector expansion completed in "
                           << FormatDuration(expand_sec * 1000.0);
           }
+        }
+
+        // 3c. Diagnostic: dump FINAL kernel vectors in ORIGINAL-relation space
+        //     (strictly opt-in via --dump_kernel_vectors). At this point
+        //     kernel_solutions_ is original-relation-indexed on BOTH paths:
+        //       - legacy matrix path: never reduced, bit i == matrix row i == relation i;
+        //       - expanded/preprocess path: re-expanded by stage 3b over host_relations_soa_.
+        //     This complements the BW writer (which dumps reduced-row space). No
+        //     effect / zero overhead when the flag is unset.
+        if (!skip_downstream && config_.dump_kernel_vectors && !kernel_solutions_.empty()) {
+            std::filesystem::create_directories(config_.work_dir);
+            const uint64_t n_rel = host_relations_soa_.num_relations;
+            const std::string kv_path  = config_.work_dir + "/kernel_vectors.bin";
+            const std::string sc_path  = config_.work_dir + "/kernel_vectors.txt";
+
+            // Binary: self-describing little-endian packed-bit kernel vectors.
+            //   char     magic[8] = "MPQSKV\0\0"
+            //   uint32_t version  = 1
+            //   uint32_t num_vectors
+            //   uint64_t num_relations          (logical bit length of each vector)
+            //   per vector: uint64_t words_count; uint64_t bits[words_count]
+            //     bit i (word i/64, bit i%64) set  <=> relation i is in this kernel vector.
+            std::ofstream kf(kv_path, std::ios::binary);
+            if (kf) {
+                auto w32 = [&](uint32_t v){ kf.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+                auto w64 = [&](uint64_t v){ kf.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+                const char magic[8] = {'M','P','Q','S','K','V','\0','\0'};
+                kf.write(magic, 8);
+                w32(1u);
+                w32(static_cast<uint32_t>(kernel_solutions_.size()));
+                w64(n_rel);
+                for (const auto& kv : kernel_solutions_) {
+                    w64(static_cast<uint64_t>(kv.size()));
+                    if (!kv.empty()) {
+                        kf.write(reinterpret_cast<const char*>(kv.data()),
+                                 kv.size() * sizeof(uint64_t));
+                    }
+                }
+                LOG(LOG_INFO) << "[dump_kernel_vectors] Wrote " << kernel_solutions_.size()
+                              << " kernel vectors (original-relation space, " << n_rel
+                              << " relations) to " << kv_path;
+            } else {
+                LOG(LOG_ERROR_CRITICAL) << "[dump_kernel_vectors] Failed to write " << kv_path;
+            }
+
+            // Sidecar documenting row space + bit->relation mapping.
+            std::ofstream sf(sc_path);
+            if (sf) {
+                sf << "# cuda-mpqs kernel vector dump (original-relation space)\n";
+                sf << "# file: kernel_vectors.bin\n";
+                sf << "row_space=original_relation\n";
+                sf << "num_vectors=" << kernel_solutions_.size() << "\n";
+                sf << "num_relations=" << n_rel << "\n";
+                sf << "used_expanded_matrix=" << (used_expanded_matrix_ ? 1 : 0) << "\n";
+                sf << "used_packed_pipeline=" << (used_packed_pipeline_ ? 1 : 0) << "\n";
+                sf << "# bit i (vector word i/64, bit i%64) set <=> relation i selected.\n";
+                sf << "# On the LEGACY path relation i corresponds 1:1 to matrix row i in\n";
+                sf << "#   matrix.csr; on the EXPANDED/PREPROCESS path the dumped vectors are\n";
+                sf << "#   re-expanded to original relations (matrix.csr rows are REDUCED rows).\n";
+                sf << "# The BW-writer files <work_dir>/bw_W.bin and bw_sol_<i>.bin are in the\n";
+                sf << "#   BW solver row space (reduced rows on the expanded path); each such\n";
+                sf << "#   file: uint32 magic, uint32 rows, uint32 1, then packed uint64 bits.\n";
+                LOG(LOG_INFO) << "[dump_kernel_vectors] Wrote sidecar to " << sc_path;
+            } else {
+                LOG(LOG_ERROR_CRITICAL) << "[dump_kernel_vectors] Failed to write sidecar " << sc_path;
+            }
         }
 
         // 4. Square Root
@@ -2410,6 +2522,44 @@ void MPQSOrchestrator::logSieveStageSummary(const SieveStageSummary& s) {
 // Sieve Init Helpers (shared by SieveStage and TruncatedSieveRun)
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Branch-fixed character columns (Stage 4): select + upload aux primes/roots.
+// -----------------------------------------------------------------------------
+// Under --char_mode branch, the per-relation char vector captured at relation birth
+// (in postprocessing) is read against a FIXED set of r branch aux primes q_s (each
+// > lp1_bound) and their fixed Tonelli roots t_s (t_s^2 == N mod q_s), selected once
+// via the Stage-2 CharacterColumnComputer. We materialize them on the device so the
+// hot-path kernel can index them directly. No-op under norm mode; idempotent.
+void MPQSOrchestrator::initBranchCharData() {
+    if (config_.char_mode != matrix::CharMode::BRANCH) return;
+    if (!branch_aux_primes_.empty()) return;  // already initialized
+
+    matrix::CharacterColumnComputer cc;
+    cc.selectAuxPrimes(config_.N, f_data_.factorBase,
+                       matrix::CharMode::BRANCH, config_.lp1_bound);
+    branch_aux_primes_ = cc.auxPrimes();
+    branch_aux_t_s_    = cc.tS();
+
+    const size_t r = branch_aux_primes_.size();
+    if (r == 0 || branch_aux_t_s_.size() != r) {
+        LOG(LOG_ERROR_CRITICAL) << "Stage 4: branch aux-prime selection produced "
+                                << r << " primes / " << branch_aux_t_s_.size()
+                                << " roots — disabling branch capture.";
+        branch_aux_primes_.clear();
+        branch_aux_t_s_.clear();
+        return;
+    }
+
+    CUDA_CHECK(cudaMalloc(&d_branch_aux_primes_, r * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_branch_aux_t_s_,    r * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpy(d_branch_aux_primes_, branch_aux_primes_.data(),
+                          r * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_branch_aux_t_s_, branch_aux_t_s_.data(),
+                          r * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    LOG(LOG_INFO) << "Stage 4: branch character capture enabled (r=" << r
+                  << " aux primes > lp1_bound, fixed Tonelli roots uploaded).";
+}
+
 postprocessing::PostProcConfig MPQSOrchestrator::initPostProcessorConfig(uint64_t accum_override) {
     postprocessing::PostProcConfig pp_conf;
 
@@ -2470,6 +2620,17 @@ postprocessing::PostProcConfig MPQSOrchestrator::initPostProcessorConfig(uint64_
         pp_conf.partial_buffer_size = partial_from_config;
     }
 
+    // Stage 4: branch-fixed character capture. Select/upload aux primes once, then
+    // hand the device pointers + r to the postprocessor. Under norm mode this is a
+    // no-op and char_branch stays false (zero hot-path cost).
+    initBranchCharData();
+    if (config_.char_mode == matrix::CharMode::BRANCH && !branch_aux_primes_.empty()) {
+        pp_conf.char_branch = true;
+        pp_conf.char_r      = static_cast<uint32_t>(branch_aux_primes_.size());
+        pp_conf.d_char_q    = d_branch_aux_primes_;
+        pp_conf.d_char_t    = d_branch_aux_t_s_;
+    }
+
     return pp_conf;
 }
 
@@ -2527,6 +2688,10 @@ void MPQSOrchestrator::initLargePrimes() {
     // For small factor bases, purge witnesses after first match to prevent
     // one witness generating multiple combined relations (degenerate kernel vectors).
     lp_conf.purge_after_match = (f_data_.size < 20000);
+
+    // DIAGNOSTIC: capture combined-relation constituent provenance before the purge.
+    // ADDITIVE — only allocates/launches when --dump_combine_provenance is set.
+    lp_conf.capture_provenance = config_.dump_combine_provenance;
 
     config_.lp_config = lp_conf;
     largeprime_ = std::make_unique<mpqs::lp::LargePrimeVariant>(postprocessor_->getCudaStream());
@@ -4146,6 +4311,40 @@ void MPQSOrchestrator::SieveStage() {
             LOG(LOG_INFO) << "Downloaded " << host_partials_soa_.num_relations
                           << " LP witness partials for expanded matrix.";
         }
+
+        // DIAGNOSTIC (strictly opt-in via --dump_combine_provenance): download and
+        // serialize per-combined-relation constituent provenance captured before the
+        // slab purge. ADDITIVE — does nothing unless the flag was set at LP init.
+        if (config_.dump_combine_provenance && config_.lp1_bound > 0 && largeprime_) {
+            std::vector<mpqs::lp::CombineProvenanceEntry> prov;
+            largeprime_->moveProvenanceToHost(prov, pp_stream);
+            cudaStreamSynchronize(pp_stream);
+
+            std::string prov_path = (std::filesystem::path(config_.work_dir)
+                                     / "combine_provenance.bin").string();
+            std::filesystem::create_directories(config_.work_dir);
+            std::ofstream pf(prov_path, std::ios::binary);
+            if (pf) {
+                // Header: magic "MPQSPRV1" (8B) | version u32 | record_size u32 |
+                //         N (64B little-endian limbs) | record_count u64
+                const char MAGIC[8] = {'M','P','Q','S','P','R','V','1'};
+                pf.write(MAGIC, 8);
+                uint32_t version = 1;
+                uint32_t rec_size = (uint32_t)sizeof(mpqs::lp::CombineProvenanceEntry);
+                pf.write(reinterpret_cast<const char*>(&version), sizeof(version));
+                pf.write(reinterpret_cast<const char*>(&rec_size), sizeof(rec_size));
+                pf.write(reinterpret_cast<const char*>(config_.N.limbs), 64);
+                uint64_t n = prov.size();
+                pf.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                if (n > 0)
+                    pf.write(reinterpret_cast<const char*>(prov.data()), n * rec_size);
+                LOG(LOG_INFO) << "[dump_combine_provenance] Wrote " << n
+                              << " provenance records (" << rec_size << " B each) to " << prov_path;
+            } else {
+                LOG(LOG_ERROR_CRITICAL) << "[dump_combine_provenance] Failed to open "
+                                        << prov_path << " for writing.";
+            }
+        }
     } else {
         LOG(LOG_ERROR_CRITICAL) << "Persistent buffer missing!";
     }
@@ -4801,26 +5000,50 @@ void MPQSOrchestrator::MatrixStage() {
     // M9d: when the persistent device batch is alive (full pipeline), read sqrt_Q
     // directly from device memory — eliminates the ~20 MB D→H→D round-trip.
     // LINALG_ONLY fallback: no persistent batch exists; use existing host-upload path.
-    {
+    // --char_mode none (scientific null control): skip compute+append entirely so the
+    // matrix retains exactly its FB(+LP) columns (k == 0). No aux-prime selection, no
+    // Legendre evaluation, no AppendCharacterColumns call.
+    if (config_.char_mode == matrix::CharMode::NONE) {
+        LOG(LOG_INFO) << "Appended 0 character columns (--char_mode none, scientific "
+                      << "control). Matrix: " << csr_matrix.n_rows << " x "
+                      << csr_matrix.n_cols << ".";
+    } else {
         matrix::CharacterColumnComputer cc;
-        cc.selectAuxPrimes(config_.N, f_data_.factorBase);
+        cc.selectAuxPrimes(config_.N, f_data_.factorBase,
+                           config_.char_mode, config_.lp1_bound);
+
+        // Stage 2: aux primes are stored 64-bit. The NORM path keeps q < 2^32, so
+        // the legacy GPU/CPU char kernels (uint32 aux primes) consume a value-
+        // preserving narrowed copy. Branch-mode char computation is finalized in
+        // Stages 4-6; the kernels are untouched here.
+        const std::vector<uint64_t>& aux_primes64 = cc.auxPrimes();
+        std::vector<uint32_t> aux_primes32(aux_primes64.begin(), aux_primes64.end());
 
         matrix::CharacterColumns chars;
-        if ((config_.matrix_backend == 1 /*GPU*/ || config_.matrix_backend == 2 /*AUTO*/) &&
+        if (config_.char_mode == matrix::CharMode::BRANCH) {
+            // Stage 5 BRANCH (legacy CPU path): the genus-correct char vector was
+            // evaluated per relation at birth (Stage 4) and persisted in
+            // host_relations_soa_.char_bits (downloaded from the persistent device
+            // batch at SieveStage end, char_bits-aware moveToHost). compute(BRANCH)
+            // simply unpacks it — no symbol re-evaluation. The GPU char kernels
+            // (gpuComputeCharacterColumns*) are the NORM mod-N-symbol path; the GPU
+            // branch path is Stage 6, so branch mode routes through the CPU adapter.
+            chars = cc.compute(host_relations_soa_, matrix::CharMode::BRANCH);
+        } else if ((config_.matrix_backend == 1 /*GPU*/ || config_.matrix_backend == 2 /*AUTO*/) &&
             postprocessor_) {
             // M9d: device-resident path — zero sqrt_Q upload
             auto batch_view = postprocessor_->getPersistentBatch()->get_view();
             chars = matrix::gpuComputeCharacterColumns_device(
                 batch_view.sqrt_Q,
                 static_cast<uint32_t>(postprocessor_->getPersistentCount()),
-                cc.auxPrimes(), cc.nModQ());
+                aux_primes32, cc.nModQ());
         } else if (config_.matrix_backend == 1 /*GPU*/ || config_.matrix_backend == 2 /*AUTO*/) {
             // GPU backend but no persistent batch (LINALG_ONLY) — use host-upload path
             chars = matrix::gpuComputeCharacterColumns(
-                host_relations_soa_, cc.auxPrimes(), cc.nModQ());
+                host_relations_soa_, aux_primes32, cc.nModQ());
         } else {
-            // CPU backend
-            chars = cc.compute(host_relations_soa_);
+            // CPU backend (NORM)
+            chars = cc.compute(host_relations_soa_, matrix::CharMode::NORM);
         }
 
         matrix::AppendCharacterColumns(csr_matrix, chars,
@@ -4889,6 +5112,15 @@ void MPQSOrchestrator::LinearAlgebraStage() {
     bw_conf.nrows = matrix_A_.n_rows;
     bw_conf.device_id = config_.device_id;
     bw_conf.checkpoint_prefix = config_.work_dir + "/bw";
+    // Diagnostic (strictly opt-in via --dump_kernel_vectors): reuse the existing
+    // BW solution writer (BWIOSystem::save_solutions). It emits <prefix>_W.bin and
+    // <prefix>_sol_<i>.bin in the BW solver's ROW SPACE (= reduced rows on the
+    // expanded/preprocess path; = original relations on the legacy path). The
+    // orchestrator additionally dumps the re-expanded original-relation-space
+    // solutions after stage 3b (see below). No effect when the flag is unset.
+    if (config_.dump_kernel_vectors) {
+        bw_conf.stage3_save_solutions = true;
+    }
     bw_conf.m_block = (int)config_.bw_m;
     bw_conf.n_block = (int)config_.bw_n;
     bw_conf.block_size_pinned = config_.isPinned("bw_m") || config_.isPinned("bw_n");

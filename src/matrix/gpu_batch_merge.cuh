@@ -82,6 +82,11 @@ struct DeviceMergeWorkspace {
     uint512*     d_ws_sqrt_Q      = nullptr;  ///< [max_merged_rows]
     uint8_t*     d_ws_signs       = nullptr;  ///< [max_merged_rows]
     int32_t*     d_ws_val_2_exps  = nullptr;  ///< [max_merged_rows]
+    /// Stage 6 (branch char): XOR-composed branch char vector per merged row.
+    /// Mirrors d_ws_sqrt_Q exactly — XOR is the additive homomorphism dual of the
+    /// Montgomery sqrt_Q product. The merge kernel accumulates this in lockstep with
+    /// d_ws_sqrt_Q using the same ROW_WS_BIT selector. Always 0 in norm mode.
+    uint32_t*    d_ws_char_bits   = nullptr;  ///< [max_merged_rows]
 
     // Bump allocator: packed uint64 = [uint32 row_count | uint32 entry_count]
     uint64_t*    d_dual_counter   = nullptr;

@@ -300,9 +300,11 @@ void compact_metadata_packed_kernel(
     const uint512*  __restrict__ d_old_sqrt_Q,
     const uint8_t*  __restrict__ d_old_signs,
     const int32_t*  __restrict__ d_old_val_2_exps,
+    const uint32_t* __restrict__ d_old_char_bits,  // Stage 6: branch char vector
     uint512* __restrict__ d_new_sqrt_Q,
     uint8_t* __restrict__ d_new_signs,
     int32_t* __restrict__ d_new_val_2_exps,
+    uint32_t* __restrict__ d_new_char_bits,        // Stage 6: relocated char vector
     uint32_t new_n_rows)
 {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -312,6 +314,9 @@ void compact_metadata_packed_kernel(
     d_new_sqrt_Q[i]       = d_old_sqrt_Q[old_r];
     d_new_signs[i]        = d_old_signs[old_r];
     d_new_val_2_exps[i]   = d_old_val_2_exps[old_r];
+    // Stage 6: singleton removal only RELOCATES rows (gather by row_map);
+    // the composed char vector carries through unchanged, like sqrt_Q.
+    d_new_char_bits[i]    = d_old_char_bits[old_r];
 }
 
 // ============================================================================
@@ -530,7 +535,9 @@ PackedSingletonResult gpuRemoveSingletons_packed(DevicePackedCSR& device_csr) {
         compact_metadata_packed_kernel<<<grid_new_rows, kBlock>>>(
             buf.d_row_map,
             device_csr.d_sqrt_Q, device_csr.d_signs, device_csr.d_val_2_exps,
+            device_csr.d_char_bits,
             result.reduced.d_sqrt_Q, result.reduced.d_signs, result.reduced.d_val_2_exps,
+            result.reduced.d_char_bits,
             new_n_rows);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -594,6 +601,10 @@ PackedSingletonResult gpuRemoveSingletons_packed(DevicePackedCSR& device_csr) {
     if (device_csr.d_val_2_exps) {
         CUDA_CHECK(cudaFree(device_csr.d_val_2_exps));
         device_csr.d_val_2_exps = nullptr;
+    }
+    if (device_csr.d_char_bits) {
+        CUDA_CHECK(cudaFree(device_csr.d_char_bits));
+        device_csr.d_char_bits = nullptr;
     }
     device_csr.n_rows = 0;
     device_csr.n_cols = 0;

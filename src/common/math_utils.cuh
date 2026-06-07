@@ -305,8 +305,15 @@ void calculateQ_unsigned(mpqs::uint512 a, mpqs::uint512 b, int32_t x, mpqs::uint
 
 // CONTRACT: |a| and |b| are small relative to N, N < 2^512.
 // FORMALLY: |ax+b| < sqrt{N} (|ax+b| < 2^511 - 1 is actually sufficient)
-__host__ __device__ __forceinline__ 
-void calculate_sqrt_of_QX(mpqs::uint512 a, mpqs::uint512 b, int32_t x, mpqs::uint512& sqrt_out)
+//
+// 5-arg form: additionally returns the SIGN of the genuine (signed) (ax+b) via
+// sign_axb_out (+1 or -1, as produced by abs_twos_complement). The sign is needed
+// at relation birth by the branch-fixed character path (Stage 4): the
+// branch-fixed symbol reads the SIGNED field element ((ax+b) - t_s) mod q, so the
+// sign discarded when reducing to sqrt_out = |ax+b| must be recovered here.
+__host__ __device__ __forceinline__
+void calculate_sqrt_of_QX(mpqs::uint512 a, mpqs::uint512 b, int32_t x,
+                          mpqs::uint512& sqrt_out, int8_t& sign_axb_out)
 {
     // Compute term = ax + b (algebraically) as above.
     // We exploit uint512 underflow.
@@ -315,7 +322,7 @@ void calculate_sqrt_of_QX(mpqs::uint512 a, mpqs::uint512 b, int32_t x, mpqs::uin
     ax.mult_uint32(abs_x);
 
     mpqs::uint512 temp; // Stores intermediate values
-    
+
     if (x >= 0) {
         // b + ax
         temp = ax;
@@ -325,8 +332,16 @@ void calculate_sqrt_of_QX(mpqs::uint512 a, mpqs::uint512 b, int32_t x, mpqs::uin
         temp = b;
         temp.sub(ax);
     }
+    sqrt_out = temp.abs_twos_complement(sign_axb_out);
+}
+
+// 3-arg form (legacy): identical to the 5-arg form but discards the (ax+b) sign.
+// Existing callers (the genus-blind NORM path) are unaffected.
+__host__ __device__ __forceinline__
+void calculate_sqrt_of_QX(mpqs::uint512 a, mpqs::uint512 b, int32_t x, mpqs::uint512& sqrt_out)
+{
     int8_t sign;
-    sqrt_out = temp.abs_twos_complement(sign);
+    calculate_sqrt_of_QX(a, b, x, sqrt_out, sign);
 }
 
 } // namespace math

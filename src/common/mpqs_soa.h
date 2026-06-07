@@ -22,10 +22,14 @@ struct RelationBatchView; // Defined below
  */
 struct HostRelationBatch {
     // Algebra
-    std::vector<mpqs::uint512> sqrt_Q; 
-    std::vector<uint8_t> signs; 
+    std::vector<mpqs::uint512> sqrt_Q;
+    std::vector<uint8_t> signs;
     std::vector<int32_t> val_2_exps;
-    std::vector<unsigned __int128> large_primes; 
+    std::vector<unsigned __int128> large_primes;
+    /// Branch-fixed character vector (Stage 4): r-bit (r=32) per-relation char vector
+    /// computed at relation birth from the SIGNED (ax+b). One bit per branch aux prime.
+    /// Always 0 (a defined value) under --char_mode norm; only meaningful under branch.
+    std::vector<uint32_t> char_bits;
 
     // CSR Factors
     std::vector<uint64_t> factor_offsets; 
@@ -49,7 +53,8 @@ struct RelationBatchView {
     mpqs::uint512* sqrt_Q;
     uint8_t* signs;
     int32_t* val_2_exps;
-    unsigned __int128* large_primes; 
+    unsigned __int128* large_primes;
+    uint32_t* char_bits;  ///< Branch-fixed per-relation char vector (Stage 4); 0 in norm mode.
     
     // CSR Factors
     uint64_t* factor_offsets;    // [Size + 1]
@@ -268,6 +273,7 @@ private:
     uint8_t*           d_signs = nullptr;
     int32_t*           d_val_2_exps = nullptr;
     unsigned __int128* d_large_primes = nullptr;
+    uint32_t*          d_char_bits = nullptr;  ///< Branch-fixed per-relation char vector (Stage 4).
 
     // -- Device Pointers (CSR) --
     uint64_t* d_factor_offsets = nullptr;

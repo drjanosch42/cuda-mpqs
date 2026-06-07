@@ -4,6 +4,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <string>
 #include <cuda_runtime.h>
 #include <memory>
 
@@ -36,6 +37,39 @@ struct HostMatrixCSR {
 // --- Validation & Conversion Helpers ---
 bool ValidateHostMatrixCSR(const HostMatrixCSR& M);
 HostMatrix ConvertFromCSR(const HostMatrixCSR& src);
+
+// --- Diagnostic serializer (sqrt-failure investigation) ---------------------
+//
+// DumpHostMatrixCSR writes the GF(2) matrix `A` (the canonical BW input, stored
+// as a vector<vector<col>> HostMatrix) to `path` in a tiny self-describing
+// little-endian binary CSR format so the matrix can be parsed offline.
+//
+// On-disk layout (all integers little-endian):
+//   char     magic[8]   = "MPQSMAT\0"
+//   uint32_t version    = 1
+//   uint32_t n_rows
+//   uint32_t n_cols
+//   uint64_t nnz                              (total stored entries)
+//   uint64_t row_offsets[n_rows + 1]          (CSR row pointers, offsets[0]=0)
+//   uint32_t col_indices[nnz]                 (per-row column indices, as stored)
+//
+// All matrix entries are 1 over GF(2); only column indices of set bits are
+// stored. Column semantics are emitted separately by DumpMatrixColumnLegend.
+// Returns true on success. This function performs NO computation on the matrix
+// beyond reading it; it is only ever called behind the --dump_matrix flag.
+bool DumpHostMatrixCSR(const std::string& path, const HostMatrix& A);
+
+// DumpMatrixColumnLegend writes a human-readable text file mapping each matrix
+// column index to its meaning, given the factor base used to build the matrix:
+//   col 0            -> sign (parity of negative Q values)
+//   col 1            -> prime 2 parity (val_2_exps)
+//   col 2 + k        -> FactorBase[k]   (k = 0 .. fb_size-1)
+//   cols after FB    -> "LP / character columns (expanded path)" — only present
+//                       when n_cols > fb_size + 2 (preprocess matrix path).
+// `n_cols` is the matrix column count (HostMatrix::n_cols). Returns true on success.
+bool DumpMatrixColumnLegend(const std::string& path,
+                            const std::vector<uint32_t>& factor_base,
+                            uint32_t n_cols);
 
 /**
  * @brief Handles the construction of the sparse matrix from GPU relation data.

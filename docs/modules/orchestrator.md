@@ -70,10 +70,11 @@ Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline, ma
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `matrix_mode` | `MatrixMode` | `AUTO` | Matrix construction mode. `AUTO`: select by LP fraction vs. threshold. `LEGACY`: projected (F+2)-column matrix. `PREPROCESS`: expanded (F+2+L)-column merge/filter pipeline. CLI: `--matrix_mode legacy\|preprocess` |
+| `matrix_mode` | `MatrixMode` | `AUTO` | Matrix construction mode. `AUTO`: **resolves to LEGACY for normal runs** (the old LP-fraction auto-switch was removed — preprocessing degrades the obstructed high-LP regime). `LEGACY`: projected (F+2)-column matrix. `PREPROCESS`: expanded (F+2+L)-column merge/filter pipeline (engages only via explicit flag, or AUTO in `MATRIX_ONLY` replay with raw partials). CLI: `--matrix_mode legacy\|preprocess` |
+| `char_mode` | `matrix::CharMode` | `NONE` | Character-column symbol. `NONE`: zero char cols (default). `NORM`: legacy genus-blind NORM symbol. `BRANCH`: branch-fixed field-element symbol (aux primes `> lp1_bound`, fixed Tonelli roots). Never auto-enabled — set only by CLI. See [matrix.md](matrix.md). CLI: `--char_mode norm\|branch\|none` |
 | `matrix_backend` | `int` | 0 (CPU) | Preprocessing backend: 0 = CPU, 1 = GPU, 2 = auto (GPU if available and >10K rows). CLI: `--matrix_backend cpu\|gpu\|auto` |
-| `lp_preprocess_threshold` | `double` | 0.55 | Auto-detect threshold: LP fraction above this triggers PREPROCESS mode. CLI: `--lp_preprocess_threshold` |
-| `lp_matrix_threshold` | `double` | 0.01 | **DEPRECATED** alias for `lp_preprocess_threshold`. CLI: `--lp_matrix_threshold` |
+| `lp_preprocess_threshold` | `double` | 0.55 | **DEPRECATED / INERT.** Formerly the LP fraction above which AUTO selected PREPROCESS; the auto-switch was removed. Still parsed, no effect. CLI: `--lp_preprocess_threshold` |
+| `lp_matrix_threshold` | `double` | 0.01 | **DEPRECATED** alias for `lp_preprocess_threshold` (also inert). CLI: `--lp_matrix_threshold` |
 | `partial_subsample` | `double` | 1.0 | Fraction of partials/LP-combined to retain in `MATRIX_ONLY`. Range [0.0, 1.0]; 1.0 = no subsampling. CLI: `--partial_subsample` |
 | `smooth_subsample` | `double` | 1.0 | Fraction of pure smooths (`large_primes ≤ 1`) to retain in `MATRIX_ONLY`. LP-combined relations are always retained. Range [0.0, 1.0]; 1.0 = no subsampling. CLI: `--smooth_subsample` |
 | `truncation_factor` | `double` | 1.05 | Matrix truncation on/off switch: > 0 = enabled, 0 = disabled. Actual target is excess-based (M12-S1): `n_cols + n_extra_cols + matrix_truncation_excess`. Retained as backward-compatible CLI toggle. CLI: `--truncation_factor` |
@@ -94,6 +95,7 @@ Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline, ma
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `sqrt_legacy` | `bool` | false | If true, use CPU `Perform()` loop; default uses GPU batched path |
+| `sqrt_diagnostic` | `bool` | false | If true, log extra sqrt diagnostics: per-solution nontrivial-GCD rate (`k/n`) per Block-Wiedemann solution, HalveExponents validity, solution diversity (at `LOG_DEBUG_1`). CLI: `--sqrt_diagnostic` |
 
 ### Cluster Fields
 

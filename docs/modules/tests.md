@@ -7,6 +7,7 @@ Main driver binary and auxiliary test utilities for the MPQS pipeline.
 | File | Lines | Build Target | Purpose |
 |------|-------|-------------|---------|
 | `cuda-mpqs.cpp` | ~700 | `cuda-mpqs` | Primary driver: CLI parsing, orchestrator invocation, factor verification, bootstrap mode |
+| `tools/sqrt_failure/relation_validator.cu` | -- | `relation_validator` | Standalone host-side relation + large-prime validator (see below) |
 | `sqrt_benchmark.cpp` | 135 | `bench_sqrt` (`EXCLUDE_FROM_ALL`) | **Stale**: uses old AoS `Relation` API; kept for reference but not functional with current SoA pipeline |
 | `sieving_benchmark.cpp` | 317 | *(not in build)* | **Stale**: development-only isolated sieve + postprocessing via low-level API; no build target |
 | `mpqs_analyzer.html` | -- | -- | Browser-based analysis/visualization artifact |
@@ -68,7 +69,7 @@ All buffer size flags accept K/M suffixes (base-1024, e.g. `512K`, `4M`).
 | `--sqrt_only` | Load kernel vectors + sqrt (**BROKEN** — use `--linalg_only` instead) |
 | `--param_test` | Parameter exploration (exits after sieve) |
 | `--sqrt_legacy` | Force CPU sqrt path (debug/benchmark; default: GPU batched) |
-| `--sqrt_diagnostic` | Log extra sqrt diagnostics (HalveExponents validity, solution diversity) |
+| `--sqrt_diagnostic` | Log extra sqrt diagnostics: per-solution nontrivial-GCD rate (`k/n`) per BW solution, HalveExponents validity, solution diversity (at `LOG_DEBUG_1`; pair with `--log_file`) |
 | `--estimate_only` | Run truncated sieve probe + print runtime estimate, then exit |
 
 `--autotune_only` (sets `AUTOTUNE_ONLY` mode) and `--autotune_bootstrap` (bootstrap mode) are documented in the Autotune section.
@@ -77,10 +78,11 @@ All buffer size flags accept K/M suffixes (base-1024, e.g. `512K`, `4M`).
 
 | Flag | Argument | Description |
 |------|----------|-------------|
-| `--matrix_mode` | `<legacy\|preprocess>` | Matrix construction mode (default: auto) |
+| `--matrix_mode` | `<legacy\|preprocess>` | Matrix construction mode (default: auto, which **resolves to legacy** for normal runs; preprocess only via explicit flag or `--matrix_only`) |
+| `--char_mode` | `<norm\|branch\|none>` | Character-column symbol (default: none). `none` = zero char cols; `norm` = legacy NORM symbol; `branch` = branch-fixed field-element symbol. See [matrix.md](matrix.md) |
 | `--matrix_backend` | `<cpu\|gpu\|auto>` | Preprocessing backend (default: cpu; auto → gpu if available and >10K rows) |
-| `--lp_preprocess_threshold` | `<F>` | LP fraction for auto preprocess-mode detection (default: 0.55) |
-| `--lp_matrix_threshold` | `<F>` | **Deprecated** alias for `--lp_preprocess_threshold` (propagates only if the latter is unset) |
+| `--lp_preprocess_threshold` | `<F>` | **Deprecated / inert**: the LP-fraction auto-preprocess switch was removed (default still parsed: 0.55, no effect) |
+| `--lp_matrix_threshold` | `<F>` | **Deprecated** alias for `--lp_preprocess_threshold` (also inert; propagates only if the latter is unset) |
 | `--truncation_factor` | `<F>` | Post-GF(2) row truncation enable flag (>0 enabled, 0 disabled; default: 1.05). Actual target is excess-based — see `--matrix_truncation_excess` |
 | `--matrix_truncation_excess` | `<N>` | Excess rows above `(n_cols + n_extra_cols)` (default: 200) |
 | `--compact_cycles` | `<N>` | Max compact-merge cycles, GPU backend (default: 5; 0 = single pass / no compaction) |
@@ -171,6 +173,39 @@ Runs a truncated sieve probe via `autotune::estimateRuntime()` and prints a brea
 ### Bootstrap Mode (`--autotune_bootstrap`)
 
 Requires `--autotune_candidates <file>`. Loads candidate composites (one decimal per line, `#` comments and blank lines skipped), sorts by bit-length ascending, and factors each with `FULL_PIPELINE`. Autotune history is saved after each successful factorization, building a history database for future autotune lookups.
+
+## Standalone Validation Tool: `relation_validator`
+
+`tools/sqrt_failure/relation_validator.cu` builds the `relation_validator` executable: a host-side,
+CPU-only exhaustive correctness checker for a saved relations file (`.v2` or `.soa`, loaded via
+`detect_and_deserialize`). It independently re-derives every relation from scratch — it does not
+trust what the GPU sieve/postprocessing recorded — and, crucially, runs a **deterministic primality
+test on every recorded large prime**. Per relation (smooths and partials) it checks:
+
+1. **Algebraic identity** — recompute `Q = sqrt_Q² − N`, confirm the recorded sign, and confirm `|Q| == 2^v2 · Π fb[idx]^count · large_prime`.
+2. **Completeness / missed-factor** — independently trial-divide `|Q|` by the entire factor base and confirm the re-derived factorization matches; flags any FB prime dividing the recorded large prime (the "composite masquerading as a large prime" pathology).
+3. **Large-prime primality** (partials) — deterministic Miller–Rabin (BPSW fallback for very large values); flags every composite large prime.
+4. **Range** — confirm `max(factor_base) < large_prime ≤ lp_bound`.
+
+Compiled as CUDA (for the `__host__ __device__` math headers) but launches no kernels; parallelised
+with OpenMP. Not registered as a CTest target (it takes a relations-file argument).
+
+## CTest Targets (branch-fixed character columns, Stages 1–6)
+
+Six regression tests are registered with CTest (`add_test`), all CPU-only host tests compiled as
+CUDA. They certify the branch-fixed character-column machinery end to end:
+
+| Test (`add_test` name) | Stage | Certifies |
+|------|-------|-----------|
+| `nt_primitives_u64` | 1 | `Tonelli_Shanks_u64` / `jacobi_u64` / `is_prime_u64` (sieve) + `uint512::mod_uint64` against a 128-bit oracle and the uint32 implementations |
+| `aux_prime_selection` | 2 | `selectAuxPrimes()` under `NORM` (byte-identical legacy walk) and `BRANCH` (q > lp1_bound, fixed Tonelli root) |
+| `branch_char_bit` | 3 | `branchCharBit` genus-correctness vs. a Python reference, the F2 homomorphism, and host==device parity |
+| `char_bits_persist` | 4 | Birth-capture formula parity, `relation_io` v2 char-bit round-trip (and char-less back-compat), cluster wire round-trip |
+| `char_xor_propagation` | 5 | CPU XOR propagation: LP-combination XOR, merge-tree reduction XOR, per-relation adapter, append-after-reduction structure |
+| `packed_char_gather` / `packed_char_device_parity` | 6 | M9v2 packed propagation parity (host mirror + real GPU pipeline) vs. the CPU merge-tree oracle |
+
+The Stage-3 fixture (`branch_char_fixture.h`) is regenerated at build time from the Python reference
+so it tracks the genus prototype.
 
 ## Built-in Test Numbers
 

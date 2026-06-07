@@ -58,7 +58,13 @@ struct Relation {
     /// If 1, it is a full relation.
     /// If > 1, it is a Large Prime (up to 128 bits).
     /// If 0, it indicates an error/invalid LP.
-    unsigned __int128 large_prime_remainder; 
+    unsigned __int128 large_prime_remainder;
+
+    /// @brief Branch-fixed character vector (Stage 4): r-bit (r<=32) char vector of
+    /// the SIGNED (ax+b), one bit per branch aux prime. Computed at relation birth
+    /// in processCandidate only under --char_mode branch (else 0). It is a property
+    /// of (ax+b) alone, so the SAME value rides on both the smooth and partial append.
+    uint32_t char_bits = 0;
 };
 
 } // namespace structures

@@ -31,6 +31,7 @@
 #include "autotune.h"
 #include "merge_tree.h"
 #include "merge_filter.h"
+#include "character_columns.h"  // matrix::CharMode (Stage 2)
 #include "expanded_matrix.h"
 #include "preprocess.h"        // PreprocessResultV2 (M9f)
 #include <optional>
@@ -84,6 +85,23 @@ struct MPQSConfig {
     bool disk_io = false;
     std::string work_dir = "./mpqs_work";
 
+    // --- Diagnostic disk dumps (sqrt-failure investigation) ---
+    // Both are ADDITIVE and strictly opt-in: when false, the standard code path
+    // and its allocations/performance are byte-for-byte unchanged.
+    bool dump_matrix = false;          ///< CLI: --dump_matrix. Dump finalized matrix_A_
+                                       ///< (CSR binary + human-readable column legend) to work_dir.
+    bool dump_kernel_vectors = false;  ///< CLI: --dump_kernel_vectors. Enable BW writer
+                                       ///< (bw_config.stage3_save_solutions) AND dump the final
+                                       ///< orchestrator kernel_solutions_ (original-relation space)
+                                       ///< plus a sidecar documenting row space + bit→relation map.
+    bool dump_combine_provenance = false; ///< CLI: --dump_combine_provenance. Capture the two
+                                       ///< constituents (probe root u_p, witness root u_w, signs,
+                                       ///< val_2_exps, LP) of every LP-combined relation BEFORE the
+                                       ///< slab purge, and serialize to combine_provenance.bin in
+                                       ///< work_dir. ADDITIVE/diagnostic: when false, NO provenance
+                                       ///< buffer is allocated and NO extra kernel runs — the
+                                       ///< factorization path is byte-for-byte unchanged.
+
     // Tuning
     bool auto_tune_parameters = true;
     bool lp1_variation = false;    // overriden by auto_tune if auto_tune=true
@@ -98,6 +116,7 @@ struct MPQSConfig {
     double lp_matrix_threshold = 0.01;  ///< DEPRECATED: use lp_preprocess_threshold. Kept as alias.
     MatrixMode matrix_mode = MatrixMode::AUTO;  ///< Matrix construction mode. CLI: --matrix_mode legacy|preprocess
     int matrix_backend = 0;  ///< 0=CPU, 1=GPU, 2=AUTO. CLI: --matrix_backend cpu|gpu|auto
+    matrix::CharMode char_mode = matrix::CharMode::NONE;  ///< CLI: --char_mode norm|branch|none. Default none (char cols off); pass --char_mode norm|branch to enable.
     double lp_preprocess_threshold = 0.55;      ///< Auto-detect threshold: LP fraction above this → PREPROCESS.
                                                  ///< CLI: --lp_preprocess_threshold
     double partial_subsample = 1.0;  ///< Fraction of partials/LP-combined to retain in matrix_only.
@@ -564,6 +583,18 @@ private:
     /// Applied via ApplyLPCorrection (GPU) or mont.mul in Perform (CPU).
     /// MUST NOT be passed through mont.transform() again -- already in Montgomery form.
     std::vector<mpqs::uint512> precomputed_lp_y_;
+
+    // --- Branch-fixed character columns (Stage 4) ---
+    /// Branch aux primes q_s and fixed Tonelli roots t_s, selected once (under
+    /// --char_mode branch) and uploaded to the device for the postprocessing capture.
+    /// Empty / nullptr under --char_mode norm.
+    std::vector<uint64_t> branch_aux_primes_;   ///< r aux primes q_s (> lp1_bound)
+    std::vector<uint64_t> branch_aux_t_s_;      ///< r fixed Tonelli roots t_s
+    uint64_t* d_branch_aux_primes_ = nullptr;   ///< device copy of q_s
+    uint64_t* d_branch_aux_t_s_ = nullptr;      ///< device copy of t_s
+    /// Select (host) and upload (device) the branch aux primes/roots if char_mode is
+    /// branch and they are not yet computed. No-op under norm mode. Idempotent.
+    void initBranchCharData();
 };
 
 } // namespace mpqs

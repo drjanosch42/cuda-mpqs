@@ -24,6 +24,7 @@ set_target_properties(mpqs_matrix PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 target_link_libraries(mpqs_matrix PUBLIC
     mpqs_common
+    mpqs_sieve  # Stage 2: 64-bit NT primitives (Tonelli_Shanks_u64/jacobi_u64/is_prime_u64) + prime_algorithms.h include path
     cudampqs_build_flags
 )
 

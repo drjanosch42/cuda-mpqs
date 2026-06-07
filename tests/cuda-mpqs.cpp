@@ -196,6 +196,11 @@ void print_usage(const char* prog_name) {
               << "  --device <ID>    GPU Device ID [Default: 0]\n"
               << "  --dir <PATH>     Working directory [Default: ./mpqs_work]\n"
               << "  --disk_io        Enable dumping relations to disk\n"
+              << "  --dump_matrix    Dump finalized GF(2) matrix (matrix.csr + matrix_columns.txt) to <dir>\n"
+              << "  --dump_kernel_vectors  Dump BW solutions (bw_*.bin, reduced-row space) and final\n"
+              << "                         kernel_vectors.bin + .txt (original-relation space) to <dir>\n"
+              << "  --dump_combine_provenance  Capture LP-combined relation constituents (probe/witness\n"
+              << "                         roots, signs, exps, LP) to combine_provenance.bin in <dir>\n"
               << "\n--- Tuning / Sieving ---\n"
               << "  --fb_bound <N>   Factor Base Bound F (K/M/B/T suffix) [Default: Auto/20000]\n"
               << "  --lp1_bound <N>  Large Prime Bound 1 (K/M/B/T suffix)\n"
@@ -219,7 +224,9 @@ void print_usage(const char* prog_name) {
               << "  --sqrt_only      Run Sqrt step only (BROKEN: use --linalg_only instead)\n"
               << "  --matrix_only    Load v2 relations, run matrix preprocessing + BW + sqrt\n"
               << "  --matrix_mode <MODE>    Matrix construction: legacy, preprocess [Default: auto]\n"
-              << "  --lp_preprocess_threshold <F>  LP fraction for auto preprocess [Default: 0.55]\n"
+              << "  --char_mode <MODE>      Character-column aux-prime selection: norm, branch, none [Default: none]\n"
+              << "                            none = append ZERO character columns (scientific null control).\n"
+              << "  --lp_preprocess_threshold <F>  DEPRECATED/INERT: AUTO no longer auto-selects preprocess from LP fraction; use --matrix_mode preprocess to opt in [Default: 0.55]\n"
               << "  --lp_matrix_threshold <F>  DEPRECATED: alias for --lp_preprocess_threshold (kept for backwards compatibility)\n"
               << "  --partial_subsample <F>  Subsample partials/LP-combined for matrix_only experiments [0.0-1.0, default: 1.0]\n"
               << "  --smooth_subsample <F>   Subsample pure smooths (LP-combined always kept) for matrix_only experiments [0.0-1.0, default: 1.0]\n"
@@ -365,6 +372,12 @@ ParsedArgs parse_args(int argc, char** argv) {
             args.config.work_dir = argv[++i];
         } else if (arg == "--disk_io") {
             args.config.disk_io = true;
+        } else if (arg == "--dump_matrix") {
+            args.config.dump_matrix = true;
+        } else if (arg == "--dump_kernel_vectors") {
+            args.config.dump_kernel_vectors = true;
+        } else if (arg == "--dump_combine_provenance") {
+            args.config.dump_combine_provenance = true;
         }
 
         // --- Modes ---
@@ -479,6 +492,21 @@ ParsedArgs parse_args(int argc, char** argv) {
                 exit(1);
             }
             args.mark("matrix_mode");
+        }
+        else if (arg == "--char_mode" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "norm") {
+                args.config.char_mode = matrix::CharMode::NORM;
+            } else if (mode == "branch") {
+                args.config.char_mode = matrix::CharMode::BRANCH;
+            } else if (mode == "none") {
+                args.config.char_mode = matrix::CharMode::NONE;
+            } else {
+                std::cerr << "Error: unknown --char_mode '" << mode
+                          << "'. Valid values: norm, branch, none\n";
+                exit(1);
+            }
+            args.mark("char_mode");
         }
         else if (arg == "--lp_preprocess_threshold" && i + 1 < argc) {
             double val;

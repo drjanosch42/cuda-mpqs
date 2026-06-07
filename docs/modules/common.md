@@ -19,7 +19,7 @@ Static library `mpqs_common`. Separable CUDA compilation ON. Links `cudampqs_bui
 | `mpqs_soa.cu` | SoA batch operations: resize, append, validation kernel, D-to-H/H-to-D transfer, counter management. |
 | `logger/hpc_logger.h` | `HPCLogger` singleton + `LogMessage` proxy. Severity levels, stage tracking, macros. |
 | `logger/hpc_logger.cpp` | Logger implementation: thread-safe writes, console/file output, CSV mode. |
-| `relation_io.h` | Binary I/O interface (`mpqs::io`): v1 (`HostRelationBatch` + projected LP) and v2 (full smooths + raw partials + `V2Metadata`) serialization. Auto-detection via `detect_and_deserialize`. |
+| `relation_io.h` | Binary I/O interface (`mpqs::io`): v1 (`HostRelationBatch` + projected LP) and v2 (full smooths + raw partials + `V2Metadata`) serialization. Auto-detection via `detect_and_deserialize`. v2 optionally carries branch character bits (`FLAG_HAS_CHAR_BITS`). |
 | `relation_io.cpp` | Implementation of v1/v2 serialize/deserialize with `"MPQS_SOA\0"` and `"MPQS_V2\0"` magic headers. |
 | `cuda_check.h` | `CUDA_CHECK(call)` / `CUDA_CHECK_FATAL(call)` macros: log error via `HPCLogger` at `LOG_ERROR_CRITICAL` then throw `std::runtime_error`. |
 
@@ -36,7 +36,7 @@ Free helpers in `mpqs` namespace: `clz32(uint32_t)`, `ctz32(uint32_t)` — porta
 | Constructors | `uint512()`, `uint512(uint32_t)`, `uint512(uint64_t)`, `uint512(unsigned __int128)`, `uint512(const char*)`, `uint512(const uint32_t(&)[16])` |
 | Factory | `static max_value()` — returns 2^512 - 1 |
 | Arithmetic | `add`, `sub`, `mult`, `div`, `mod`, `div_mod_core(divisor, remainder_out*)` |
-| Small-type arithmetic | `add_uint32(uint32_t)`, `mult_uint32(uint32_t)`, `mul_uint64_inplace(uint64_t)` → returns overflow carry, `div_uint32_inplace(uint32_t)` → returns remainder, `div_uint64_inplace(uint64_t)` → returns remainder, `div_uint32_const(uint32_t)` → non-destructive quotient, `mod_uint32(uint32_t)` → const read-only remainder |
+| Small-type arithmetic | `add_uint32(uint32_t)`, `mult_uint32(uint32_t)`, `mul_uint64_inplace(uint64_t)` → returns overflow carry, `div_uint32_inplace(uint32_t)` → returns remainder, `div_uint64_inplace(uint64_t)` → returns remainder, `div_uint32_const(uint32_t)` → non-destructive quotient, `mod_uint32(uint32_t)` → const read-only remainder, `mod_uint64(uint64_t)` → const read-only 64-bit remainder (limb-by-limb `__int128`; used by branch char-bit capture to compute `|ax+b| mod q`) |
 | Modular | `add_mod`, `sub_mod`, `double_mod`, `mul_mod`, `negate_mod_inplace`, `additive_inverse_mod_n` |
 | Specialized | `mul_add_mod_signed(int64_t x, b, N)` — computes `(a*x + b) mod N` for polynomial evaluation |
 | Bit ops | `lshift`, `rshift`, `msb()`, `countr_zero()`, `msb_is_set()` |
@@ -79,6 +79,7 @@ Namespace: `mpqs::structures`.
 | `factor_offsets` | `vector<uint64_t>` | CSR row pointers, size n+1 |
 | `factor_indices` | `vector<uint32_t>` | Factor base indices (CSR values) |
 | `factor_counts` | `vector<uint8_t>` | Multiplicities (CSR values) |
+| `char_bits` | `vector<uint32_t>` | Branch-fixed per-relation character vector (Stage 4); 0 in `norm`/`none` mode. Empty unless `--char_mode branch`. |
 | `num_relations` | `size_t` | Fill count |
 | `num_factors` | `size_t` | Fill count |
 
@@ -114,10 +115,22 @@ Namespace: `mpqs::structures`. Raw device pointers + atomic counters + bounds. P
 | Field | Description |
 |-------|-------------|
 | `sqrt_Q`, `signs`, `val_2_exps`, `large_primes` | Per-relation arrays |
+| `char_bits` | Branch-fixed per-relation character vector (Stage 4); 0 in `norm`/`none` mode |
 | `factor_offsets`, `factor_indices`, `factor_counts` | CSR factor arrays |
 | `global_count`, `global_factor_idx` | Device atomic counters |
 | `max_relations`, `max_factors` | Bounds for overflow checking |
 | `target_cap` | Adaptive convergence ceiling (0 = unlimited) |
+
+### Relation I/O v2 Character Extension
+
+The v2 format (`relation_io.h`) carries the branch-fixed character data behind a forward-tolerant
+flag bit, `FLAG_HAS_CHAR_BITS` (0x4). When set, the file appends — at the **end** of the
+fixed-position metadata block — the aux-prime metadata (`uint32_t r`, then `r` aux primes `q_s` and
+`r` Tonelli roots `t_s`) and the per-relation `char_bits` vectors (after the smooth/partial batch
+records). Old `.v2` files (no char flag) parse byte-for-byte unchanged, loading with empty
+`char_bits` and `V2Metadata::has_char_bits == false`. Consumers (e.g. the orchestrator under
+`--char_mode branch`) check `has_char_bits` to refuse char-less input. See [matrix.md](matrix.md)
+for how the vectors are used.
 
 ### Montgomery
 

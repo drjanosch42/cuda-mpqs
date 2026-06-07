@@ -59,9 +59,13 @@ serializeRelationBatch(const mpqs::structures::HostRelationBatch& batch, uint64_
         num_factors = batch.factor_offsets[count];
     }
 
-    // Total: 8 (header) + count*(64+1+4+16) + (count+1)*8 + num_factors*(4+1)
+    // Total: 8 (header) + count*(64+1+4+16+4) + (count+1)*8 + num_factors*(4+1)
+    // The extra count*4 carries the Stage 4 branch char_bits (4B/relation). Worker→
+    // coord ships raw partials with their char vectors so the coordinator can XOR on
+    // combination (Stage 5 logic). char_bits is always present in the wire format
+    // (a defined 0 in norm mode); it never enters the dedup hash (see accumulator.h).
     size_t total = 8
-        + count * (sizeof(mpqs::uint512) + 1 + 4 + 16)  // sqrt_Q, signs, val_2_exps, large_primes
+        + count * (sizeof(mpqs::uint512) + 1 + 4 + 16 + 4)  // sqrt_Q, signs, val_2_exps, large_primes, char_bits
         + (count + 1) * sizeof(uint64_t)                  // factor_offsets (CSR with sentinel)
         + num_factors * sizeof(uint32_t)                   // factor_indices
         + num_factors * sizeof(uint8_t);                   // factor_counts (per-factor exponents)
@@ -80,6 +84,14 @@ serializeRelationBatch(const mpqs::structures::HostRelationBatch& batch, uint64_
         writeBytes(buf, offset, batch.signs.data(), count * sizeof(uint8_t));
         writeBytes(buf, offset, batch.val_2_exps.data(), count * sizeof(int32_t));
         writeBytes(buf, offset, batch.large_primes.data(), count * sizeof(unsigned __int128));
+        // Stage 4: branch char_bits (4B/relation). The buffer is always sized for
+        // `count` entries; write the live values when present, else a defined 0.
+        if (batch.char_bits.size() >= count) {
+            writeBytes(buf, offset, batch.char_bits.data(), count * sizeof(uint32_t));
+        } else {
+            std::vector<uint32_t> zeros(count, 0u);
+            writeBytes(buf, offset, zeros.data(), count * sizeof(uint32_t));
+        }
         // CSR: write (count + 1) factor_offsets including sentinel
         writeBytes(buf, offset, batch.factor_offsets.data(), (count + 1) * sizeof(uint64_t));
         if (num_factors > 0) {
@@ -108,6 +120,8 @@ uint64_t deserializeRelationBatch(const uint8_t* data, size_t len,
         r.readBytes(out.signs.data(), n_rels * sizeof(uint8_t));
         r.readBytes(out.val_2_exps.data(), n_rels * sizeof(int32_t));
         r.readBytes(out.large_primes.data(), n_rels * sizeof(unsigned __int128));
+        // Stage 4: branch char_bits (resize() already sized out.char_bits to n_rels).
+        r.readBytes(out.char_bits.data(), n_rels * sizeof(uint32_t));
         r.readBytes(out.factor_offsets.data(), (n_rels + 1) * sizeof(uint64_t));
         if (n_facs > 0) {
             r.readBytes(out.factor_indices.data(), n_facs * sizeof(uint32_t));
@@ -345,6 +359,10 @@ structures::HostRelationBatch mergeRelationBatches(
         std::memcpy(out.signs.data()        + rel_cursor, b->signs.data(),         n * sizeof(uint8_t));
         std::memcpy(out.val_2_exps.data()   + rel_cursor, b->val_2_exps.data(),    n * sizeof(int32_t));
         std::memcpy(out.large_primes.data() + rel_cursor, b->large_primes.data(),  n * sizeof(unsigned __int128));
+        // Stage 4: branch char_bits. out.char_bits was sized by resize(); source may
+        // lack char_bits (legacy) — copy only when present (else leaves the 0 default).
+        if (b->char_bits.size() >= n)
+            std::memcpy(out.char_bits.data() + rel_cursor, b->char_bits.data(),    n * sizeof(uint32_t));
 
         // CSR factor storage
         if (n_facs > 0) {

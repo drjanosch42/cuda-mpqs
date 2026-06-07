@@ -26,6 +26,19 @@ struct V2Metadata {
     std::vector<uint32_t> factor_base; ///< Factor base primes
     uint64_t lp_bound = 0;            ///< LP bound used during sieving
     uint32_t sieve_bound = 0;         ///< M (sieve interval half-width)
+
+    // --- Branch-fixed character columns (Stage 4) ---
+    // Present only when the file carries char bits (FLAG_HAS_CHAR_BITS). Written/read
+    // at the END of the fixed-position metadata block, flag-guarded, so old .v2 files
+    // (no char flag) parse byte-for-byte unchanged.
+    std::vector<uint64_t> aux_primes;  ///< r branch aux primes q_s (64-bit, > lp_bound)
+    std::vector<uint64_t> t_s;         ///< r fixed Tonelli roots (t_s^2 == N mod q_s)
+    uint32_t r = 0;                    ///< number of branch aux primes (== char_bits bit-width)
+
+    /// Set by deserialize_v2/detect_and_deserialize: true iff the loaded file carried
+    /// FLAG_HAS_CHAR_BITS. The orchestrator load point (Stage 5) uses this to REFUSE
+    /// char-less input under --char_mode branch. Defaults false (e.g. norm-mode files).
+    bool has_char_bits = false;
 };
 
 bool serialize_v2(const std::string& path,

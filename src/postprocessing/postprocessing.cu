@@ -3,6 +3,7 @@
 
 #include "postprocessing.h"
 #include "../largeprimes/largeprime.h" // SLPPinnedStats (full definition for prediction kernel)
+#include "gpu_char_cols.cuh" // Stage 4: mpqs::matrix::branchCharBit (header-only inline)
 #include "logger/hpc_logger.h"
 #include "cuda_check.h"
 #include <thrust/sort.h>
@@ -268,6 +269,9 @@ void append_to_soa(
     view.signs[my_global_rel_idx]        = meta_data.sign_of_Q;
     view.val_2_exps[my_global_rel_idx]   = meta_data.val_2_exp;
     view.large_primes[my_global_rel_idx] = meta_data.large_prime_remainder;
+    // Stage 4: branch character vector (0 under norm mode; identical for both the
+    // smooth and partial views since it is a property of (ax+b)).
+    view.char_bits[my_global_rel_idx]    = meta_data.char_bits;
 
     // Write CSR Offsets
     // This defines the range [start, start + count) for this relation
@@ -302,8 +306,12 @@ __device__ __forceinline__ void processCandidate(
     mpqs::sieve::DenseCandidate c = input[tid];
 
     // --- 1. Compute Sqrt(Q) and Q ---
+    // 5-arg form also returns the SIGN of the genuine (signed) (ax+b), which is
+    // discarded when reducing to sqrt_Q = |ax+b|. The branch-fixed character path
+    // (Stage 4) needs that sign to form the SIGNED field element ((ax+b) - t_s) mod q.
     mpqs::uint512 sqrt_Q;
-    mpqs::math::calculate_sqrt_of_QX(c.a, c.b, c.true_x, sqrt_Q);
+    int8_t sign_axb;
+    mpqs::math::calculate_sqrt_of_QX(c.a, c.b, c.true_x, sqrt_Q, sign_axb);
 
     mpqs::uint512 Q = sqrt_Q;
     int8_t sign;
@@ -376,6 +384,29 @@ __device__ __forceinline__ void processCandidate(
     meta.sign_of_Q = sign;
     meta.val_2_exp = val_2_exp;
     meta.large_prime_remainder = is_one ? 1 : remainder;
+
+    // --- 5b. Branch-fixed character vector (Stage 4) ---
+    // Computed at relation birth from the SIGNED (ax+b). Gated on cfg.char_branch
+    // (--char_mode branch): under the default norm mode this whole block is skipped,
+    // leaving meta.char_bits at its defined 0 (zero added hot-path arithmetic). Even
+    // in branch mode the r-prime loop runs ONLY for relations actually emitted
+    // (is_one for smooths OR is_valid_partial for partials) — never for discards.
+    // char_bits is a property of (ax+b) alone, so the SAME value feeds both the
+    // smooth and partial append below.
+    meta.char_bits = 0u;
+    if (cfg.char_branch && (is_one || is_valid_partial)) {
+        uint32_t char_bits = 0u;
+        for (uint32_t s = 0; s < cfg.char_r; ++s) {
+            uint64_t q  = cfg.d_char_q[s];
+            uint64_t aq = sqrt_Q.mod_uint64(q);                       // |ax+b| mod q (Stage 1)
+            uint64_t axb_mod_q = (sign_axb == -1)
+                                 ? mpqs::math::sub_mod(0, aq, q)       // recover sign of (ax+b)
+                                 : aq;
+            char_bits |= ((uint32_t)mpqs::matrix::branchCharBit(
+                              axb_mod_q, cfg.d_char_t[s], q)) << s;     // Stage 3 primitive
+        }
+        meta.char_bits = char_bits;
+    }
 
     // --- 6. Interface Calls (Dual Append) ---
     append_to_soa(
@@ -473,6 +504,12 @@ __global__ void find_first_bad_offset(
  * [63..48] Length (num_factors)
  * [47..32] XOR Sum of Factor Exponents (counts)
  * [31.. 0] XOR Sum of (Factor Index * Magic) ^ SignLogic
+ *
+ * Stage 4 invariant (M12-S5/S5b analogue): view.char_bits is DELIBERATELY excluded
+ * from this hash. char_bits is a deterministic function of (ax+b), so two relations
+ * with identical factorization carry identical char vectors — folding it in cannot
+ * change dedup identity but would risk divergence from the cluster CPU dedup hash.
+ * Keeping it out preserves byte-for-byte dedup behaviour in both norm and branch mode.
  */
 __global__ void compute_relation_hashes_soa(
     mpqs::structures::RelationBatchView view,
@@ -544,6 +581,7 @@ __global__ void gather_soa_relations_kernel(
     dest.sqrt_Q[new_idx]       = src.sqrt_Q[old_idx];
     dest.signs[new_idx]        = src.signs[old_idx];
     dest.val_2_exps[new_idx]   = src.val_2_exps[old_idx];
+    dest.char_bits[new_idx]    = src.char_bits[old_idx]; // Stage 4: follow relation through dedup
 
     // 2. Copy Factors
     // Src Range

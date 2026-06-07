@@ -185,4 +185,8 @@ add_subdirectory(src/cluster)
 # ==============================================================================
 # 5. Tests / Benchmarks
 # ==============================================================================
+# Enable CTest at the top level so add_test() in tests/ is discoverable via
+# `ctest --test-dir <build>` (root-scope enable_testing() generates the
+# build-root CTestTestfile.cmake that includes the tests/ subdirectory).
+enable_testing()
 add_subdirectory(tests)

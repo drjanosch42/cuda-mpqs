@@ -161,9 +161,15 @@ public:
     uint64_t rawTarget() const { return target_; }
 
 private:
-    /// Compute 64-bit hash matching deduplicateHostBatch in mpqs_soa.cu:
+    /// Compute 64-bit hash matching compute_relation_hashes_soa in postprocessing.cu:
     ///   hash = (len << 48) | (exp_xor << 32) | body_xor
     /// where body_xor includes factor_indices * MAGIC, sign, and val_2_exp.
+    ///
+    /// Stage 4 invariant (M12-S5/S5b analogue): batch.char_bits is DELIBERATELY NOT
+    /// folded into this hash. char_bits is a deterministic function of (ax+b), so two
+    /// relations with identical factorization share identical char vectors — including
+    /// it cannot change dedup identity, and excluding it keeps this CPU coordinator
+    /// hash byte-for-byte equivalent to the GPU worker hash regardless of char_mode.
     static uint64_t computeRelationHash(const mpqs::structures::HostRelationBatch& batch, size_t i) {
         constexpr uint32_t MAGIC = 0x9e3779b9;
 
@@ -201,6 +207,9 @@ private:
         dest.signs.push_back(src.signs[idx]);
         dest.val_2_exps.push_back(src.val_2_exps[idx]);
         dest.large_primes.push_back(src.large_primes[idx]);
+        // Stage 4: carry the branch char vector (0 in norm mode). Defaults to 0 if the
+        // source batch predates char bits (size mismatch), keeping CSR/SoA aligned.
+        dest.char_bits.push_back(idx < src.char_bits.size() ? src.char_bits[idx] : 0u);
 
         // CSR factor append
         uint64_t fstart = src.factor_offsets[idx];

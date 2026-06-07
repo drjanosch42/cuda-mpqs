@@ -43,6 +43,10 @@ host can poll without any CPU/GPU synchronization.
 | `partial_buffer_size` | `uint32_t` | 1-partial buffer capacity; defaults to `accumulate_buffer_size` if 0 |
 | `shc_dim` | `uint32_t` | Hypercube dimension (number of prime factors in `a`) |
 | `device_id` | `int` | CUDA device index |
+| `char_branch` | `bool` | When true (`--char_mode branch`), capture the r-bit branch character vector at relation birth. Default false: char-bit computation is fully gated off (zero hot-path cost). |
+| `char_r` | `uint32_t` | Number of branch aux primes (`r ≤ 32`); valid only when `char_branch` |
+| `d_char_q` | `const uint64_t*` | Device array of r branch aux primes `q_s` (64-bit, `> lp1_bound`) |
+| `d_char_t` | `const uint64_t*` | Device array of r fixed Tonelli roots `t_s` (`t_s² == N mod q_s`) |
 
 ## Kernels
 
@@ -84,11 +88,26 @@ Warp-level aggregated SoA append:
 6. Each thread scatter-writes its relation scalars (`sqrt_Q`, `sign`, `val_2_exp`,
    `large_prime_remainder`) and factor arrays (indices + counts) into CSR layout.
 
+### Branch Character-Bit Capture (`--char_mode branch`)
+
+When `PostProcConfig::char_branch` is set, the trial-division path (`processCandidate`, shared by
+both factorization kernels) computes the r-bit branch character vector for every **emitted**
+relation (full smooth or valid 1-partial — never for discards). For each of the `char_r` aux primes
+`q_s` it recovers the signed `(ax+b) mod q_s` (via `sqrt_Q.mod_uint64(q_s)` and the sign of `ax+b`)
+and evaluates `mpqs::matrix::branchCharBit(axb_mod_q, t_s, q_s)`, packing bit `s` into
+`view.char_bits[i]`. Because the vector depends only on `(ax+b)`, the same value feeds both the
+smooth and partial append. Under the default `--char_mode norm`/`none` the entire block is skipped
+and `char_bits` is written as a defined 0 (zero added hot-path arithmetic). The captured vector is
+deliberately **excluded** from the dedup hash (below) and is propagated by XOR through LP
+combination in the [largeprimes module](largeprimes.md) and through the matrix-reduction merges
+(see [matrix.md](matrix.md)). Persisted per relation in `HostRelationBatch::char_bits` and the
+`relation_io` v2 format (see [common.md](common.md)).
+
 ### Deduplication kernels
 
 | Kernel | Purpose |
 |--------|---------|
-| `compute_relation_hashes_soa` | 64-bit hash: `[63:48]` num_factors, `[47:32]` XOR of exponents, `[31:0]` XOR(factor_idx × 0x9e3779b9) ^ sign logic |
+| `compute_relation_hashes_soa` | 64-bit hash: `[63:48]` num_factors, `[47:32]` XOR of exponents, `[31:0]` XOR(factor_idx × 0x9e3779b9) ^ sign logic. `char_bits` is **excluded** (it is a deterministic function of `(ax+b)`, so two relations with the same factorization carry identical char bits and must still dedup). |
 | `compute_new_lengths_kernel` | Computes per-survivor factor lengths for exclusive scan |
 | `gather_soa_relations_kernel` | Compacts SoA by copying survivors into a fresh batch via CSR segment copy |
 

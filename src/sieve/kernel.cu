@@ -265,7 +265,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
                     // Loop terminates when offset <= sieveBlockStart.
                     // Safe because offset is int and subtracts p.
                     int offset = offset1 - threadIdx.x * p - p;
-                    for (; offset > sieveBlockStart; offset -= blockDim.x * p) {
+                    for (; offset >= sieveBlockStart; offset -= blockDim.x * p) {
                         int localOffset = offset - sieveBlockStart;
                         if (blockEntries[localOffset]) {
                             int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
@@ -277,7 +277,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
                         }
                     }
                     offset = offset2 - threadIdx.x * p - p;
-                    for (; offset > sieveBlockStart; offset -= blockDim.x * p) {
+                    for (; offset >= sieveBlockStart; offset -= blockDim.x * p) {
                         int localOffset = offset - sieveBlockStart;
                         if (blockEntries[localOffset]) {
                             int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
@@ -301,7 +301,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
                 //__syncthreads(); AS ABOVE, NO SYNC NEEDED
                 if (active) {
                     int offset = offset1 - p;
-                    for (; offset > sieveBlockStart; offset -= p) {
+                    for (; offset >= sieveBlockStart; offset -= p) {
                         int localOffset = offset - sieveBlockStart;
                         if (blockEntries[localOffset]) {
                             int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
@@ -313,7 +313,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
                         }
                     }
                     offset = offset2 - p;
-                    for (; offset > sieveBlockStart; offset -= p) {
+                    for (; offset >= sieveBlockStart; offset -= p) {
                         int localOffset = offset - sieveBlockStart;
                         if (blockEntries[localOffset]) {
                             int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
@@ -1177,7 +1177,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                     // Loop terminates when offset <= sieveBlockStart.
                     // Safe because offset is int and subtracts p.
                     int offset = offset1 - threadIdx.x * p - p;
-                    for (; offset > sieveBlockStart; offset -= blockDim.x * p) {
+                    for (; offset >= sieveBlockStart; offset -= blockDim.x * p) {
                         int localOffset = offset - sieveBlockStart;
                         if (blockEntries[localOffset]) {
                             int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
@@ -1189,7 +1189,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                         }
                     }
                     offset = offset2 - threadIdx.x * p - p;
-                    for (; offset > sieveBlockStart; offset -= blockDim.x * p) {
+                    for (; offset >= sieveBlockStart; offset -= blockDim.x * p) {
                         int localOffset = offset - sieveBlockStart;
                         if (blockEntries[localOffset]) {
                             int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
@@ -1213,7 +1213,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                 //__syncthreads(); AS ABOVE, NO SYNC NEEDED
                 if (active) {
                     int offset = offset1 - p;
-                    for (; offset > sieveBlockStart; offset -= p) {
+                    for (; offset >= sieveBlockStart; offset -= p) {
                         int localOffset = offset - sieveBlockStart;
                         if (blockEntries[localOffset]) {
                             int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
@@ -1225,7 +1225,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                         }
                     }
                     offset = offset2 - p;
-                    for (; offset > sieveBlockStart; offset -= p) {
+                    for (; offset >= sieveBlockStart; offset -= p) {
                         int localOffset = offset - sieveBlockStart;
                         if (blockEntries[localOffset]) {
                             int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;

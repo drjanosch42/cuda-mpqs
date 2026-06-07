@@ -6,6 +6,7 @@
 #include "matrix_constructor.h"  // HostMatrixCSR
 #include "merge_tree.h"          // MergeTree
 #include "merge_filter.h"        // SingletonResult, MergeResult, MergeFilterPipeline
+#include "character_columns.h"   // CharMode
 #include "uint512.cuh"           // uint512
 #include "mpqs_soa.h"            // RelationBatchView
 #include <vector>
@@ -149,6 +150,12 @@ std::vector<uint32_t> selectKernelVectorRows(
 /// @param gf2_floor_factor   M12-S2 GF(2) col-diversity floor as fraction of
 ///                           the initial post-singleton GF(2) col count. Default 0.5.
 /// @param gf2_min_floor      M12-S2 absolute lower bound on the GF(2) col floor. Default 8192.
+/// @param char_mode          NORM (default): product char cols via the norm symbol on
+///                           the merged sqrt_Q (gpuProductCharCols_packed) — byte-identical
+///                           to before. BRANCH (Stage 6): unpack the per-row char vector
+///                           XOR-composed through the packed reduction (d_char_bits) and
+///                           append it — bit-identical to the CPU branch path.
+/// @param lp1_bound          Large-prime bound; BRANCH selects 32 aux primes > lp1_bound.
 /// @return PreprocessResultV2 with GF(2) CSR + merged 1-partial data.
 PreprocessResultV2 gpuPreprocessMatrix_packed(
     const structures::RelationBatchView& smooth_view,
@@ -164,7 +171,9 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
     uint32_t compact_cycles = 5,
     uint32_t truncation_excess = 200,
     double gf2_floor_factor = 0.5,
-    uint32_t gf2_min_floor = 8192);
+    uint32_t gf2_min_floor = 8192,
+    CharMode char_mode = CharMode::NORM,
+    uint64_t lp1_bound = 0);
 
 } // namespace matrix
 } // namespace mpqs

@@ -244,17 +244,20 @@ void copy_row_metadata_kernel(
     const mpqs::uint512* __restrict__ smooth_sqrt_Q,
     const uint8_t*       __restrict__ smooth_signs,
     const int32_t*       __restrict__ smooth_val2,
+    const uint32_t*      __restrict__ smooth_char_bits,   // Stage 6: branch char vector (may be null)
     // Partial batch fields
     const mpqs::uint512* __restrict__ partial_sqrt_Q,
     const uint8_t*       __restrict__ partial_signs,
     const int32_t*       __restrict__ partial_val2,
+    const uint32_t*      __restrict__ partial_char_bits,  // Stage 6: branch char vector (may be null)
     // Dimensions
     uint32_t n_smooth,
     uint32_t total_rows,
     // Output
     mpqs::uint512* __restrict__ d_sqrt_Q,
     uint8_t*       __restrict__ d_signs,
-    int32_t*       __restrict__ d_val_2_exps)
+    int32_t*       __restrict__ d_val_2_exps,
+    uint32_t*      __restrict__ d_char_bits)              // Stage 6: seeded per-row char vector
 {
     uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= total_rows) return;
@@ -263,11 +266,16 @@ void copy_row_metadata_kernel(
         d_sqrt_Q[r]     = smooth_sqrt_Q[r];
         d_signs[r]      = smooth_signs[r];
         d_val_2_exps[r] = smooth_val2[r];
+        // Stage 6: seed original-row char vector mirroring d_signs. The view's
+        // char_bits is always non-null (allocated in Stage 4, zero in norm mode),
+        // but guard defensively.
+        d_char_bits[r]  = (smooth_char_bits != nullptr) ? smooth_char_bits[r] : 0u;
     } else {
         uint32_t idx = r - n_smooth;
         d_sqrt_Q[r]     = partial_sqrt_Q[idx];
         d_signs[r]      = partial_signs[idx];
         d_val_2_exps[r] = partial_val2[idx];
+        d_char_bits[r]  = (partial_char_bits != nullptr) ? partial_char_bits[idx] : 0u;
     }
 }
 
@@ -476,9 +484,12 @@ GpuPackedExpandedResult gpuBuildPackedMatrix(
 
         copy_row_metadata_kernel<<<grid, block>>>(
             smooth_view.sqrt_Q, smooth_view.signs, smooth_view.val_2_exps,
+            smooth_view.char_bits,
             partial_view.sqrt_Q, partial_view.signs, partial_view.val_2_exps,
+            partial_view.char_bits,
             n_smooth32, total_rows,
-            result.csr.d_sqrt_Q, result.csr.d_signs, result.csr.d_val_2_exps);
+            result.csr.d_sqrt_Q, result.csr.d_signs, result.csr.d_val_2_exps,
+            result.csr.d_char_bits);
         CUDA_CHECK(cudaGetLastError());
     }
 

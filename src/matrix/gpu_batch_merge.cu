@@ -131,6 +131,20 @@ uint512 resolve_sqrt_Q(
     return orig_sqrt_Q[ptr_val];
 }
 
+/// Resolve branch char vector for a row via row_ptr encoding (Stage 6).
+/// Mirrors resolve_sqrt_Q exactly — same ROW_WS_BIT selector.
+static __device__ __forceinline__
+uint32_t resolve_char_bits(
+    uint32_t ptr_val,
+    const uint32_t* orig_char_bits,
+    const uint32_t* ws_char_bits)
+{
+    if (ptr_val & ROW_WS_BIT) {
+        return ws_char_bits[ptr_val & 0x7FFFFFFFu];
+    }
+    return orig_char_bits[ptr_val];
+}
+
 /// Resolve sign for a row via row_ptr encoding.
 static __device__ __forceinline__
 uint8_t resolve_sign(
@@ -217,6 +231,7 @@ void execute_merges_kernel(
     const uint512*     __restrict__ orig_sqrt_Q,
     const uint8_t*     __restrict__ orig_signs,
     const int32_t*     __restrict__ orig_val_2_exps,
+    const uint32_t*    __restrict__ orig_char_bits,   // Stage 6: branch char vector
     // Workspace (append-only)
     PackedEntry*       ws_entries,
     uint32_t*          ws_row_starts,
@@ -224,6 +239,7 @@ void execute_merges_kernel(
     uint512*           ws_sqrt_Q,
     uint8_t*           ws_signs,
     int32_t*           ws_val_2_exps,
+    uint32_t*          ws_char_bits,                  // Stage 6: branch char vector
     uint64_t*          ws_dual_counter,
     uint32_t           ws_max_rows,
     uint32_t           ws_max_entries,
@@ -323,6 +339,15 @@ void execute_merges_kernel(
     uint8_t merged_sign = (neg1 ^ neg2) ? static_cast<uint8_t>(0xFF) : static_cast<uint8_t>(1);
     int32_t merged_v2   = v2_1 + v2_2;
 
+    // Stage 6 (branch char): XOR-compose the branch char vector in lockstep with the
+    // Montgomery sqrt_Q product. XOR is the additive (GF(2)) homomorphism dual of the
+    // multiplicative field-element product, so the merged row's char vector is the XOR
+    // of the two constituents' vectors — resolved via the SAME ROW_WS_BIT selector.
+    // Passive metadata: never an input to merge planning / col-weight decisions.
+    uint32_t cb1 = resolve_char_bits(ptr1, orig_char_bits, ws_char_bits);
+    uint32_t cb2 = resolve_char_bits(ptr2, orig_char_bits, ws_char_bits);
+    uint32_t merged_char = cb1 ^ cb2;
+
     // === Step 6: Reserve workspace slot via atomic_reserve_dual ===
     uint32_t row_slot, entry_offset;
     bool success;
@@ -345,6 +370,7 @@ void execute_merges_kernel(
     ws_sqrt_Q[row_slot]      = merged_sq;
     ws_signs[row_slot]       = merged_sign;
     ws_val_2_exps[row_slot]  = merged_v2;
+    ws_char_bits[row_slot]   = merged_char;   // Stage 6: XOR-composed branch char vector
 
     // === Step 8: Update row_ptr ===
     row_ptr[r1] = ROW_WS_BIT | row_slot;  // r1 now points to workspace
@@ -494,6 +520,11 @@ void DeviceMergeWorkspace::alloc(
     device_malloc(reinterpret_cast<void**>(&d_ws_val_2_exps),
                   max_merged_rows * sizeof(int32_t));
     CUDA_CHECK(cudaMemset(d_ws_val_2_exps, 0, max_merged_rows * sizeof(int32_t)));
+    // Stage 6 (branch char): workspace mirror of d_ws_sqrt_Q. Zero-init (default
+    // composed char vector = 0; norm mode stays 0 throughout).
+    device_malloc(reinterpret_cast<void**>(&d_ws_char_bits),
+                  max_merged_rows * sizeof(uint32_t));
+    CUDA_CHECK(cudaMemset(d_ws_char_bits, 0, max_merged_rows * sizeof(uint32_t)));
 
     // Dual counter
     device_malloc(reinterpret_cast<void**>(&d_dual_counter), sizeof(uint64_t));
@@ -535,6 +566,7 @@ DeviceMergeWorkspace::~DeviceMergeWorkspace() {
     if (d_ws_sqrt_Q)      cudaFree(d_ws_sqrt_Q);
     if (d_ws_signs)       cudaFree(d_ws_signs);
     if (d_ws_val_2_exps)  cudaFree(d_ws_val_2_exps);
+    if (d_ws_char_bits)   cudaFree(d_ws_char_bits);
     if (d_dual_counter)   cudaFree(d_dual_counter);
     if (d_row_ptr)        cudaFree(d_row_ptr);
     if (d_row_locks)      cudaFree(d_row_locks);
@@ -550,6 +582,7 @@ DeviceMergeWorkspace::DeviceMergeWorkspace(DeviceMergeWorkspace&& other) noexcep
       d_ws_sqrt_Q     (other.d_ws_sqrt_Q),
       d_ws_signs      (other.d_ws_signs),
       d_ws_val_2_exps (other.d_ws_val_2_exps),
+      d_ws_char_bits  (other.d_ws_char_bits),
       d_dual_counter  (other.d_dual_counter),
       d_row_ptr       (other.d_row_ptr),
       d_row_locks     (other.d_row_locks),
@@ -568,6 +601,7 @@ DeviceMergeWorkspace::DeviceMergeWorkspace(DeviceMergeWorkspace&& other) noexcep
     other.d_ws_sqrt_Q      = nullptr;
     other.d_ws_signs       = nullptr;
     other.d_ws_val_2_exps  = nullptr;
+    other.d_ws_char_bits   = nullptr;
     other.d_dual_counter   = nullptr;
     other.d_row_ptr        = nullptr;
     other.d_row_locks      = nullptr;
@@ -589,6 +623,7 @@ DeviceMergeWorkspace& DeviceMergeWorkspace::operator=(DeviceMergeWorkspace&& oth
     if (d_ws_sqrt_Q)      cudaFree(d_ws_sqrt_Q);
     if (d_ws_signs)       cudaFree(d_ws_signs);
     if (d_ws_val_2_exps)  cudaFree(d_ws_val_2_exps);
+    if (d_ws_char_bits)   cudaFree(d_ws_char_bits);
     if (d_dual_counter)   cudaFree(d_dual_counter);
     if (d_row_ptr)        cudaFree(d_row_ptr);
     if (d_row_locks)      cudaFree(d_row_locks);
@@ -602,6 +637,7 @@ DeviceMergeWorkspace& DeviceMergeWorkspace::operator=(DeviceMergeWorkspace&& oth
     d_ws_sqrt_Q      = other.d_ws_sqrt_Q;
     d_ws_signs       = other.d_ws_signs;
     d_ws_val_2_exps  = other.d_ws_val_2_exps;
+    d_ws_char_bits   = other.d_ws_char_bits;
     d_dual_counter   = other.d_dual_counter;
     d_row_ptr        = other.d_row_ptr;
     d_row_locks      = other.d_row_locks;
@@ -620,6 +656,7 @@ DeviceMergeWorkspace& DeviceMergeWorkspace::operator=(DeviceMergeWorkspace&& oth
     other.d_ws_sqrt_Q      = nullptr;
     other.d_ws_signs       = nullptr;
     other.d_ws_val_2_exps  = nullptr;
+    other.d_ws_char_bits   = nullptr;
     other.d_dual_counter   = nullptr;
     other.d_row_ptr        = nullptr;
     other.d_row_locks      = nullptr;
@@ -984,9 +1021,9 @@ BatchMergeResult gpuBatchMerge(
         execute_merges_kernel<<<blocks, 256>>>(
             d_candidates, n,
             csr.d_row_offsets, csr.d_entries,
-            csr.d_sqrt_Q, csr.d_signs, csr.d_val_2_exps,
+            csr.d_sqrt_Q, csr.d_signs, csr.d_val_2_exps, csr.d_char_bits,
             ws.d_ws_entries, ws.d_ws_row_starts, ws.d_ws_row_lengths,
-            ws.d_ws_sqrt_Q, ws.d_ws_signs, ws.d_ws_val_2_exps,
+            ws.d_ws_sqrt_Q, ws.d_ws_signs, ws.d_ws_val_2_exps, ws.d_ws_char_bits,
             ws.d_dual_counter, ws.max_merged_rows, ws.max_merged_entries,
             ws.d_row_ptr, ws.d_row_locks,
             ws.d_col_weight, ws.d_gf2_col_weight, mont, ws.d_abort_count);
@@ -1112,9 +1149,9 @@ BatchMergeResult gpuBatchMerge(
         execute_merges_kernel<<<blocks, 256>>>(
             d_candidates, n,
             csr.d_row_offsets, csr.d_entries,
-            csr.d_sqrt_Q, csr.d_signs, csr.d_val_2_exps,
+            csr.d_sqrt_Q, csr.d_signs, csr.d_val_2_exps, csr.d_char_bits,
             ws.d_ws_entries, ws.d_ws_row_starts, ws.d_ws_row_lengths,
-            ws.d_ws_sqrt_Q, ws.d_ws_signs, ws.d_ws_val_2_exps,
+            ws.d_ws_sqrt_Q, ws.d_ws_signs, ws.d_ws_val_2_exps, ws.d_ws_char_bits,
             ws.d_dual_counter, ws.max_merged_rows, ws.max_merged_entries,
             ws.d_row_ptr, ws.d_row_locks,
             ws.d_col_weight, ws.d_gf2_col_weight, mont, ws.d_abort_count);

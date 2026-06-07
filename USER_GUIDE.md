@@ -211,8 +211,9 @@ These flags control the matrix construction and preprocessing stage, which conve
 
 | Flag | Type | Default | Description | Pinned |
 |------|------|---------|-------------|--------|
-| `--matrix_mode <MODE>` | string | auto | Matrix construction mode: `legacy` (projected FB+2 columns) or `preprocess` (expanded FB+2+LP columns with merge-based preprocessing). Auto-selects `preprocess` when LP fraction exceeds `--lp_preprocess_threshold`. | No |
+| `--matrix_mode <MODE>` | string | auto | Matrix construction mode: `legacy` (projected FB+2 columns) or `preprocess` (expanded FB+2+LP columns with merge-based preprocessing). AUTO resolves to `legacy` for normal runs; `preprocess` engages only via explicit `--matrix_mode preprocess` or `--matrix_only`. The former LP-fraction auto-switch was removed because preprocessing degrades the obstructed high-LP regime. | No |
 | `--matrix_backend <BACKEND>` | string | `cpu` | Preprocessing backend: `cpu`, `gpu`, or `auto`. In solo mode with `gpu` or `auto` (if GPU available and >10K rows), activates the V2 packed GPU preprocessing pipeline with batch GPU merges. Cluster, `MATRIX_ONLY`, and `LINALG_ONLY` modes always use CPU. | No |
+| `--char_mode <MODE>` | string | `none` | Quadratic character-column symbol: `none` (no character columns — default), `branch` (correct branch-fixed field-element character with a fixed Tonelli root), or `norm` (legacy genus-blind NORM symbol). Never auto-enabled — only this flag sets it. Character columns confer no measured factoring benefit at reachable scales; `branch` is the mathematically correct symbol, kept as a tool. | No |
 | `--truncation_factor <F>` | double | `1.05` | Post-GF(2) row truncation enable flag: `> 0` enables truncation, `0` disables it. The actual kept-row target is excess-based (see `--matrix_truncation_excess`), not a direct multiple of this value. | No |
 | `--matrix_truncation_excess <N>` | uint32 | `200` | Number of excess rows to keep above `(n_cols + n_extra_cols)` when truncation is enabled. Controls overdetermination of the truncated matrix. | No |
 | `--compact_cycles <N>` | uint32 | `5` | Maximum compact-merge cycles for the GPU preprocessing backend. `0` runs a single merge pass with no compaction. | No |
@@ -220,7 +221,7 @@ These flags control the matrix construction and preprocessing stage, which conve
 | `--matrix_gf2_min_floor <N>` | uint32 | `8192` | M12-S2 absolute minimum GF(2) column floor; compact-merge stops if alive GF(2) columns drop below this value. | No |
 | `--partial_subsample <F>` | double | `1.0` | Fraction of partial / LP-combined relations to retain (for `--matrix_only` experiments). Range `[0.0, 1.0]`. | No |
 | `--smooth_subsample <F>` | double | `1.0` | Fraction of pure smooth relations to retain (LP-combined relations are always kept) for `--matrix_only` experiments. Range `[0.0, 1.0]`. | No |
-| `--lp_preprocess_threshold <F>` | double | `0.55` | LP fraction threshold for auto-selecting `preprocess` mode. When the fraction of LP-combined relations exceeds this value, the pipeline uses the expanded matrix with preprocessing instead of the legacy projected matrix. (`--lp_matrix_threshold` is a deprecated alias.) | No |
+| `--lp_preprocess_threshold <F>` | double | `0.55` | **Deprecated / inert.** Formerly the LP-fraction threshold for auto-selecting `preprocess` mode; AUTO no longer auto-selects preprocess from LP fraction (use `--matrix_mode preprocess` to opt in). Retained as a no-op for backwards compatibility. (`--lp_matrix_threshold` is a deprecated alias.) | No |
 
 **GPU preprocessing pipeline (V2, `--matrix_backend gpu`):**
 

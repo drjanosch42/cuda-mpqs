@@ -126,7 +126,8 @@ CharacterColumns gpuProductCharCols_packed(
     // Layout matches CharacterColumnComputer::compute() exactly.
     CharacterColumns result;
     result.k          = k;
-    result.aux_primes = aux_primes;
+    // CharacterColumns::aux_primes is 64-bit (Stage 2); widen the uint32 input.
+    result.aux_primes.assign(aux_primes.begin(), aux_primes.end());
     result.columns.resize(k);
     for (uint32_t j = 0; j < k; ++j) result.columns[j].resize(n_rows, 0);
 

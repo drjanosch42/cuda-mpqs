@@ -26,6 +26,9 @@ void HostRelationBatch::resize(size_t n_rels, size_t n_factors) {
     if (signs.size() < n_rels) signs.resize(n_rels);
     if (val_2_exps.size() < n_rels) val_2_exps.resize(n_rels);
     if (large_primes.size() < n_rels) large_primes.resize(n_rels);
+    // char_bits mirrors signs (1 per relation). Zero-init so norm-mode batches and
+    // back-compat loads (no char bits) carry a defined 0 vector.
+    if (char_bits.size() < n_rels) char_bits.resize(n_rels, 0u);
     
     if (factor_offsets.size() < n_rels + 1) factor_offsets.resize(n_rels + 1);
     if (factor_indices.size() < n_factors) factor_indices.resize(n_factors);
@@ -35,6 +38,7 @@ void HostRelationBatch::resize(size_t n_rels, size_t n_factors) {
 void HostRelationBatch::clear() {
     num_relations = 0; num_factors = 0;
     sqrt_Q.clear(); signs.clear(); val_2_exps.clear(); large_primes.clear();
+    char_bits.clear();
     factor_offsets.clear(); factor_indices.clear(); factor_counts.clear();
 }
 
@@ -47,7 +51,8 @@ RelationBatch::~RelationBatch() {
     if (d_signs)  cudaFree(d_signs);
     if (d_val_2_exps) cudaFree(d_val_2_exps);
     if (d_large_primes) cudaFree(d_large_primes);
-    
+    if (d_char_bits) cudaFree(d_char_bits);
+
     if (d_factor_offsets) cudaFree(d_factor_offsets);
     if (d_factor_indices) cudaFree(d_factor_indices);
     if (d_factor_counts)  cudaFree(d_factor_counts);
@@ -136,6 +141,7 @@ void RelationBatch::resize(size_t num_rels_needed, size_t num_factors_needed) {
     uint8_t* new_signs = nullptr;
     int32_t* new_val_2_exps = nullptr;
     unsigned __int128* new_large_primes = nullptr;
+    uint32_t* new_char_bits = nullptr;
     uint64_t* new_factor_offsets = nullptr;
     uint32_t* new_factor_indices = nullptr;
     uint8_t* new_factor_counts = nullptr;
@@ -167,7 +173,12 @@ void RelationBatch::resize(size_t num_rels_needed, size_t num_factors_needed) {
     safe_alloc((void**)&new_signs,        new_cap_rels * sizeof(uint8_t));
     safe_alloc((void**)&new_val_2_exps,   new_cap_rels * sizeof(int32_t));
     safe_alloc((void**)&new_large_primes, new_cap_rels * sizeof(unsigned __int128));
+    safe_alloc((void**)&new_char_bits,    new_cap_rels * sizeof(uint32_t));
     safe_alloc((void**)&new_factor_offsets, (new_cap_rels + 1) * sizeof(uint64_t));
+    // char_bits must be a defined 0 everywhere even in norm mode (postproc writes 0
+    // only for emitted rows; padding/unwritten slots must read as 0). Zero the whole
+    // new buffer; the copy below overwrites the live prefix.
+    if (new_char_bits) CUDA_CHECK(cudaMemset(new_char_bits, 0, new_cap_rels * sizeof(uint32_t)));
 
     safe_alloc((void**)&new_factor_indices, new_cap_factors * sizeof(uint32_t));
     safe_alloc((void**)&new_factor_counts,  new_cap_factors * sizeof(uint8_t));
@@ -207,6 +218,7 @@ void RelationBatch::resize(size_t num_rels_needed, size_t num_factors_needed) {
         safe_copy(new_signs, d_signs, copy_rels * sizeof(uint8_t));
         safe_copy(new_val_2_exps, d_val_2_exps, copy_rels * sizeof(int32_t));
         safe_copy(new_large_primes, d_large_primes, copy_rels * sizeof(unsigned __int128));
+        safe_copy(new_char_bits, d_char_bits, copy_rels * sizeof(uint32_t));
         // Offsets: copy N+1.
         safe_copy(new_factor_offsets, d_factor_offsets, (copy_rels + 1) * sizeof(uint64_t));
     } else {
@@ -224,6 +236,7 @@ void RelationBatch::resize(size_t num_rels_needed, size_t num_factors_needed) {
     if (d_signs) cudaFree(d_signs);
     if (d_val_2_exps) cudaFree(d_val_2_exps);
     if (d_large_primes) cudaFree(d_large_primes);
+    if (d_char_bits) cudaFree(d_char_bits);
     if (d_factor_offsets) cudaFree(d_factor_offsets);
     if (d_factor_indices) cudaFree(d_factor_indices);
     if (d_factor_counts) cudaFree(d_factor_counts);
@@ -233,6 +246,7 @@ void RelationBatch::resize(size_t num_rels_needed, size_t num_factors_needed) {
     d_signs = new_signs;
     d_val_2_exps = new_val_2_exps;
     d_large_primes = new_large_primes;
+    d_char_bits = new_char_bits;
     d_factor_offsets = new_factor_offsets;
     d_factor_indices = new_factor_indices;
     d_factor_counts = new_factor_counts;
@@ -373,6 +387,7 @@ void RelationBatch::append(
     copy(d_signs + start_rels,  other.d_signs,  actual_rels_to_add * sizeof(uint8_t));
     copy(d_val_2_exps + start_rels, other.d_val_2_exps, actual_rels_to_add * sizeof(int32_t));
     copy(d_large_primes + start_rels, other.d_large_primes, actual_rels_to_add * sizeof(unsigned __int128));
+    copy(d_char_bits + start_rels, other.d_char_bits, actual_rels_to_add * sizeof(uint32_t));
     
     // Copy Factors
     copy(d_factor_indices + start_factors, other.d_factor_indices, actual_factors_to_add * sizeof(uint32_t));
@@ -422,6 +437,7 @@ RelationBatchView RelationBatch::get_view() {
     v.signs          = d_signs;
     v.val_2_exps     = d_val_2_exps;
     v.large_primes   = d_large_primes;
+    v.char_bits      = d_char_bits;
     v.factor_offsets = d_factor_offsets;
     v.factor_indices = d_factor_indices;
     v.factor_counts  = d_factor_counts;
@@ -471,6 +487,7 @@ void RelationBatch::moveToHost(HostRelationBatch& dest, cudaStream_t stream) {
         std::memcpy(dest.signs.data(),        d_signs,        n_rels * sizeof(uint8_t));
         std::memcpy(dest.val_2_exps.data(),   d_val_2_exps,   n_rels * sizeof(int32_t));
         std::memcpy(dest.large_primes.data(), d_large_primes, n_rels * sizeof(unsigned __int128));
+        std::memcpy(dest.char_bits.data(),    d_char_bits,    n_rels * sizeof(uint32_t));
         std::memcpy(dest.factor_offsets.data(), d_factor_offsets, (n_rels + 1) * sizeof(uint64_t));
         if (n_factors > 0) {
             std::memcpy(dest.factor_indices.data(), d_factor_indices, n_factors * sizeof(uint32_t));
@@ -486,6 +503,7 @@ void RelationBatch::moveToHost(HostRelationBatch& dest, cudaStream_t stream) {
         copyToHost(dest.signs.data(),        d_signs,        n_rels * sizeof(uint8_t));
         copyToHost(dest.val_2_exps.data(),   d_val_2_exps,   n_rels * sizeof(int32_t));
         copyToHost(dest.large_primes.data(), d_large_primes, n_rels * sizeof(unsigned __int128));
+        copyToHost(dest.char_bits.data(),    d_char_bits,    n_rels * sizeof(uint32_t));
         copyToHost(dest.factor_offsets.data(), d_factor_offsets, (n_rels + 1) * sizeof(uint64_t));
 
         if (n_factors > 0) {
@@ -517,6 +535,7 @@ void RelationBatch::moveRangeToHost(HostRelationBatch& dest, uint64_t offset, ui
     d2h(dest.signs.data(),        d_signs + offset,        count * sizeof(uint8_t));
     d2h(dest.val_2_exps.data(),   d_val_2_exps + offset,   count * sizeof(int32_t));
     d2h(dest.large_primes.data(), d_large_primes + offset, count * sizeof(unsigned __int128));
+    d2h(dest.char_bits.data(),    d_char_bits + offset,    count * sizeof(uint32_t));
     d2h(dest.factor_offsets.data(), d_factor_offsets + offset, (count + 1) * sizeof(uint64_t));
 
     // --- Sync: read CSR offsets on CPU ---
@@ -885,6 +904,8 @@ void RelationBatch::validate_host_batch(const HostRelationBatch& host_batch, con
     copyToDev(v.signs,        host_batch.signs.data(),        host_batch.num_relations * sizeof(uint8_t));
     copyToDev(v.val_2_exps,   host_batch.val_2_exps.data(),   host_batch.num_relations * sizeof(int32_t));
     copyToDev(v.large_primes, host_batch.large_primes.data(), host_batch.num_relations * sizeof(unsigned __int128));
+    if (!host_batch.char_bits.empty())
+        copyToDev(v.char_bits, host_batch.char_bits.data(),   host_batch.num_relations * sizeof(uint32_t));
     copyToDev(v.factor_offsets, host_batch.factor_offsets.data(), (host_batch.num_relations + 1) * sizeof(uint64_t));
 
     if (host_batch.num_factors > 0) {
@@ -930,6 +951,10 @@ void RelationBatch::uploadFromHost(const HostRelationBatch& host_batch) {
         std::memcpy(d_signs,         host_batch.signs.data(),         nr * sizeof(uint8_t));
         std::memcpy(d_val_2_exps,    host_batch.val_2_exps.data(),    nr * sizeof(int32_t));
         std::memcpy(d_large_primes,  host_batch.large_primes.data(),  nr * sizeof(unsigned __int128));
+        // char_bits may be empty (norm-mode / back-compat load); resize() left
+        // d_char_bits zeroed, so only copy when present.
+        if (!host_batch.char_bits.empty())
+            std::memcpy(d_char_bits, host_batch.char_bits.data(),     nr * sizeof(uint32_t));
         std::memcpy(d_factor_offsets, host_batch.factor_offsets.data(), (nr + 1) * sizeof(uint64_t));
         if (nf > 0) {
             std::memcpy(d_factor_indices, host_batch.factor_indices.data(), nf * sizeof(uint32_t));
@@ -945,6 +970,10 @@ void RelationBatch::uploadFromHost(const HostRelationBatch& host_batch) {
         copyToDev(d_signs,         host_batch.signs.data(),         nr * sizeof(uint8_t));
         copyToDev(d_val_2_exps,    host_batch.val_2_exps.data(),    nr * sizeof(int32_t));
         copyToDev(d_large_primes,  host_batch.large_primes.data(),  nr * sizeof(unsigned __int128));
+        // char_bits may be empty (norm-mode / back-compat load); resize() left
+        // d_char_bits zeroed, so only copy when present.
+        if (!host_batch.char_bits.empty())
+            copyToDev(d_char_bits, host_batch.char_bits.data(),     nr * sizeof(uint32_t));
         copyToDev(d_factor_offsets, host_batch.factor_offsets.data(), (nr + 1) * sizeof(uint64_t));
         if (nf > 0) {
             copyToDev(d_factor_indices, host_batch.factor_indices.data(), nf * sizeof(uint32_t));

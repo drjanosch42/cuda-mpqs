@@ -24,6 +24,15 @@ int jacobi(uint32_t a, uint32_t n);
 uint32_t Tonelli_Shanks(uint32_t n, uint32_t p);
 uint32_t findRoot(const mpqs::uint512& d, const mpqs::uint512& N, uint32_t p);
 
+// ----------------------------------------------------------------------------
+// 64-bit, overflow-safe number-theory primitives (for branch-fixed character
+// columns; aux primes are chosen > lp1_bound ~1e11, so they exceed uint32_t).
+// All modular steps route through mpqs::math::{mul_mod,pow_mod} (u128-safe).
+// ----------------------------------------------------------------------------
+uint64_t Tonelli_Shanks_u64(uint64_t n, uint64_t p);
+int jacobi_u64(uint64_t a, uint64_t n);
+bool is_prime_u64(uint64_t n);
+
 // Hensel Lifting is very specific to setting up roots for powers of primes
 uint64_t liftRoot(uint64_t r, uint64_t reduced_N, uint32_t p);
 

@@ -231,6 +231,7 @@ void compact_entries_metadata_kernel(
     const uint512*     __restrict__ orig_sqrt_Q,
     const uint8_t*     __restrict__ orig_signs,
     const int32_t*     __restrict__ orig_val_2_exps,
+    const uint32_t*    __restrict__ orig_char_bits,   // Stage 6: branch char vector
     // Workspace
     const uint32_t*    __restrict__ ws_row_starts,
     const uint32_t*    __restrict__ ws_row_lengths,
@@ -238,6 +239,7 @@ void compact_entries_metadata_kernel(
     const uint512*     __restrict__ ws_sqrt_Q,
     const uint8_t*     __restrict__ ws_signs,
     const int32_t*     __restrict__ ws_val_2_exps,
+    const uint32_t*    __restrict__ ws_char_bits,     // Stage 6: branch char vector
     // New row offsets (output offsets for entries)
     const uint32_t*    __restrict__ d_new_row_offsets,
     // Column remap: old_col -> new_col (UINT32_MAX for dead columns)
@@ -246,7 +248,8 @@ void compact_entries_metadata_kernel(
     PackedEntry* __restrict__ d_new_entries,
     uint512*     __restrict__ d_new_sqrt_Q,
     uint8_t*     __restrict__ d_new_signs,
-    int32_t*     __restrict__ d_new_val_2_exps)
+    int32_t*     __restrict__ d_new_val_2_exps,
+    uint32_t*    __restrict__ d_new_char_bits)        // Stage 6: relocated char vector
 {
     uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= n_rows || d_alive_mask[r] == 0) return;
@@ -260,6 +263,7 @@ void compact_entries_metadata_kernel(
     uint512            src_sqrt_Q;
     uint8_t            src_sign;
     int32_t            src_v2;
+    uint32_t           src_char_bits;   // Stage 6: branch char vector
 
     if (ptr & ROW_WS_BIT) {
         uint32_t ws_idx = ptr & 0x7FFFFFFFu;
@@ -268,12 +272,14 @@ void compact_entries_metadata_kernel(
         src_sqrt_Q      = ws_sqrt_Q[ws_idx];
         src_sign        = ws_signs[ws_idx];
         src_v2          = ws_val_2_exps[ws_idx];
+        src_char_bits   = ws_char_bits[ws_idx];
     } else {
         src_entries     = orig_entries + orig_row_offsets[ptr];
         src_len         = orig_row_offsets[ptr + 1] - orig_row_offsets[ptr];
         src_sqrt_Q      = orig_sqrt_Q[ptr];
         src_sign        = orig_signs[ptr];
         src_v2          = orig_val_2_exps[ptr];
+        src_char_bits   = orig_char_bits[ptr];
     }
 
     // Copy entries with column remapping
@@ -291,6 +297,9 @@ void compact_entries_metadata_kernel(
     d_new_sqrt_Q[new_r]     = src_sqrt_Q;
     d_new_signs[new_r]      = src_sign;
     d_new_val_2_exps[new_r] = src_v2;
+    // Stage 6: compaction RELOCATES the row; the composed char vector carries
+    // through unchanged (no XOR — that already happened in the merge kernel).
+    d_new_char_bits[new_r]  = src_char_bits;
 }
 
 // ============================================================================
@@ -482,10 +491,12 @@ CompactResult gpuCompactPackedCSR(
         compact_entries_metadata_kernel<<<blocks, 256>>>(
             ws.d_row_ptr, d_alive_mask, d_alive_scatter, n_rows,
             csr.d_row_offsets, csr.d_entries, csr.d_sqrt_Q, csr.d_signs, csr.d_val_2_exps,
+            csr.d_char_bits,
             ws.d_ws_row_starts, ws.d_ws_row_lengths, ws.d_ws_entries,
-            ws.d_ws_sqrt_Q, ws.d_ws_signs, ws.d_ws_val_2_exps,
+            ws.d_ws_sqrt_Q, ws.d_ws_signs, ws.d_ws_val_2_exps, ws.d_ws_char_bits,
             d_new_row_offsets, d_col_remap,
-            new_csr.d_entries, new_csr.d_sqrt_Q, new_csr.d_signs, new_csr.d_val_2_exps);
+            new_csr.d_entries, new_csr.d_sqrt_Q, new_csr.d_signs, new_csr.d_val_2_exps,
+            new_csr.d_char_bits);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -568,8 +579,6 @@ CompactMergeResult gpuCompactMergeCycles(
 
     // [M12-S2] Snapshot initial GF(2) col count (post-singleton, pre-merge) and
     // derive the diversity floor. Cost: one extra kernel launch + small D→H copy.
-    // Audit ref: docs/audits/matrix/matrix_module_audit_2026_04_27.md (HIGH);
-    //            M11_fix_plan.md Stage 3-A1.
     const uint32_t initial_gf2_cols = countGf2AliveCols(csr);
     const uint32_t computed_floor =
         static_cast<uint32_t>(gf2_floor_factor *

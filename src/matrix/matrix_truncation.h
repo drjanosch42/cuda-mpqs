@@ -35,8 +35,7 @@ struct TruncationResult {
 /// performed and the input is returned unchanged. Otherwise the factor is used
 /// only as an on/off switch — the actual target is excess-based, not
 /// factor-based, because the factor-based target is char-col-blind and
-/// produced a no-op or destructive truncation on high-LP data
-/// (see audit `docs/audits/matrix/matrix_module_audit_2026_04_27.md` §3, §4.4).
+/// produced a no-op or destructive truncation on high-LP data.
 ///
 /// Selection priority (per row r):
 ///   1. Coverage-greedy admit pass: traverse rows in moderate-weight order

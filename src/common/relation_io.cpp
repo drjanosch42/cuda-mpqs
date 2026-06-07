@@ -16,6 +16,12 @@ constexpr char V2_MAGIC[8] = {'M','P','Q','S','_','V','2','\0'};
 // v2 flags bitfield
 constexpr uint32_t FLAG_HAS_PARTIALS = 0x1;
 constexpr uint32_t FLAG_HAS_METADATA = 0x2;
+// Stage 4 (branch-fixed character columns): file carries per-relation char_bits plus
+// the {r, aux_primes, t_s} metadata extension. Layout is forward-tolerant: the
+// metadata extension and char_bits vectors are appended at the END of their
+// respective fixed-position blocks and read ONLY when this flag is set, so old .v2
+// files (no char flag) parse byte-for-byte unchanged.
+constexpr uint32_t FLAG_HAS_CHAR_BITS = 0x4;
 
 template<typename T>
 void write_vec(std::ofstream& f, const std::vector<T>& v) {
@@ -108,6 +114,9 @@ bool serialize_v2(const std::string& path,
     f.write(reinterpret_cast<const char*>(&version), sizeof(version));
     uint32_t flags = FLAG_HAS_METADATA;
     if (partials.num_relations > 0) flags |= FLAG_HAS_PARTIALS;
+    // Stage 4: declare char bits iff the run produced branch aux primes (r > 0).
+    const bool has_char = (meta.r > 0);
+    if (has_char) flags |= FLAG_HAS_CHAR_BITS;
     f.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
 
     // Metadata section
@@ -119,12 +128,25 @@ bool serialize_v2(const std::string& path,
         f.write(reinterpret_cast<const char*>(meta.factor_base.data()), fb_size * sizeof(uint32_t));
     f.write(reinterpret_cast<const char*>(&meta.lp_bound), sizeof(meta.lp_bound));
     f.write(reinterpret_cast<const char*>(&meta.sieve_bound), sizeof(meta.sieve_bound));
+    // Stage 4 metadata extension — appended at the END of the fixed-position block,
+    // flag-guarded (read only under FLAG_HAS_CHAR_BITS). r, then r aux primes, then r
+    // Tonelli roots.
+    if (has_char) {
+        f.write(reinterpret_cast<const char*>(&meta.r), sizeof(meta.r));
+        if (meta.r > 0) {
+            f.write(reinterpret_cast<const char*>(meta.aux_primes.data()), meta.r * sizeof(uint64_t));
+            f.write(reinterpret_cast<const char*>(meta.t_s.data()),        meta.r * sizeof(uint64_t));
+        }
+    }
 
     // Full smooth section
     uint64_t nr = full_smooths.num_relations, nf = full_smooths.num_factors;
     f.write(reinterpret_cast<const char*>(&nr), sizeof(nr));
     f.write(reinterpret_cast<const char*>(&nf), sizeof(nf));
     write_batch(f, full_smooths);
+    // Stage 4: per-relation char_bits appended after the smooth batch record (caller-
+    // side, flag-guarded — keeps write_batch back-compat).
+    if (has_char) write_vec(f, full_smooths.char_bits);
 
     // Partial section (if present)
     if (flags & FLAG_HAS_PARTIALS) {
@@ -132,6 +154,7 @@ bool serialize_v2(const std::string& path,
         f.write(reinterpret_cast<const char*>(&np), sizeof(np));
         f.write(reinterpret_cast<const char*>(&npf), sizeof(npf));
         write_batch(f, partials);
+        if (has_char) write_vec(f, partials.char_bits);
     }
 
     return f.good();
@@ -158,11 +181,14 @@ bool deserialize_v2(const std::string& path,
     f.read(reinterpret_cast<char*>(&flags), sizeof(flags));
 
     // Warn about unknown flags but continue
-    constexpr uint32_t KNOWN_FLAGS = FLAG_HAS_PARTIALS | FLAG_HAS_METADATA;
+    constexpr uint32_t KNOWN_FLAGS = FLAG_HAS_PARTIALS | FLAG_HAS_METADATA | FLAG_HAS_CHAR_BITS;
     if (flags & ~KNOWN_FLAGS) {
         LOG(LOG_WARNING) << "relation_io: unknown v2 flags 0x" << std::hex << (flags & ~KNOWN_FLAGS)
                          << std::dec << " — ignoring";
     }
+
+    const bool has_char = (flags & FLAG_HAS_CHAR_BITS) != 0;
+    meta.has_char_bits = has_char;
 
     // Metadata section
     if (flags & FLAG_HAS_METADATA) {
@@ -174,6 +200,17 @@ bool deserialize_v2(const std::string& path,
             f.read(reinterpret_cast<char*>(meta.factor_base.data()), fb_size * sizeof(uint32_t));
         f.read(reinterpret_cast<char*>(&meta.lp_bound), sizeof(meta.lp_bound));
         f.read(reinterpret_cast<char*>(&meta.sieve_bound), sizeof(meta.sieve_bound));
+        // Stage 4 metadata extension — read ONLY under FLAG_HAS_CHAR_BITS, at the END
+        // of the block (old files without the flag stop here, exactly as before).
+        if (has_char) {
+            f.read(reinterpret_cast<char*>(&meta.r), sizeof(meta.r));
+            meta.aux_primes.resize(meta.r);
+            meta.t_s.resize(meta.r);
+            if (meta.r > 0) {
+                f.read(reinterpret_cast<char*>(meta.aux_primes.data()), meta.r * sizeof(uint64_t));
+                f.read(reinterpret_cast<char*>(meta.t_s.data()),        meta.r * sizeof(uint64_t));
+            }
+        }
     }
 
     // Full smooth section
@@ -183,6 +220,10 @@ bool deserialize_v2(const std::string& path,
     full_smooths.num_relations = nr;
     full_smooths.num_factors = nf;
     read_batch(f, full_smooths);
+    // Stage 4: per-relation char_bits trails the smooth batch record ONLY when the
+    // flag is set. For char-less (old) files char_bits stays empty — reading it
+    // unconditionally would consume the next section's bytes.
+    if (has_char) read_vec(f, full_smooths.char_bits);
 
     // Partial section
     if (flags & FLAG_HAS_PARTIALS) {
@@ -192,6 +233,7 @@ bool deserialize_v2(const std::string& path,
         partials.num_relations = np;
         partials.num_factors = npf;
         read_batch(f, partials);
+        if (has_char) read_vec(f, partials.char_bits);
     } else {
         partials.clear();
     }

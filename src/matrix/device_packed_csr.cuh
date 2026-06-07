@@ -52,6 +52,7 @@ struct DevicePackedView {
     uint512*     d_sqrt_Q;       ///< [n_rows] — Montgomery product of constituent sqrt_Q values
     uint8_t*     d_signs;        ///< [n_rows] — product of signs
     int32_t*     d_val_2_exps;   ///< [n_rows] — sum of val_2 exponents
+    uint32_t*    d_char_bits;    ///< [n_rows] — Stage 6: XOR of constituent branch char vectors (0 in norm mode)
 
     // Dimensions
     uint32_t     n_rows;
@@ -74,6 +75,13 @@ struct DevicePackedCSR {
     uint512*     d_sqrt_Q      = nullptr;
     uint8_t*     d_signs       = nullptr;
     int32_t*     d_val_2_exps  = nullptr;
+    /// Stage 6 (branch-fixed char): per-row XOR-composed branch char vector
+    /// (one bit per branch aux prime). Mirrors d_sqrt_Q through the packed
+    /// reduction — XOR is the additive homomorphism dual of the Montgomery
+    /// sqrt_Q product. Always 0 in norm mode (seeded from char_bits-zero views);
+    /// passive metadata, never an input to merge planning / singleton removal /
+    /// truncation. Unpacked into the 32 char columns only AFTER the full reduction.
+    uint32_t*    d_char_bits   = nullptr;
 
     // Dimensions
     uint32_t     n_rows = 0;

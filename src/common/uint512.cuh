@@ -594,6 +594,22 @@ public:
         return (uint32_t)rem;
     }
 
+    // Read-only Modulo u64 (non-mutating; does NOT alter *this).
+    // Uses unsigned __int128 for the running remainder so that the
+    // ((rem << 32) | limb) step cannot overflow when divisor > 2^32
+    // (the 64-bit rem of mod_uint32 would wrap for 64-bit divisors).
+    __host__ __device__ uint64_t mod_uint64(uint64_t d) const {
+        if (d == 0) return 0;
+        unsigned __int128 rem = 0;
+        #if defined(__NVCC__) && defined(__CUDA_ARCH__)
+            #pragma unroll
+        #endif
+        for (int i = 15; i >= 0; i--) {
+            rem = (((unsigned __int128)rem << 32) | limbs[i]) % d;
+        }
+        return (uint64_t)rem;
+    }
+
     /**
      * @brief In-place multiply by a 64-bit integer.
      * Returns the overflow (carry out of 512 bits).

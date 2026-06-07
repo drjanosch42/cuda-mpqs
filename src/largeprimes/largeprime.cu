@@ -5,6 +5,8 @@
 #include "cuda_check.h"
 #include <cstdio>
 #include <stdexcept>
+#include <algorithm>
+#include <string>
 #ifdef LP_DEBUG
 #include <set>
 #endif
@@ -454,6 +456,18 @@ __global__ void global_combine_kernel(
               output_view.signs[pos] = (neg_a ^ neg_b) ? static_cast<uint8_t>(0xFF) : static_cast<uint8_t>(1); }
             output_view.val_2_exps[pos] = input_view.val_2_exps[my_idx] + global_witness_view.val_2_exps[target_global_idx];
             output_view.large_primes[pos] = input_view.large_primes[my_idx]; // Original LP stored for reference
+            // Stage 5: branch-character XOR-combine. The combined relation's char
+            // vector is the XOR of its two constituents' raw per-relation vectors —
+            // the field-element symbol is a multiplicative homomorphism, so the bit
+            // of u_c = u_p · u_w equals (bit of u_p) ⊕ (bit of u_w) (gpu_char_cols.cuh
+            // branchCharBit doc; audit F4; proto-v2 §3). We must NOT re-derive bits
+            // from the mod-N product Q_res (lines above) — that product is provably
+            // non-homomorphic. This is mode-agnostic: under --char_mode norm both
+            // constituents carry a defined 0, so 0 ⊕ 0 == 0, byte-identical to the
+            // Stage-4 placeholder; only under branch do the bits become meaningful.
+            output_view.char_bits[pos] =
+                input_view.char_bits[my_idx] ^
+                global_witness_view.char_bits[target_global_idx];
 
             output_view.factor_offsets[pos] = f_pos;
             output_view.factor_offsets[pos+1] = f_pos + m_len;
@@ -469,8 +483,79 @@ __global__ void global_combine_kernel(
 }
 
 /**
+ * @brief DIAGNOSTIC Stage 5A' Kernel: Capture combined-relation constituent provenance.
+ *
+ * STRICTLY ADDITIVE / SIDE-EFFECT-FREE on the factorization. Reads the exact same
+ * inputs as global_combine_kernel (status_flags, target_idx_array, input_view,
+ * global_witness_view) and applies the identical MATCH_FOUND + LP-match guard, so
+ * the set of captured records is in bijection with the set of combined relations
+ * the combine kernel emits. For each match it recomputes u_c = u_p * u_w (mod N)
+ * and atomically appends a CombineProvenanceEntry recording both constituents'
+ * roots (u_p probe, u_w witness), signs, val_2_exps, and the shared LP. This makes
+ * the combined->(probe,witness) linkage and the constituent roots fully recoverable
+ * even though probe_hash_table_kernel purges the slab entry afterwards.
+ *
+ * Launched only when LargePrimeConfig::capture_provenance is set. Never touches any
+ * batch/witness state.
+ */
+__global__ void capture_provenance_kernel(
+    const SLPStatus* __restrict__ status_flags,
+    const uint32_t* __restrict__ target_idx_array,
+    mpqs::structures::RelationBatchView input_view,
+    mpqs::structures::RelationBatchView global_witness_view,
+    const uint64_t* __restrict__ d_count,
+    mpqs::uint512 N,
+    CombineProvenanceEntry* __restrict__ out,
+    uint64_t* __restrict__ out_count,
+    uint64_t capacity,
+    uint64_t* __restrict__ overflow_count
+) {
+    uint32_t num_items = (uint32_t)*d_count;
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_items) return;
+
+    if (status_flags[tid] != SLPStatus::MATCH_FOUND) return;
+
+    uint32_t my_idx = tid;
+    uint32_t target_global_idx = target_idx_array[tid];
+
+    // Identical LP-match guard to global_combine_kernel: tag collisions are skipped
+    // there too, so they must be skipped here to stay in bijection.
+    uint64_t lp_input   = (uint64_t)input_view.large_primes[my_idx];
+    uint64_t lp_witness = (uint64_t)global_witness_view.large_primes[target_global_idx];
+    if (lp_input != lp_witness) return;
+
+    // Recompute u_c exactly as the combine kernel does.
+    mpqs::uint512 u_p = input_view.sqrt_Q[my_idx];
+    mpqs::uint512 u_w = global_witness_view.sqrt_Q[target_global_idx];
+    mpqs::uint512 u_c = u_p;
+    u_c.mul_mod(u_w, N);
+
+    uint64_t slot = atomicAdd((unsigned long long*)out_count, 1ULL);
+    if (slot >= capacity) {
+        atomicAdd((unsigned long long*)overflow_count, 1ULL);
+        return;
+    }
+
+    CombineProvenanceEntry e;
+    e.u_c = u_c;
+    e.u_p = u_p;
+    e.u_w = u_w;
+    e.lp  = input_view.large_primes[my_idx];
+    e.input_idx   = my_idx;
+    e.witness_idx = target_global_idx;
+    e.v2_p   = input_view.val_2_exps[my_idx];
+    e.v2_w   = global_witness_view.val_2_exps[target_global_idx];
+    e.sign_p = input_view.signs[my_idx];
+    e.sign_w = global_witness_view.signs[target_global_idx];
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) e._pad[k] = 0;
+    out[slot] = e;
+}
+
+/**
  * @brief Stage 5B Kernel: Atomically Appends unique 1-partials to the Global Hash Table.
- * 
+ *
  * Logic (The Spin-Lock):
  * 1. Reserve a slot in the Global Witness SoA structure.
  * 2. Write SoA Payload.
@@ -531,6 +616,9 @@ __global__ void global_append_kernel(
         global_witness_view.signs[global_idx]  = input_view.signs[my_idx];
         global_witness_view.val_2_exps[global_idx] = input_view.val_2_exps[my_idx];
         global_witness_view.large_primes[global_idx] = input_view.large_primes[my_idx];
+        // Stage 4: this is a verbatim copy of a raw partial into the witness buffer —
+        // preserve its branch character vector (no combination occurs here).
+        global_witness_view.char_bits[global_idx] = input_view.char_bits[my_idx];
 
         global_witness_view.factor_offsets[global_idx]   = f_pos;
         global_witness_view.factor_offsets[global_idx+1] = f_pos + len_A;
@@ -681,6 +769,7 @@ __global__ void device_append_kernel(
         dst_view.signs[dst_base_rel + i] = src_view.signs[i];
         dst_view.val_2_exps[dst_base_rel + i] = src_view.val_2_exps[i];
         dst_view.large_primes[dst_base_rel + i] = src_view.large_primes[i];
+        dst_view.char_bits[dst_base_rel + i] = src_view.char_bits[i]; // Stage 4: verbatim copy
 
         // Rebase factor offsets: src offsets are batch-relative, dst needs absolute offset
         dst_view.factor_offsets[dst_base_rel + i] = src_view.factor_offsets[i] + dst_base_factor;
@@ -865,6 +954,15 @@ void LargePrimeVariant::clearBuffers() {
     // Cleanup for Match Tracking Buffers (no CUDA_CHECK — destructor path)
     if (d_target_idx_array)    cudaFree(d_target_idx_array);
     d_target_idx_array = nullptr;
+
+    // DIAGNOSTIC provenance buffers (no-op if capture was disabled)
+    if (d_provenance_)          cudaFree(d_provenance_);
+    if (d_provenance_count_)    cudaFree(d_provenance_count_);
+    if (d_provenance_overflow_) cudaFree(d_provenance_overflow_);
+    d_provenance_ = nullptr;
+    d_provenance_count_ = nullptr;
+    d_provenance_overflow_ = nullptr;
+    provenance_capacity_ = 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -986,6 +1084,25 @@ void LargePrimeVariant::initiate(
     d_output_batch->initiate(device_id);
     d_output_batch->resize(config.max_combined_output, out_est_factors);
     d_output_batch->reset_counters(lp_stream);
+
+    // --- 8b. DIAGNOSTIC provenance buffer (allocated ONLY when capture enabled) ---
+    // STRICTLY ADDITIVE: on the normal path config.capture_provenance is false, so
+    // these pointers stay null and nothing below executes — zero hot-path cost.
+    if (config.capture_provenance) {
+        // Capacity: every combined relation produces one record. Combined output is
+        // capped by max_combined_output across a batch but accumulates over the run,
+        // so size generously against witness capacity (an absolute upper bound on
+        // distinct matches) with a floor for tiny runs. Overflow is counted, not fatal.
+        provenance_capacity_ = std::max((uint64_t)1u << 20, (uint64_t)config.max_witness_capacity);
+        CUDA_CHECK(cudaMalloc(&d_provenance_, provenance_capacity_ * sizeof(CombineProvenanceEntry)));
+        CUDA_CHECK(cudaMalloc(&d_provenance_count_, sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(d_provenance_count_, 0, sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_provenance_overflow_, sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(d_provenance_overflow_, 0, sizeof(uint64_t)));
+        LOG(LOG_INFO) << "[dump_combine_provenance] Provenance capture ENABLED, capacity="
+                      << provenance_capacity_ << " records ("
+                      << (provenance_capacity_ * sizeof(CombineProvenanceEntry) >> 20) << " MiB).";
+    }
 
     // --- 9. Pre-allocate pipeline buffers to max capacity (Stage 4: no runtime resize) ---
     max_pipeline_capacity_ = std::max((size_t)65536, (size_t)config.max_witness_capacity);
@@ -1226,6 +1343,10 @@ void LargePrimeVariant::processAndCommit(
         d_output_overflow_count
     );
 
+    // 3A': DIAGNOSTIC provenance capture (no-op unless --dump_combine_provenance).
+    // Witness SoA roots are stable here (only the slab pointer was purged in Stage 2).
+    captureProvenance(input_view, global_witness_view, grid_size, block_size);
+
     // --- Diagnostic: validate combine inputs (env-gated: MPQS_LP_DIAG=1) ---
     if (std::getenv("MPQS_LP_DIAG") && std::string(std::getenv("MPQS_LP_DIAG")) == "1") {
         constexpr uint32_t MAX_DIAG = 20;
@@ -1332,7 +1453,10 @@ void LargePrimeVariant::processAndCommit(
     // Read from pinned memory (no additional sync needed)
     uint64_t found_full_count = h_pinned_lp_combined_count[0];
     if (found_full_count > 0) {
-        LOG(LOG_STATS) << "Combined " << found_full_count << " full relations in this batch.";
+        // Per-LP-call combination count: technical batch-level telemetry, detached from
+        // the consolidated sieve-progress block. Demoted to DEBUG_1 so --verbose (STATS)
+        // shows only the ETA/throughput/buffer-fill telemetry during sieving.
+        LOG(LOG_DEBUG_1) << "Combined " << found_full_count << " full relations in this batch.";
         persistent_storage->append(*d_output_batch, found_full_count, lp_stream);
     }
     
@@ -1422,6 +1546,9 @@ void LargePrimeVariant::processAndCommitAsync(
         d_status_flags, d_target_idx_array,
         input_view, global_witness_view, output_view,
         d_output_dual_counter, d_lp_input_count_, this->N, d_output_overflow_count);
+
+    // DIAGNOSTIC provenance capture (no-op unless --dump_combine_provenance).
+    captureProvenance(input_view, global_witness_view, grid_size, block_size);
 
     // --- Diagnostic: validate combine inputs (async path, sync-gated) ---
     {
@@ -1537,6 +1664,58 @@ void LargePrimeVariant::launchDeviceAppend(
     // Reset output batch on the same stream (ordered after append completes)
     d_output_batch->reset_counters(stream);
     cudaMemsetAsync(d_output_batch->get_view().factor_offsets, 0, sizeof(uint64_t), stream);
+}
+
+// -----------------------------------------------------------------------------
+// DIAGNOSTIC: Combine-provenance capture (additive, gated)
+// -----------------------------------------------------------------------------
+
+void LargePrimeVariant::captureProvenance(
+    const mpqs::structures::RelationBatchView& input_view,
+    const mpqs::structures::RelationBatchView& global_witness_view,
+    uint32_t grid_size, uint32_t block_size
+) {
+    if (!config.capture_provenance || !d_provenance_) return;
+    kernels::capture_provenance_kernel<<<grid_size, block_size, 0, lp_stream>>>(
+        d_status_flags,
+        d_target_idx_array,
+        input_view,
+        global_witness_view,
+        d_lp_input_count_,
+        this->N,
+        d_provenance_,
+        d_provenance_count_,
+        provenance_capacity_,
+        d_provenance_overflow_
+    );
+}
+
+void LargePrimeVariant::moveProvenanceToHost(
+    std::vector<CombineProvenanceEntry>& dest, cudaStream_t stream
+) {
+    dest.clear();
+    if (!config.capture_provenance || !d_provenance_ || !d_provenance_count_) return;
+
+    uint64_t count = 0, overflow = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&count, d_provenance_count_, sizeof(uint64_t),
+                               cudaMemcpyDeviceToHost, stream));
+    if (d_provenance_overflow_) {
+        CUDA_CHECK(cudaMemcpyAsync(&overflow, d_provenance_overflow_, sizeof(uint64_t),
+                                   cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    uint64_t copy_n = std::min(count, provenance_capacity_);
+    dest.resize(copy_n);
+    if (copy_n > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(dest.data(), d_provenance_,
+                                   copy_n * sizeof(CombineProvenanceEntry),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    LOG(LOG_INFO) << "[dump_combine_provenance] Captured " << count
+                  << " combined-relation provenance records (downloaded " << copy_n << ")"
+                  << (overflow ? (", DROPPED " + std::to_string(overflow) + " on overflow") : "");
 }
 
 void LargePrimeVariant::moveWitnessesToHost(

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <fstream>
 
 namespace mpqs {
 namespace matrix {
@@ -409,6 +410,80 @@ HostMatrix ConvertFromCSR(const HostMatrixCSR& src) {
         }
     }
     return out;
+}
+
+// --- Diagnostic serializer (sqrt-failure investigation) ---------------------
+// See matrix_constructor.h for the on-disk format documentation.
+
+bool DumpHostMatrixCSR(const std::string& path, const HostMatrix& A) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+
+    auto write_u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+    auto write_u64 = [&](uint64_t v) { f.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+
+    const char magic[8] = {'M','P','Q','S','M','A','T','\0'};
+    f.write(magic, 8);
+    write_u32(1u);                                    // version
+    write_u32(A.n_rows);
+    write_u32(A.n_cols);
+
+    // Total non-zeros (set bits) across all rows.
+    uint64_t nnz = 0;
+    for (const auto& row : A.rows) nnz += row.size();
+    write_u64(nnz);
+
+    // CSR row offsets (n_rows + 1), offsets[0] = 0.
+    uint64_t acc = 0;
+    write_u64(acc);
+    for (uint32_t i = 0; i < A.n_rows; ++i) {
+        acc += A.rows[i].size();
+        write_u64(acc);
+    }
+
+    // Flattened column indices, row by row (preserving the stored per-row order).
+    for (uint32_t i = 0; i < A.n_rows; ++i) {
+        if (!A.rows[i].empty()) {
+            f.write(reinterpret_cast<const char*>(A.rows[i].data()),
+                    A.rows[i].size() * sizeof(uint32_t));
+        }
+    }
+    return static_cast<bool>(f);
+}
+
+bool DumpMatrixColumnLegend(const std::string& path,
+                            const std::vector<uint32_t>& factor_base,
+                            uint32_t n_cols) {
+    std::ofstream f(path);
+    if (!f) return false;
+
+    const uint32_t fb_size = static_cast<uint32_t>(factor_base.size());
+    f << "# cuda-mpqs matrix column legend\n";
+    f << "# Maps GF(2) matrix column index -> meaning.\n";
+    f << "# Each matrix entry is 1 over GF(2); a set bit in column c means the\n";
+    f << "# corresponding parity (sign / prime exponent) is odd for that relation.\n";
+    f << "# n_cols=" << n_cols << " fb_size=" << fb_size << "\n";
+    f << "# format: <col_index>\\t<meaning>\n";
+    f << "0\tsign (parity of negative Q)\n";
+    if (n_cols > 1) f << "1\tprime 2 parity (val_2_exps)\n";
+
+    const uint32_t fb_first = 2;
+    const uint32_t fb_last  = fb_first + fb_size;   // exclusive
+    for (uint32_t k = 0; k < fb_size && (fb_first + k) < n_cols; ++k) {
+        f << (fb_first + k) << "\tFactorBase[" << k << "] = prime " << factor_base[k] << "\n";
+    }
+
+    // Columns beyond the factor base only exist on the expanded/preprocess path
+    // (large-prime columns followed by 32 quadratic-character columns). Their
+    // exact split is not reconstructible from the factor base alone, so they are
+    // documented as a single labelled range.
+    if (n_cols > fb_last) {
+        f << "# columns [" << fb_last << ", " << n_cols << ") : large-prime columns "
+          << "followed by 32 quadratic-character columns (expanded/preprocess matrix path).\n";
+        f << fb_last << ".." << (n_cols - 1)
+          << "\tLP and character columns (expanded path)\n";
+    }
+    return static_cast<bool>(f);
 }
 
 } // namespace matrix

@@ -126,6 +126,7 @@ Two 1-partials A, B sharing large prime L combine as:
 - `sign = sign_A * sign_B`
 - `val_2_exp = val_2_exp_A + val_2_exp_B`
 - Factors: sorted merge of CSR arrays with exponent summation (capped at 64 factors)
+- `char_bits = char_bits_A ^ char_bits_B` — under `--char_mode branch`, the combined relation's branch character vector is the XOR of its constituents' vectors (`branchCharBit` is an F2 homomorphism over the field-element product; bits are never re-derived from `sqrt_Q_combined`). Mode-agnostic: under `norm`/`none` both inputs carry 0, so the result stays 0. The cluster CPU LP path (`cpu_lp.cu`) does the same.
 
 ## Memory Footprint (B=20, 16M witnesses)
 

@@ -67,7 +67,42 @@ struct LargePrimeConfig {
     /// kernel vectors) at small factor-base sizes.
     bool purge_after_match = false;
 
+    /// @brief When true, capture per-combined-relation constituent provenance
+    /// (probe root u_p, witness root u_w, signs, val_2_exps, LP) into a separate
+    /// device buffer BEFORE the slab purge erases the linkage. STRICTLY ADDITIVE
+    /// and DIAGNOSTIC: when false, NO provenance buffer is allocated and NO extra
+    /// kernel is launched, so the factorization path and its performance are
+    /// byte-for-byte unchanged. Gated by CLI --dump_combine_provenance.
+    bool capture_provenance = false;
+
     int device_id = 0;
+};
+
+/**
+ * @brief One captured combined-relation provenance record.
+ *
+ * Records the two constituents of a combined relation u_c = u_p * u_w (mod N),
+ * formed in global_combine_kernel from an input "probe" 1-partial (u_p) and a
+ * stored "witness" (u_w) sharing the same large prime. Captured by a SEPARATE
+ * diagnostic kernel that reads the identical inputs as the combine kernel, so it
+ * is order-aligned with no semantic effect. The (lp, u_c) pair uniquely links
+ * each record back to its row in the combined-output / relations.v2 store.
+ *
+ * Sign encoding mirrors the SoA convention: 1 = positive, anything else = negative.
+ * POD / trivially copyable for direct binary serialization.
+ */
+struct CombineProvenanceEntry {
+    mpqs::uint512 u_c;        ///< Combined root = u_p * u_w (mod N)  [must match output sqrt_Q]
+    mpqs::uint512 u_p;        ///< Probe (input 1-partial) root sqrt_Q
+    mpqs::uint512 u_w;        ///< Witness (stored) root sqrt_Q
+    unsigned __int128 lp;     ///< Shared large prime (both constituents)
+    uint32_t input_idx;       ///< Probe index within its sieve batch (intra-batch only)
+    uint32_t witness_idx;     ///< Global witness SoA index (stable across the whole run)
+    int32_t  v2_p;            ///< Probe val_2_exp
+    int32_t  v2_w;            ///< Witness val_2_exp
+    uint8_t  sign_p;          ///< Probe sign (1=positive)
+    uint8_t  sign_w;          ///< Witness sign (1=positive)
+    uint8_t  _pad[6];         ///< Explicit padding (keep struct size deterministic for I/O)
 };
 
 /**
@@ -183,6 +218,11 @@ public:
     /// Call after sieve loop completes, before matrix construction.
     void moveWitnessesToHost(mpqs::structures::HostRelationBatch& dest, cudaStream_t stream);
 
+    /// @brief Download all captured combined-relation provenance records to host.
+    /// No-op (clears dest) unless config.capture_provenance was set at initiate().
+    /// Call after the sieve loop completes, before serialization. STRICTLY ADDITIVE.
+    void moveProvenanceToHost(std::vector<CombineProvenanceEntry>& dest, cudaStream_t stream);
+
 private:
     LargePrimeConfig config;
     cudaStream_t lp_stream;
@@ -279,6 +319,22 @@ private:
 
     /// @brief Saved pointer to persistent batch for deferred append (async path, Stage 3)
     mpqs::structures::RelationBatch* pending_persistent_ = nullptr;
+
+    // --- Combine-provenance capture (DIAGNOSTIC, allocated only when enabled) ---
+    /// @brief Run-lifetime device buffer of captured CombineProvenanceEntry records.
+    /// Appended to (across all batches) by capture_provenance_kernel. nullptr unless
+    /// config.capture_provenance. Never touched on the normal path.
+    CombineProvenanceEntry* d_provenance_ = nullptr;
+    /// @brief Device atomic append counter for d_provenance_ (number of records).
+    uint64_t* d_provenance_count_ = nullptr;
+    /// @brief Capacity (in records) of d_provenance_.
+    uint64_t  provenance_capacity_ = 0;
+    /// @brief Device overflow counter: combined relations dropped because buffer full.
+    uint64_t* d_provenance_overflow_ = nullptr;
+    /// @brief Launches capture_provenance_kernel on lp_stream (gated on capture_provenance).
+    void captureProvenance(const mpqs::structures::RelationBatchView& input_view,
+                           const mpqs::structures::RelationBatchView& global_witness_view,
+                           uint32_t grid_size, uint32_t block_size);
 
 #ifdef LP_DEBUG
     uint32_t lp_call_counter_ = 0;

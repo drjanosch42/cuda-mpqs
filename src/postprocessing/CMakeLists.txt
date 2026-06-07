@@ -139,9 +139,21 @@ set_target_properties(mpqs_postproc PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-target_include_directories(mpqs_postproc PUBLIC 
+target_include_directories(mpqs_postproc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+# Stage 4 (branch-fixed character columns): postprocessing computes the per-relation
+# branch character vector at relation birth via mpqs::matrix::branchCharBit
+# (header-only __host__ __device__ inline in src/matrix/gpu_char_cols.cuh). Only the
+# header is needed — no link dependency on mpqs_matrix is introduced. PRIVATE so it
+# does not leak into postproc's public interface. Project-mode only (standalone
+# postproc has no matrix sources).
+if(NOT (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR))
+    target_include_directories(mpqs_postproc PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/matrix
+    )
+endif()
 
 # ==============================================================================
 # Benchmark Binary (Only built in Standalone)

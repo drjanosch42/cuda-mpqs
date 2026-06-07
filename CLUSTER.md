@@ -403,7 +403,8 @@ tail -f /tmp/rtx_cluster_coord.log
 
 Access: `ssh ${USER}@<hostname>`, repo at `~/dev/cuda-mpqs` on all nodes.
 
-See [docs/cluster/machines.md](docs/cluster/machines.md) for validated per-node optimal parameters and performance data.
+Validated per-node optimal parameters and performance data are maintained
+alongside the cluster launch scripts under `tools/cluster/`.
 
 ---
 
@@ -453,8 +454,8 @@ Coordinator Node                    Worker Node(s)
 
 The single sieve loop in `MPQSOrchestrator::SieveStage()` serves all three modes (solo, coordinator Thread B, worker). The `DataTap*` callback is `nullptr` in solo mode (zero overhead), `DirectChannel` for the coordinator's local GPU sieve, and `NetworkDataTap` for remote workers.
 
-For full architectural details, see [docs/modules/cluster.md](docs/modules/cluster.md).
-For the design specification, see [docs/specs/cluster_v2_spec.md](docs/specs/cluster_v2_spec.md).
+For full architectural details and the design overview, see
+[docs/modules/cluster.md](docs/modules/cluster.md).
 
 ---
 

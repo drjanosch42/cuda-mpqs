@@ -30,6 +30,9 @@ struct PartialRelation {
     unsigned __int128 large_prime;
     std::vector<uint32_t> factor_indices;
     std::vector<uint8_t>  factor_counts;
+    /// Stage 4: branch char vector of this raw partial (0 in norm mode). Carried so
+    /// Stage 5 can XOR-combine it with the matched partner; Stage 4 only preserves it.
+    uint32_t          char_bits = 0;
 };
 
 /// CPU hash table for single large prime matching.

@@ -56,6 +56,7 @@
 
 #include "prime_algorithms.h"
 #include "graycode.cuh"
+#include "uint128_helper.cuh" // mpqs::math::{mul_mod,pow_mod} — u128-safe 64-bit modular ops
 #include <cassert>
 #include <bit>
 
@@ -230,6 +231,173 @@ uint32_t Tonelli_Shanks(uint32_t n, uint32_t p) {
         t = (t * c) % p;
         R = (R * b) % p;
     }
+}
+
+/**
+ * @brief 64-bit Jacobi symbol $\left(\frac{a}{n}\right)$ (== Legendre when n prime).
+ *
+ * Identical algorithm to the uint32 `jacobi` above, lifted to 64-bit operands.
+ * Uses `__builtin_ctzll` for trailing-zero counting and 64-bit `% 8` / `% 4`
+ * reductions. Required because aux primes $q_s > $ lp1_bound exceed $2^{32}$.
+ *
+ * @param a The numerator.
+ * @param n The denominator (must be odd).
+ * @return 1, 0, or -1.
+ */
+int jacobi_u64(uint64_t a, uint64_t n) {
+    assert(n % 2 == 1); // Jacobi is defined for odd n
+
+    a = a % n;
+    int t = 1;
+
+    while (a != 0) {
+        // 1. Remove factors of 2 from a
+        int zeros = __builtin_ctzll(a);
+        a >>= zeros;
+
+        // 2. If 2 appeared an odd number of times, check n mod 8
+        if (zeros % 2 == 1) {
+            if (n % 8 == 3 || n % 8 == 5) {
+                t = -t;
+            }
+        }
+
+        // 3. Quadratic Reciprocity Law
+        if ((a % 4 == 3) && (n % 4 == 3)) {
+            t = -t;
+        }
+
+        // 4. Euclidean Step: swap and mod
+        uint64_t temp = n;
+        n = a;
+        a = temp % a;
+    }
+
+    if (n == 1) return t;
+    return 0; // gcd(a, n) != 1
+}
+
+/**
+ * @brief 64-bit Tonelli-Shanks: solves $x^2 \equiv n \pmod p$ for odd prime $p$.
+ *
+ * Structurally identical to the uint32 `Tonelli_Shanks` above, but every
+ * `x^k mod p` / `t·t mod p` step is routed through the u128-safe primitives
+ * `mpqs::math::pow_mod` / `mpqs::math::mul_mod`. The uint32 version's bare
+ * `(x*x) % p` products overflow once $p > 2^{32}$; the 64-bit aux primes
+ * ($q_s > $ lp1_bound) require the wide-multiply path here.
+ *
+ * Preconditions: $p$ is an odd prime, $\gcd(n,p)=1$.
+ *
+ * @param n Quadratic residue.
+ * @param p Prime modulus (may exceed $2^{32}$).
+ * @return Root $r$ such that $r^2 \equiv n \pmod p$. Returns 0 if no root exists.
+ */
+uint64_t Tonelli_Shanks_u64(uint64_t n, uint64_t p) {
+    using mpqs::math::mul_mod;
+    using mpqs::math::pow_mod;
+
+    // 0. Trivial checks
+    if (n == 0) return 0;
+    // Euler's criterion: n^((p-1)/2) == 1 mod p
+    if (pow_mod(n, (p - 1) / 2, p) != 1) {
+        return 0; // Not a quadratic residue
+    }
+
+    // 1. Factor out powers of 2 from p-1:  p - 1 = Q * 2^S
+    uint64_t Q = p - 1;
+    uint64_t S = 0;
+    while ((Q & 1) == 0) {
+        Q >>= 1;
+        S++;
+    }
+
+    // 2. Find a quadratic non-residue z
+    uint64_t z = 2;
+    while (pow_mod(z, (p - 1) / 2, p) != p - 1) {
+        z++;
+    }
+
+    // 3. Initialization
+    uint64_t M = S;
+    uint64_t c = pow_mod(z, Q, p);
+    uint64_t t = pow_mod(n, Q, p);
+    uint64_t R = pow_mod(n, (Q + 1) / 2, p);
+
+    // 4. Main Loop
+    while (true) {
+        if (t == 0) return 0; // Should not happen if (n,p)=1
+        if (t == 1) return R;
+
+        // Find smallest i (0 < i < M) such that t^(2^i) = 1 mod p
+        uint64_t i = 0;
+        uint64_t temp_t = t;
+        for (i = 1; i < M; i++) {
+            temp_t = mul_mod(temp_t, temp_t, p);
+            if (temp_t == 1) break;
+        }
+
+        // If no such i found, input wasn't a residue.
+        if (i == M) return 0;
+
+        // b = c^(2^(M-i-1)) via repeated squaring
+        uint64_t b = c;
+        for (uint64_t j = 0; j < M - i - 1; j++) {
+            b = mul_mod(b, b, p);
+        }
+
+        // Update variables
+        M = i;
+        c = mul_mod(b, b, p);
+        t = mul_mod(t, c, p);
+        R = mul_mod(R, b, p);
+    }
+}
+
+/**
+ * @brief Deterministic Miller-Rabin primality test, valid for all $n < 2^{64}$.
+ *
+ * Uses the fixed witness set {2,3,5,7,11,13,17,19,23,29,31,37}, which is
+ * proven sufficient to deterministically classify every 64-bit integer.
+ * All modular arithmetic uses the u128-safe `mpqs::math::{mul_mod,pow_mod}`.
+ * (Trial division is infeasible for the ~1e11-scale aux primes.)
+ *
+ * @param n Candidate.
+ * @return true iff n is prime.
+ */
+bool is_prime_u64(uint64_t n) {
+    using mpqs::math::mul_mod;
+    using mpqs::math::pow_mod;
+
+    if (n < 2) return false;
+    // Small-prime quick check / witness handling
+    static const uint64_t witnesses[12] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37};
+    for (uint64_t w : witnesses) {
+        if (n == w) return true;
+        if (n % w == 0) return false;
+    }
+
+    // Write n - 1 = d * 2^r with d odd
+    uint64_t d = n - 1;
+    int r = 0;
+    while ((d & 1) == 0) {
+        d >>= 1;
+        r++;
+    }
+
+    for (uint64_t a : witnesses) {
+        // a < n is guaranteed here: all witnesses are small primes and any
+        // n <= 37 already returned above, so n > 37 > a.
+        uint64_t x = pow_mod(a, d, n);
+        if (x == 1 || x == n - 1) continue;
+
+        bool composite = true;
+        for (int j = 0; j < r - 1; j++) {
+            x = mul_mod(x, x, n);
+            if (x == n - 1) { composite = false; break; }
+        }
+        if (composite) return false;
+    }
+    return true;
 }
 
 /**

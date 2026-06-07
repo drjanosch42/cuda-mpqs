@@ -13,7 +13,7 @@ Namespaces: `mpqs::sieve` (all sieving structures and kernels), `mpqs::postproce
 | `kernel.cu` / `kernel.cuh` | All CUDA kernels (legacy + batch variants), device math helpers, polynomial/root helpers |
 | `sieving_data_structs.h` | All data structures: primes, candidates, contexts, configs, `gpuInfo`, `DoubleBuffer` |
 | `device_sieving_controller.h` / `.cpp` | Main API class: initialization, execution, batch orchestration, state management, snapshot / cluster hooks |
-| `prime_algorithms.cu` / `.h` | Factor base generation, Tonelli-Shanks, Hensel lifting, hypercube walk, batch index preparation |
+| `prime_algorithms.cu` / `.h` | Factor base generation, Tonelli-Shanks, Hensel lifting, hypercube walk, batch index preparation; 64-bit number-theory primitives (`Tonelli_Shanks_u64`, `jacobi_u64`, `is_prime_u64`) for branch-fixed character columns |
 | `graycode.cuh` | Gray code enumeration: `gray()`, `advanceGray()`, `grayBitToFlip()` (all `__host__ __device__`) |
 | `common.h` | `factoringData` struct (`mpqs::sieve` sieving state) and `AFactorsSnapshot` |
 | `json_helper.h` | Minimal `JSONString` / `JSON_IO` builder used only by the optional debug-snapshot path |
@@ -339,9 +339,22 @@ The private member `external_stop_` (`device_sieving_controller.h:244`, default 
 | `advance_a_factors(fData, steps)` | Advance hypercube walk by `steps` |
 | `recalc_a(fData)` | Recompute a from current a_factors |
 | `prepareNextBatchIndices(fData, batch_size)` | Advance host state for `batch_size` steps; return flattened `uint32_t` vector of size `batch_size * shc_dim` |
-| `Tonelli_Shanks(n, p)` | Modular square root mod prime p |
+| `Tonelli_Shanks(n, p)` | Modular square root mod prime p (32-bit) |
 | `liftRoot(r, N_red, p)` | Hensel lifting for roots mod prime powers |
 | `modInv(a, p)` | Modular inverse mod prime p |
+
+### 64-bit Number-Theory Primitives
+
+Overflow-safe 64-bit primitives added for the branch-fixed character columns (the branch aux primes
+`q_s` are chosen `> lp1_bound ~1e11`, exceeding `uint32_t`). All modular steps route through the
+`__int128`-safe `mpqs::math::{mul_mod, pow_mod}` helpers. Consumed by the matrix module's
+`selectAuxPrimes`/`branchCharBit` and the postprocessing branch char-bit capture.
+
+| Function | Description |
+|----------|-------------|
+| `Tonelli_Shanks_u64(n, p)` | Modular square root mod prime p (64-bit), used to fix the per-aux-prime Tonelli root `t_s` |
+| `jacobi_u64(a, n)` | 64-bit Jacobi symbol |
+| `is_prime_u64(n)` | Deterministic Miller–Rabin primality test over the full `uint64_t` range |
 
 ## Dependencies
 

@@ -20,8 +20,12 @@ namespace mpqs::cluster {
 /// Serialize first `count` relations from a HostRelationBatch to a contiguous buffer.
 /// Wire layout: [num_relations:u32][num_factors:u32]
 ///   [sqrt_Q: N*64B][signs: N*1B][val_2_exps: N*4B]
-///   [large_primes: N*16B][factor_offsets: (N+1)*8B]  <-- CSR sentinel included
+///   [large_primes: N*16B][char_bits: N*4B]           <-- Stage 4 branch char vector
+///   [factor_offsets: (N+1)*8B]                        <-- CSR sentinel included
 ///   [factor_indices: NNZ*4B][factor_counts: NNZ*1B]  <-- per-factor exponents
+/// char_bits is always present (a defined 0 under --char_mode norm) and NEVER enters
+/// the dedup hash (see accumulator.h::computeRelationHash). Worker→coord ships raw
+/// partials carrying their char vectors; the coordinator XORs on combine (Stage 5).
 /// @return (buffer, byte count written).
 std::pair<std::vector<uint8_t>, size_t>
 serializeRelationBatch(const mpqs::structures::HostRelationBatch& batch, uint64_t count);

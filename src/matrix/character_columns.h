@@ -12,9 +12,20 @@
 namespace mpqs {
 namespace matrix {
 
+/// Character-column selection mode (branch-fixed character columns, Stage 2).
+/// CLI: --char_mode norm|branch|none. Default: none (char cols off by default;
+/// pass --char_mode norm|branch to enable).
+/// NONE:   append zero character columns (default). The matrix is left with
+///         exactly its FB(+LP) columns; char-col computation is skipped entirely,
+///         so k == 0.
+/// NORM:   legacy start-at-3 uint32 aux-prime walk (byte-identical A/B oracle).
+/// BRANCH: aux primes chosen > lp1_bound via a 64-bit walk with a fixed Tonelli
+///         root t_s per aux prime (locks the ideal branch).
+enum class CharMode { NORM, BRANCH, NONE };
+
 /// Character column data for k auxiliary primes over n relations.
 struct CharacterColumns {
-    std::vector<uint32_t> aux_primes;           ///< k auxiliary primes
+    std::vector<uint64_t> aux_primes;           ///< k auxiliary primes (64-bit: branch mode chooses q > lp1_bound)
     std::vector<std::vector<uint8_t>> columns;  ///< columns[j][i] in {0,1}, j=char, i=relation
     uint32_t k = 0;                             ///< number of character columns
 };
@@ -25,27 +36,43 @@ public:
     /// Select k auxiliary primes satisfying (N|q)=+1, q not in FB.
     /// @param N         The composite being factored.
     /// @param fb        Factor base primes.
+    /// @param mode      NORM (legacy start-at-3 uint32 walk; byte-identical) or
+    ///                  BRANCH (64-bit walk for q > lp1_bound + fixed Tonelli root t_s).
+    /// @param lp1_bound Large-prime bound; BRANCH starts at the first odd q > lp1_bound.
     /// @param k         Number of character columns (default 32).
     void selectAuxPrimes(const uint512& N,
                          const std::vector<uint32_t>& fb,
+                         CharMode mode,
+                         uint64_t lp1_bound,
                          uint32_t k = 32);
 
     /// Compute character column values for a batch of relations.
-    /// Q_i = sqrt_Q_i^2 - N for each relation. Legendre symbol (Q_i | q_j) encoded as GF(2).
-    /// N mod q is precomputed by selectAuxPrimes().
-    /// @param batch     Relations (uses sqrt_Q values).
+    /// NORM (default): Q_i = sqrt_Q_i^2 - N; Legendre symbol (Q_i | q_j) encoded as
+    /// GF(2); N mod q is precomputed by selectAuxPrimes(). Byte-identical to before.
+    /// BRANCH (Stage 5): a thin adapter — the genus-correct branch-fixed char vector
+    /// was already evaluated per relation at birth (Stage 4) on the SIGNED (ax+b) and
+    /// persisted in batch.char_bits; this just unpacks bit j of char_bits[i] into
+    /// columns[j][i] (no symbol re-evaluation). char_bits absent → treated as 0.
+    /// @param batch     Relations (NORM uses sqrt_Q; BRANCH uses char_bits).
+    /// @param mode      NORM (default, legacy formula) or BRANCH (unpack char_bits).
     /// @return CharacterColumns with k columns, each of length batch.num_relations.
-    CharacterColumns compute(const structures::HostRelationBatch& batch) const;
+    CharacterColumns compute(const structures::HostRelationBatch& batch,
+                             CharMode mode = CharMode::NORM) const;
 
     /// Access selected primes (for logging/debugging).
-    const std::vector<uint32_t>& auxPrimes() const { return aux_primes_; }
+    const std::vector<uint64_t>& auxPrimes() const { return aux_primes_; }
 
     /// Access precomputed N mod q values (for GPU dispatch in M8c).
+    /// NORM path only — branch mode does not populate this (see selectAuxPrimes).
     const std::vector<uint32_t>& nModQ() const { return n_mod_q_; }
 
+    /// Access fixed Tonelli roots t_s per aux prime (branch mode only; empty in norm).
+    const std::vector<uint64_t>& tS() const { return t_s_; }
+
 private:
-    std::vector<uint32_t> aux_primes_;
-    std::vector<uint32_t> n_mod_q_;  ///< precomputed N mod q for each aux prime
+    std::vector<uint64_t> aux_primes_;
+    std::vector<uint32_t> n_mod_q_;  ///< precomputed N mod q for each aux prime (NORM path only)
+    std::vector<uint64_t> t_s_;      ///< fixed Tonelli root t_s per aux prime (BRANCH mode only)
 };
 
 /// Append character columns to an existing CSR matrix.
@@ -77,6 +104,8 @@ CharacterColumns ConcatenateCharacterColumns(const CharacterColumns& a,
 /// @param ns             Number of smooth relations.
 /// @param N              The composite being factored.
 /// @param fb             Factor base primes (for aux prime selection).
+/// @param mode           Aux-prime selection mode (NORM or BRANCH); forwarded to selectAuxPrimes.
+/// @param lp1_bound      Large-prime bound; BRANCH selects q > lp1_bound.
 /// @param k              Number of character columns (default 32).
 /// @return CharacterColumns with k columns, each of length row_map.size().
 CharacterColumns computeProductCharacterColumns(
@@ -87,6 +116,8 @@ CharacterColumns computeProductCharacterColumns(
     size_t ns,
     const uint512& N,
     const std::vector<uint32_t>& fb,
+    CharMode mode,
+    uint64_t lp1_bound,
     uint32_t k = 32);
 
 /// GPU-accelerated standard character column computation (M8c).

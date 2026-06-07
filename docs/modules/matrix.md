@@ -16,11 +16,11 @@ Converts SoA relation data to a sparse GF(2) CSR matrix for the Block Wiedemann 
 | `merge_tree.cpp` | Merge tree construction and `expandKernelVector()` |
 | `matrix_truncation.h` | `truncateMatrix()` — CPU row truncation (select k sparsest rows) |
 | `matrix_truncation.cpp` | Truncation implementation via `std::nth_element` partial sort |
-| `character_columns.h` | `CharacterColumnComputer`, `CharacterColumns`, `computeProductCharacterColumns()` |
-| `character_columns.cpp` | Quadratic character column computation (standard + product) |
+| `character_columns.h` | `CharMode`, `CharacterColumnComputer`, `CharacterColumns`, `computeProductCharacterColumns()` |
+| `character_columns.cpp` | Quadratic character column computation (`norm` NORM symbol + `branch` field-element symbol), standard + product |
 | `gpu_singleton.cuh` | `gpuRemoveSingletons()` — binary CSR GPU singleton removal (cluster mode) |
 | `gpu_singleton.cu` | 5-kernel singleton pipeline (S1-S5) + Thrust prefix sums |
-| `gpu_char_cols.cuh` | `gpuComputeCharacterColumns()` — GPU standard character columns (CC1 kernel) |
+| `gpu_char_cols.cuh` | `gpuComputeCharacterColumns()` — GPU standard character columns (CC1 kernel); `branchCharBit()` — branch-fixed field-element character symbol (`__host__ __device__`); `ROW_WS_BIT` selector |
 | `gpu_char_cols.cu` | Jacobi symbol kernel for 32 auxiliary prime Legendre symbols |
 | `preprocess.h` | `PreprocessResult`, `PreprocessResultV2`, `preprocessMatrix()`, `gpuPreprocessMatrix_packed()`, `selectKernelVectorRows()` |
 | `preprocess.cpp` | Backend dispatch, V1 pipeline driver, V2 packed pipeline driver |
@@ -124,6 +124,49 @@ One thread per row in the chunk. Columns are written in fixed order: 0 (sign), 1
 - **Links:** `mpqs_postproc`, `mpqs_common`, `cudampqs_build_flags`
 - **Headers:** `mpqs_soa.h` (`RelationBatchView`), `linalg/cuda_spmm/include/common.h` (`HostMatrix`), Thrust
 - **Include paths:** `src/linalg/include` (for `lingen/types.h`), `src/linalg/cuda_spmm/include` (for `common.h` defining `HostMatrix`)
+
+---
+
+## Character Columns
+
+Quadratic character columns force the linear-algebra solver into the principal genus. The
+`CharMode` enum (`character_columns.h`) selects how the auxiliary-prime symbol is evaluated, set by
+the CLI flag `--char_mode {norm,branch,none}`:
+
+| Mode | Symbol | Notes |
+|---|---|---|
+| `none` (**default**) | — | Zero character columns appended (`k == 0`). Char-col computation is skipped entirely (`compute`+`append` short-circuited at `orchestrator.cpp` legacy site, the CPU-preprocess M7 site, and `preprocess.cpp` GPU-preprocess M9f). Scientific null control. |
+| `norm` | `jacobi((sqrt_Q² − N) / q)` | Legacy genus-blind NORM symbol; aux primes via a start-at-3 `uint32` walk. The pre-existing behavior, kept as a baseline oracle. |
+| `branch` | `[jacobi(((ax+b) − t_s) / q) == −1]` | Mathematically correct branch-fixed field-element character. Aux primes `q_s` chosen `> lp1_bound` via a 64-bit walk, each with a fixed Tonelli root `t_s` (`t_s² == N mod q_s`) that locks the ideal branch. The per-relation bit is evaluated at relation birth and propagated by XOR (see below). |
+
+`CharMode` is never auto-enabled — it is set only by the CLI flag, and all four append sites are
+gated by `char_mode == NONE`.
+
+**Why `none` is the default.** Empirical validation found character columns confer no demonstrable
+factoring benefit at reachable scales. When the QS is *unobstructed* (e.g. RSA-100/110 across the
+reachable parameter space) the columns are linearly redundant — the per-solution nontrivial-GCD
+rate already sits at the ~50% theoretical cap, and `none` is statistically indistinguishable from
+`norm`. When the QS is *obstructed* (the LP graph becomes dominated by isolated degree-2 cycles),
+the per-solution rate collapses near-discontinuously to 0%, and even the genus-correct 32 `branch`
+columns are insufficient to recover it. There is no intermediate regime in which `branch` rescues
+an otherwise-failing factorization. `branch` is the correct symbol and is retained as a tool, but
+should not be expected to improve factoring outcomes; the practical mitigation for high-LP collapse
+is operational (keep the LP bound below the 2-cycle cliff), not algebraic.
+
+**Branch char-bit propagation (Stage 4–6).** Under `--char_mode branch`, the r-bit char vector is a
+property of the signed `(ax+b)` alone, so it is captured once at relation birth in postprocessing
+(`processCandidate`, `mpqs::matrix::branchCharBit`) and persisted per relation in
+`HostRelationBatch::char_bits` (and `relation_io` v2 via `FLAG_HAS_CHAR_BITS`; see
+[common.md](common.md)). Because `branchCharBit` is an F2 homomorphism over field-element products,
+the combined vector is the **XOR** of its constituents:
+- **LP combination** (`largeprime.cu`, cluster `cpu_lp.cu`): `char_bits[combined] = char_bits[probe] ^ char_bits[witness]`.
+- **Merge-tree reduction** (`computeProductCharacterColumns(BRANCH)`): each reduced row's columns are the XOR-with-multiplicity of its leaves' persisted `char_bits`.
+- **Packed/preprocess reduction**: the seed `char_bits` is XOR-composed at each merge, relocated through compaction, and gathered at the end (M9v2).
+
+`CharacterColumnComputer::compute(batch, BRANCH)` is then a thin adapter that just unpacks bit j of
+`char_bits[i]` (no symbol re-evaluation); `CharMode::NORM` re-evaluates the NORM formula from
+`sqrt_Q` as before. The 64-bit aux-prime selection (`selectAuxPrimes`) and `branchCharBit` reuse the
+`*_u64` number-theory primitives in `src/sieve/prime_algorithms.*` (see [sieve.md](sieve.md)).
 
 ---
 
@@ -402,7 +445,8 @@ selector and a **char-col-aware** target:
 target_rows = max(n_cols + n_extra_cols + k_excess, <coverage minimum>)
 ```
 
-The driver calls it with `n_extra_cols = 32` (the product char columns about to be appended) and
+The driver calls it with `n_extra_cols` = the number of product char columns about to be appended
+(32 under `--char_mode norm|branch`, 0 under the default `none`) and
 `k_excess = truncation_excess` (CLI `--matrix_truncation_excess`, default 200), so the
 post-augmentation matrix is overdetermined by a controlled excess rather than by a hardcoded
 factor. `truncation_factor > 0` is retained only as an on/off switch; the actual target is
@@ -412,11 +456,19 @@ column is left with zero coverage.
 
 ### M9f: Product Character Columns (Packed)
 
-`gpuProductCharCols_packed()` computes 32 quadratic character columns from pre-merged `sqrt_Q` values. No Montgomery recomputation needed -- `sqrt_Q` products were computed incrementally during M9e merges.
+`gpuProductCharCols_packed()` computes up to 32 quadratic character columns from pre-merged
+`sqrt_Q` values (`--char_mode norm`). No Montgomery recomputation needed -- `sqrt_Q` products were
+computed incrementally during M9e merges.
 
 Per row r, evaluates: `jacobi((sqrt_Q[r]^2 - N) mod q, q)` for 32 auxiliary primes q.
 
 Structurally identical to the standard `char_col_kernel` (CC1), reading from merged `sqrt_Q` instead of original relation `sqrt_Q`. Cost: ~5ms at RSA-110 (155K rows x 32 Jacobi evaluations).
+
+Under `--char_mode branch`, the packed pipeline instead carries a per-relation `char_bits` seed
+through the merge/compaction (XOR-composed via `ROW_WS_BIT`, relocated during compaction, gathered
+at the end) and appends those columns — see [Character Columns](#character-columns) below. Under the
+default `--char_mode none` the whole product-char-column step (`preprocess.cpp:310`, M9f) is skipped
+and zero columns are appended.
 
 ### `PreprocessResultV2`
 
@@ -472,9 +524,11 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
     uint32_t max_weight = 200,          // fill-in limit for higher-weight merges
     double   truncation_factor = 1.05,  // > 0 enables M9c-post truncation, 0 disables
     uint32_t compact_cycles = 5,        // M10 max compact-merge cycles; 0 = single pass
-    uint32_t truncation_excess = 200,   // M12-S1 excess rows over (n_cols + 32 char cols)
+    uint32_t truncation_excess = 200,   // M12-S1 excess rows over (n_cols + char cols)
     double   gf2_floor_factor = 0.5,    // M12-S2 floor as fraction of initial GF(2) col count
-    uint32_t gf2_min_floor = 8192);     // M12-S2 absolute GF(2) col floor
+    uint32_t gf2_min_floor = 8192,      // M12-S2 absolute GF(2) col floor
+    CharMode char_mode = CharMode::NORM,// product char-col symbol: NORM | BRANCH | NONE (skip)
+    uint64_t lp1_bound = 0);            // BRANCH aux-prime selection bound (q > lp1_bound)
 ```
 
 > The legacy `k_max=10, max_weight=200, truncation_factor=1.05` defaults still seed the merge
@@ -509,16 +563,25 @@ This replaces the M5 `ApplyLPCorrection` mechanism from the V1 pipeline.
 
 ### Mode Selection
 
-The preprocessing path is chosen in `orchestrator.cpp` from `--matrix_mode`, `--matrix_backend`,
-the measured LP fraction vs. `--lp_preprocess_threshold`, and the execution mode.
+The construction path is chosen in `orchestrator.cpp` from `--matrix_mode`, `--matrix_backend`, and
+the execution mode.
+
+**AUTO resolves to legacy for normal runs.** The old LP-fraction → preprocess auto-switch was
+removed: validation showed preprocessing *degrades* the obstructed high-LP regime (the merge/
+compaction destroys the row/cycle diversity the legacy projected matrix preserves, pulling the
+2-cycle collapse below the legacy cliff and turning a legacy success into a failure). Preprocessing
+now engages only via explicit `--matrix_mode preprocess`, or implicitly in `MATRIX_ONLY` replay mode
+when raw partials are present. `--lp_preprocess_threshold` / `--lp_matrix_threshold` are still parsed
+for backward compatibility but are **inert** — they no longer trigger any auto-switch.
 
 | Mode | Pipeline | Reason |
 |---|---|---|
-| Solo, GPU backend, preprocess | V2 (packed + M10–M12) | Device-resident data, full GPU acceleration |
-| Solo, CPU backend | V1 (binary CSR + merge tree) | Explicit `--matrix_backend cpu` |
+| AUTO (default), normal run | V1 legacy (projected FB+2 columns) | AUTO no longer auto-selects preprocess from LP fraction |
+| Explicit `--matrix_mode preprocess`, solo, GPU backend | V2 (packed + M10–M12) | Device-resident data, full GPU acceleration |
+| Explicit `--matrix_mode preprocess`, CPU backend | V1 (binary CSR + merge tree) | Explicit `--matrix_backend cpu` |
 | Cluster | V1 (binary CSR + merge tree) | Relations arrive on host via TCP |
 | `LINALG_ONLY` | V1 (binary CSR + merge tree) | Relations loaded from disk to host |
-| `MATRIX_ONLY` (`--matrix_only`) | Load v2 relations → Matrix → BW → Sqrt | Replay device-saved v2 relations; can drive V2 packed path |
+| `MATRIX_ONLY` (`--matrix_only`) | Load v2 relations → Matrix → BW → Sqrt | Replay device-saved v2 relations; AUTO expands only here (raw partials present) |
 
 > **`MATRIX_ONLY` mode** (`ExecutionMode::MATRIX_ONLY`, `orchestrator.h:63`): loads device-format
 > `relations.v2` and runs Matrix → BW → Sqrt without sieving. Combined with `--partial_subsample` /
@@ -534,14 +597,15 @@ Flag spellings and defaults below are the single source of truth as parsed in
 | Flag | Default | Description |
 |---|---|---|
 | `--matrix_backend <cpu\|gpu\|auto>` | `cpu` | Preprocessing backend. `auto` = GPU if available + >10K rows |
-| `--matrix_mode <legacy\|preprocess>` | auto | `legacy` = projected FB+2 columns; `preprocess` = expanded + merges |
+| `--matrix_mode <legacy\|preprocess>` | auto | `legacy` = projected FB+2 columns; `preprocess` = expanded + merges. **AUTO resolves to legacy** for normal runs (preprocess only via explicit flag or `--matrix_only`) |
+| `--char_mode <norm\|branch\|none>` | `none` | Character-column symbol. `none` = zero char cols (default); `norm` = legacy NORM symbol; `branch` = branch-fixed field-element symbol. See [Character Columns](#character-columns) |
 | `--truncation_factor <float>` | 1.05 | Truncation enable flag (>0 enabled, 0 disabled). Actual target is excess-based — see `--matrix_truncation_excess` |
 | `--matrix_truncation_excess <N>` | 200 | M12-S1 excess rows above `(n_cols + n_extra_cols)` after truncation |
 | `--matrix_gf2_floor_factor <float>` | 0.5 | M12-S2: stop compact-merge cycles when GF(2) cols fall below `factor × initial_gf2_cols` [0.0–1.0] |
 | `--matrix_gf2_min_floor <N>` | 8192 | M12-S2 absolute minimum GF(2) column floor |
 | `--compact_cycles <N>` | 5 | M10 max compact-merge cycles (GPU backend); 0 = single pass (pre-M10 behavior) |
-| `--lp_preprocess_threshold <float>` | 0.55 | LP fraction above which preprocess mode auto-activates |
-| `--lp_matrix_threshold <float>` | — | **DEPRECATED** alias for `--lp_preprocess_threshold` (backwards compatibility) |
+| `--lp_preprocess_threshold <float>` | 0.55 | **DEPRECATED / INERT.** Formerly the LP fraction above which AUTO selected preprocess; the auto-switch was removed. Still parsed, no effect |
+| `--lp_matrix_threshold <float>` | — | **DEPRECATED** alias for `--lp_preprocess_threshold` (backwards compatibility; also inert) |
 | `--matrix_only` | off | Load v2 relations, run matrix preprocessing + BW + sqrt (no sieving) |
 | `--partial_subsample <float>` | 1.0 | `matrix_only` experiments: fraction of partials/LP-combined to retain [0.0–1.0] |
 | `--smooth_subsample <float>` | 1.0 | `matrix_only` experiments: fraction of pure smooths to retain (LP-combined always kept) [0.0–1.0] |

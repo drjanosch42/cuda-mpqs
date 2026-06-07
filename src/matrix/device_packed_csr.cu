@@ -37,6 +37,10 @@ void DevicePackedCSR::alloc(uint32_t rows, uint32_t cols, uint32_t nnz_cap, bool
     device_malloc(reinterpret_cast<void**>(&d_sqrt_Q),       safe_rows * sizeof(uint512));
     device_malloc(reinterpret_cast<void**>(&d_signs),        safe_rows * sizeof(uint8_t));
     device_malloc(reinterpret_cast<void**>(&d_val_2_exps),   safe_rows * sizeof(int32_t));
+    // Stage 6 (branch char): per-row XOR-composed branch char vector. Mirrors
+    // d_sqrt_Q. Zero-init so norm-mode rows (and any uninitialized seed) read 0.
+    device_malloc(reinterpret_cast<void**>(&d_char_bits),    safe_rows * sizeof(uint32_t));
+    CUDA_CHECK(cudaMemset(d_char_bits, 0, safe_rows * sizeof(uint32_t)));
 }
 
 DevicePackedCSR::~DevicePackedCSR() {
@@ -46,6 +50,7 @@ DevicePackedCSR::~DevicePackedCSR() {
     if (d_sqrt_Q)      cudaFree(d_sqrt_Q);
     if (d_signs)       cudaFree(d_signs);
     if (d_val_2_exps)  cudaFree(d_val_2_exps);
+    if (d_char_bits)   cudaFree(d_char_bits);
 }
 
 DevicePackedCSR::DevicePackedCSR(DevicePackedCSR&& other) noexcept
@@ -54,6 +59,7 @@ DevicePackedCSR::DevicePackedCSR(DevicePackedCSR&& other) noexcept
       d_sqrt_Q     (other.d_sqrt_Q),
       d_signs      (other.d_signs),
       d_val_2_exps (other.d_val_2_exps),
+      d_char_bits  (other.d_char_bits),
       n_rows       (other.n_rows),
       n_cols       (other.n_cols),
       nnz          (other.nnz),
@@ -64,6 +70,7 @@ DevicePackedCSR::DevicePackedCSR(DevicePackedCSR&& other) noexcept
     other.d_sqrt_Q      = nullptr;
     other.d_signs       = nullptr;
     other.d_val_2_exps  = nullptr;
+    other.d_char_bits   = nullptr;
     other.n_rows        = 0;
     other.n_cols        = 0;
     other.nnz           = 0;
@@ -77,12 +84,14 @@ DevicePackedCSR& DevicePackedCSR::operator=(DevicePackedCSR&& other) noexcept {
     if (d_sqrt_Q)      cudaFree(d_sqrt_Q);
     if (d_signs)       cudaFree(d_signs);
     if (d_val_2_exps)  cudaFree(d_val_2_exps);
+    if (d_char_bits)   cudaFree(d_char_bits);
     // Transfer from other.
     d_row_offsets = other.d_row_offsets;
     d_entries     = other.d_entries;
     d_sqrt_Q      = other.d_sqrt_Q;
     d_signs       = other.d_signs;
     d_val_2_exps  = other.d_val_2_exps;
+    d_char_bits   = other.d_char_bits;
     n_rows        = other.n_rows;
     n_cols        = other.n_cols;
     nnz           = other.nnz;
@@ -93,6 +102,7 @@ DevicePackedCSR& DevicePackedCSR::operator=(DevicePackedCSR&& other) noexcept {
     other.d_sqrt_Q      = nullptr;
     other.d_signs       = nullptr;
     other.d_val_2_exps  = nullptr;
+    other.d_char_bits   = nullptr;
     other.n_rows        = 0;
     other.n_cols        = 0;
     other.nnz           = 0;
@@ -102,7 +112,7 @@ DevicePackedCSR& DevicePackedCSR::operator=(DevicePackedCSR&& other) noexcept {
 DevicePackedView DevicePackedCSR::view() const {
     return DevicePackedView{
         d_row_offsets, d_entries,
-        d_sqrt_Q, d_signs, d_val_2_exps,
+        d_sqrt_Q, d_signs, d_val_2_exps, d_char_bits,
         n_rows, n_cols, nnz
     };
 }

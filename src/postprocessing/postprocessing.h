@@ -120,6 +120,18 @@ struct PostProcConfig {
     /// @brief Dimension of hypercube (number of prime factors in a).
     uint32_t shc_dim;
 
+    // -- Branch-fixed character columns (Stage 4) --
+    /// @brief When true, processCandidate computes the r-bit branch character vector
+    /// from the SIGNED (ax+b) for every EMITTED relation (--char_mode branch). When
+    /// false (default --char_mode norm) the computation is fully gated off — char_bits
+    /// is written as a defined 0 with zero added hot-path arithmetic.
+    bool char_branch = false;
+    /// @brief Number of branch aux primes (r <= 32). Valid only when char_branch.
+    uint32_t char_r = 0;
+    /// @brief Device array of r branch aux primes q_s (64-bit, > lp1_bound).
+    const uint64_t* d_char_q = nullptr;
+    /// @brief Device array of r fixed Tonelli roots t_s (t_s^2 == N mod q_s), in [0,q_s).
+    const uint64_t* d_char_t = nullptr;
 
    /// CUDA
    int device_id = 0;

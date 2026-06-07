@@ -91,6 +91,14 @@ bool CPULargePrimeTable::combinePartials(
     output.signs.push_back(combined_sign);
     output.val_2_exps.push_back(combined_v2);
     output.large_primes.push_back(stored.large_prime);  // Store LP for validator
+    // Stage 5: branch-character XOR-combine. The combined relation's char vector is
+    // the XOR of its two constituents' raw per-relation vectors (the field-element
+    // symbol is a multiplicative homomorphism; gpu_char_cols.cuh branchCharBit doc).
+    // Never re-derive from the mod-N product combined_sqrt_Q — provably non-
+    // homomorphic. Mode-agnostic: under --char_mode norm both carry a defined 0, so
+    // 0 ⊕ 0 == 0, byte-identical to the Stage-4 placeholder.
+    output.char_bits.push_back(
+        stored.char_bits ^ ((idx < batch.char_bits.size()) ? batch.char_bits[idx] : 0u));
 
     for (auto idx_val : merged_indices) output.factor_indices.push_back(idx_val);
     for (auto cnt_val : merged_counts)  output.factor_counts.push_back(cnt_val);
@@ -135,6 +143,8 @@ PartialRelation CPULargePrimeTable::extractPartial(
     p.sign       = batch.signs[idx];
     p.val_2_exp  = batch.val_2_exps[idx];
     p.large_prime = batch.large_primes[idx];
+    // Stage 4: preserve the raw partial's branch char vector (0 if absent/norm mode).
+    p.char_bits  = (idx < batch.char_bits.size()) ? batch.char_bits[idx] : 0u;
 
     uint64_t fstart = batch.factor_offsets[idx];
     uint64_t fend   = batch.factor_offsets[idx + 1];

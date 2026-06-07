@@ -92,6 +92,14 @@ Grid: `<<<n_solutions, 256>>>`. Shared memory: `256 × sizeof(uint512)`.
 #### `BatchedGCDKernel` (M4)
 One thread per solution. Computes `diff = |X[j]−Y[j]|` (explicit comparison to avoid unsigned wrap), `f1 = gcd(diff, N)`. If trivial, computes `sum = X[j]+Y[j]`, `f2 = gcd(sum, N)`. Sets `d_factor_status[j]` to 0 (trivial), 1 (via |X−Y|), or 2 (via X+Y). Uses `mpqs::math::gcd()` (`__host__ __device__`).
 
+**Per-solution nontrivial-GCD rate (`--sqrt_diagnostic`).** After `BatchedGCD` downloads
+`d_factor_status`, the host counts how many of the `n` Block-Wiedemann solutions yielded a
+nontrivial factor and logs the rate `k/n` (with the distinct factor pairs found) at `LOG_DEBUG_1`
+(`sqrt_step.cu:1474`). This is the diagnostic for the high-LP collapse: an unobstructed run sits
+near the ~50% theoretical cap, whereas an obstructed (2-cycle-dominated) run collapses to 0%.
+Capture it with `--sqrt_diagnostic --log_file <path>` (it is suppressed at the default `--verbose`/
+info level).
+
 #### `RefineFactorsKernel` (M10)
 Extracts finest factorization from BatchedGCDKernel output via coprime refinement.
 
