@@ -1065,14 +1065,25 @@ void MPQSOrchestrator::Run() {
                     : 0.0;
 
                 // Determine matrix mode from CLI override or auto-detection.
-                bool force_preprocess = (config_.matrix_mode == MatrixMode::PREPROCESS);
-                bool force_legacy     = (config_.matrix_mode == MatrixMode::LEGACY);
+                // DIAGNOSTIC --force_preprocess forces the expand+merge path even with 0
+                // partials (and overrides --matrix_mode legacy), so preprocess's reduction
+                // can be exercised on a smooths-only relation set.
+                bool force_preprocess = (config_.matrix_mode == MatrixMode::PREPROCESS)
+                                        || config_.force_preprocess;
+                bool force_legacy     = (config_.matrix_mode == MatrixMode::LEGACY)
+                                        && !config_.force_preprocess;
 
                 if (force_preprocess && host_partials_soa_.num_relations == 0) {
-                    LOG(LOG_WARNING) << "matrix_mode=preprocess requested but no raw partials "
-                                     << "available. Falling back to legacy.";
-                    force_preprocess = false;
-                    force_legacy     = true;
+                    if (config_.force_preprocess) {
+                        LOG(LOG_WARNING) << "DIAGNOSTIC --force_preprocess: forcing the preprocess "
+                                         << "expand+merge path on 0-partial (smooths-only) input; "
+                                         << "skipping the legacy fallback.";
+                    } else {
+                        LOG(LOG_WARNING) << "matrix_mode=preprocess requested but no raw partials "
+                                         << "available. Falling back to legacy.";
+                        force_preprocess = false;
+                        force_legacy     = true;
+                    }
                 }
 
                 if (force_legacy) {
@@ -1141,6 +1152,27 @@ void MPQSOrchestrator::Run() {
                                           : 0.0)
                                       << "% reduction).";
                         host_partials_soa_ = std::move(filtered);
+                    }
+
+                    // Facet-3 fix: at high LP, do NOT materialize the matched raw-1-partial
+                    // 2-cycle rows. Genus-character analysis (docs / preprocessing_analysis)
+                    // shows those rows place the genus-character functional into the matrix row
+                    // space, pinning the entire BW kernel to the trivial genus coset (X≡±Y) →
+                    // 0% nontrivial. The sieve-time-combined smooths (kept in raw_smooths_soa_)
+                    // are genus-neutral, so smooths-only preprocess recovers (RSA-110 ~34.7%,
+                    // factors). Below the gate (e.g. 94d at 42.9%) the partials are beneficial
+                    // and kept → no regression. Tunable via --preprocess_lp_materialize_max
+                    // (1.0 = never skip / exact pre-fix behavior; 0.0 = always skip).
+                    if (lp_fraction > config_.preprocess_lp_materialize_max &&
+                        host_partials_soa_.num_relations > 0) {
+                        LOG(LOG_WARNING) << "facet-3 gate: high LP (" << std::fixed
+                            << std::setprecision(1) << (lp_fraction * 100.0) << "% > "
+                            << (config_.preprocess_lp_materialize_max * 100.0)
+                            << "%) → skipping " << host_partials_soa_.num_relations
+                            << " raw 1-partial 2-cycle rows to avoid genus capture "
+                            << "(smooths-only preprocess; tune --preprocess_lp_materialize_max).";
+                        host_partials_soa_ = structures::HostRelationBatch{};
+                        host_partials_soa_.factor_offsets.push_back(0);  // CSR sentinel
                     }
 
                     // Conditional LP-combined inclusion based on cluster mode.
@@ -1293,7 +1325,8 @@ void MPQSOrchestrator::Run() {
                         auto t_preproc = clock::now();
                         auto preproc = matrix::preprocessMatrix(
                             expanded.matrix,
-                            static_cast<matrix::MatrixBackend>(config_.matrix_backend));
+                            static_cast<matrix::MatrixBackend>(config_.matrix_backend),
+                            config_.merge_max_weight);  // DIAGNOSTIC k_max (default 10 = no change)
                         double preproc_sec = std::chrono::duration<double>(
                             clock::now() - t_preproc).count();
                         const char* preproc_backend_name =
@@ -1310,7 +1343,16 @@ void MPQSOrchestrator::Run() {
                         // M8: Matrix truncation (M12-S1: char-col-aware target).
                         // Char cols (32) are appended *after* this call (see below);
                         // pass n_extra_cols=32 so the target accounts for them.
-                        if (config_.truncation_factor > 0.0) {
+                        // Facet-2 fix (a): size-gate truncation. truncateMatrix's lightest-row
+                        // selection can confine the BW kernel to the trivial subspace.
+                        // It is only needed
+                        // to bound genuinely huge BW inputs; for all reachable preprocess scales
+                        // the untruncated matrix solves fine (legacy proves it), so skip truncation
+                        // at/below --truncation_min_rows. Skipping leaves preproc.reduced/row_map
+                        // (and the merge tree, stored below) unchanged — identical to the existing
+                        // "no truncation needed" path.
+                        if (config_.truncation_factor > 0.0 &&
+                            preproc.reduced.n_rows > config_.truncation_min_rows) {
                             constexpr uint32_t kCharColCount = 32;
                             auto trunc = matrix::truncateMatrix(
                                 preproc.reduced, preproc.row_map,
@@ -1323,6 +1365,10 @@ void MPQSOrchestrator::Run() {
                                 LOG(LOG_INFO) << "M8: Truncated " << trunc.rows_removed << " rows, "
                                               << trunc.cols_removed << " empty columns removed.";
                             }
+                        } else if (config_.truncation_factor > 0.0) {
+                            LOG(LOG_INFO) << "M8: Truncation skipped — reduced " << preproc.reduced.n_rows
+                                          << " rows <= --truncation_min_rows (" << config_.truncation_min_rows
+                                          << "); BW-tractable untruncated.";
                         }
 
                         // Store merge tree and row map for kernel vector expansion

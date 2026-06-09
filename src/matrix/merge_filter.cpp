@@ -451,54 +451,58 @@ MergeResult MergeFilterPipeline::mergeHigherWeight(
             }
             uint32_t pivot = containing[pivot_idx];
 
-            // XOR pivot with each non-pivot row.
-            bool any_merge = false;
-            bool all_skipped = true;
+            // Column elimination is TRUE ALL-OR-NOTHING. Eliminating a weight-w column by
+            // pivoting requires cancelling it from EVERY non-pivot row and then deleting the
+            // pivot (its sole remaining occurrence): one row AND one column gone ⇒ Δnullity = 0
+            // (nullspace-preserving). If even one of the w−1 XORs would exceed the fill-in cap,
+            // we must NOT partially eliminate: deleting the pivot while the column still lives
+            // in the skipped rows removes a row without removing its column (Δnullity = −1), and
+            // keeping the partial XORs without deleting the pivot inflates the nullspace with
+            // spurious (trivial) dimensions — either way corrupting the reduced kernel and
+            // collapsing it into the trivial subspace (root cause of the preprocess
+            // "trivial-only" failure).
+            // So: PLAN every non-pivot XOR first; only if ALL fit do we COMMIT them + delete the
+            // pivot; otherwise we leave the whole column (and pivot) untouched.
+            std::vector<std::pair<uint32_t, std::vector<uint32_t>>> plan;  // (row, candidate)
+            plan.reserve(containing.size());
+            bool feasible = true;
             for (size_t i = 0; i < containing.size(); ++i) {
                 if (i == pivot_idx) continue;
                 uint32_t r = containing[i];
-
-                auto candidate = xor_rows(rows[pivot], rows[r]);
-                if (candidate.size() > effective_max) {
-                    merges_skipped++;
-                    continue;
-                }
-
-                all_skipped = false;
-
-                // Create merge tree node.
-                tree.internal_nodes.push_back({node_of[pivot], node_of[r]});
-                uint32_t new_node = tree.num_leaves +
-                    static_cast<uint32_t>(tree.internal_nodes.size()) - 1;
-
-                // Update column weights: remove old row r's contribution.
-                for (uint32_t col : rows[r]) col_weight[col]--;
-
-                // Clean stale col_rows: remove r from columns cancelled by XOR.
-                for (uint32_t col : rows[r]) {
-                    if (!std::binary_search(candidate.begin(), candidate.end(), col)) {
-                        auto& cr = col_rows[col];
-                        cr.erase(std::remove(cr.begin(), cr.end(), r), cr.end());
-                    }
-                }
-
-                // Add new row's contribution.  Guard against duplicate col_rows
-                // entries for columns already present in the old rows[r].
-                for (uint32_t col : candidate) {
-                    col_weight[col]++;
-                    if (!std::binary_search(rows[r].begin(), rows[r].end(), col)) {
-                        col_rows[col].push_back(r);
-                    }
-                }
-
-                rows[r] = std::move(candidate);
-                node_of[r] = new_node;
-                any_merge = true;
-                merges_performed++;
+                auto candidate = xor_rows(rows[pivot], rows[r]);   // pivot is not modified here
+                if (candidate.size() > effective_max) { feasible = false; break; }
+                plan.emplace_back(r, std::move(candidate));
             }
 
-            if (any_merge) {
-                // Remove pivot row and clean its col_rows entries.
+            if (feasible && !plan.empty()) {
+                // COMMIT: apply every XOR (each is a valid, merge-tree-recorded row op).
+                for (auto& pr : plan) {
+                    uint32_t r = pr.first;
+                    auto& candidate = pr.second;
+
+                    tree.internal_nodes.push_back({node_of[pivot], node_of[r]});
+                    uint32_t new_node = tree.num_leaves +
+                        static_cast<uint32_t>(tree.internal_nodes.size()) - 1;
+
+                    for (uint32_t col : rows[r]) col_weight[col]--;
+                    for (uint32_t col : rows[r]) {
+                        if (!std::binary_search(candidate.begin(), candidate.end(), col)) {
+                            auto& cr = col_rows[col];
+                            cr.erase(std::remove(cr.begin(), cr.end(), r), cr.end());
+                        }
+                    }
+                    for (uint32_t col : candidate) {
+                        col_weight[col]++;
+                        if (!std::binary_search(rows[r].begin(), rows[r].end(), col)) {
+                            col_rows[col].push_back(r);
+                        }
+                    }
+                    rows[r] = std::move(candidate);
+                    node_of[r] = new_node;
+                    merges_performed++;
+                }
+
+                // Column now occurs only in the pivot — delete it ⇒ Δnullity = 0.
                 row_alive[pivot] = false;
                 for (uint32_t col : rows[pivot]) {
                     col_weight[col]--;
@@ -510,7 +514,10 @@ MergeResult MergeFilterPipeline::mergeHigherWeight(
                 rows_removed++;
                 cols_eliminated++;
                 w_cols_elim++;
-            } else if (all_skipped && containing.size() >= 2) {
+            } else if (containing.size() >= 2) {
+                // Not fully eliminable within the fill-in cap: leave the column and pivot
+                // intact (no merges performed). Nullspace preserved (nothing changed).
+                if (!feasible) merges_skipped++;
                 cols_skipped_fillin++;
             }
         }

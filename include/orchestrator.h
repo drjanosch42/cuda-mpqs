@@ -117,8 +117,25 @@ struct MPQSConfig {
     MatrixMode matrix_mode = MatrixMode::AUTO;  ///< Matrix construction mode. CLI: --matrix_mode legacy|preprocess
     int matrix_backend = 0;  ///< 0=CPU, 1=GPU, 2=AUTO. CLI: --matrix_backend cpu|gpu|auto
     matrix::CharMode char_mode = matrix::CharMode::NONE;  ///< CLI: --char_mode norm|branch|none. Default none (char cols off); pass --char_mode norm|branch to enable.
+    uint32_t merge_max_weight = 10;  ///< DIAGNOSTIC: max column weight for higher-weight merges (preprocess
+                                      ///< CPU path; mergeHigherWeight k_max). Default 10 = no behavior change.
+                                      ///< Set 2 to disable all weight>=3 multi-cycle merges (singleton +
+                                      ///< weight-2 only, mirroring legacy's 2-cycle structure). CLI: --merge_max_weight
+    bool force_preprocess = false;   ///< DIAGNOSTIC: force the preprocess expand+merge path even when there
+                                      ///< are 0 raw partials (normally the orchestrator force-legacies in that
+                                      ///< case). Lets preprocess's reduction run on a smooths-only relation set
+                                      ///< (e.g. relations_smoothsonly.v2) to isolate reduction vs partial
+                                      ///< inclusion. Default false = unchanged behavior. CLI: --force_preprocess
     double lp_preprocess_threshold = 0.55;      ///< Auto-detect threshold: LP fraction above this → PREPROCESS.
                                                  ///< CLI: --lp_preprocess_threshold
+    double preprocess_lp_materialize_max = 0.45; ///< Facet-3 gate: max combined-smooth LP fraction at which the
+                                                 ///< preprocess path materializes the matched raw-1-partial 2-cycle
+                                                 ///< rows. ABOVE it those rows capture the genus character into the
+                                                 ///< matrix row space (pinning the BW kernel to the trivial genus →
+                                                 ///< 0% nontrivial), so they are skipped (smooths-only preprocess
+                                                 ///< recovers). Default 0.45 (just below the ~45-46% genus cliff;
+                                                 ///< keeps 94d's 42.9% partials). 1.0 = never skip (pre-fix); 0.0 =
+                                                 ///< always skip. CLI: --preprocess_lp_materialize_max
     double partial_subsample = 1.0;  ///< Fraction of partials/LP-combined to retain in matrix_only.
                                       ///< Preprocess: subsamples raw partials. Legacy: subsamples LP-combined.
                                       ///< Range [0.0, 1.0]. Default 1.0 (no subsampling). CLI: --partial_subsample
@@ -133,6 +150,12 @@ struct MPQSConfig {
     uint32_t matrix_truncation_excess = 200; ///< Excess rows above (n_cols + n_extra_cols) post-truncation.
                                               ///< Determines how overdetermined the post-augmentation matrix is.
                                               ///< CLI: --matrix_truncation_excess
+    uint32_t truncation_min_rows = 5000000; ///< Facet-2 size-gate: skip CPU-preprocess truncation when the
+                                             ///< reduced matrix has <= this many rows (BW-tractable untruncated;
+                                             ///< covers 94d/RSA-110/RSA-120). ABOVE it, truncateMatrix's
+                                             ///< lightest-row selection is a known limitation that can
+                                             ///< confine the BW kernel to the trivial subspace.
+                                             ///< CLI: --truncation_min_rows
     uint32_t compact_cycles = 5; ///< Maximum compact-merge cycles (GPU backend only).
                                   ///< 0 = single pass (no compaction, reverts to pre-M10 behavior).
                                   ///< CLI: --compact_cycles

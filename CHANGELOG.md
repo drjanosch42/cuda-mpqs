@@ -5,6 +5,35 @@ All notable changes to cuda-mpqs are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-06-09
+### Fixed
+- Matrix preprocessing (CPU `--matrix_mode preprocess`) no longer silently returns
+  only trivial congruences (X ≡ ±Y, no factor). Three independent defects fixed:
+  - **Higher-weight merge** column elimination is now all-or-nothing: the pivot row
+    was previously deleted even when a fill-in skip left the column un-eliminated,
+    making the reduction non-kernel-preserving. (`src/matrix/merge_filter.cpp`)
+  - **Truncation** is now size-gated — skipped when the reduced matrix is already
+    Block-Wiedemann-tractable, avoiding the lightest-row selection that confined the
+    kernel to the trivial subspace. (`--truncation_min_rows`, default 5,000,000)
+  - **High-LP partial handling**: raw single-large-prime relations are no longer
+    materialized as 2-cycle matrix rows at high large-prime fraction (which captured
+    the genus character and forced every dependency trivial); gated by the
+    combined-smooth LP fraction. (`--preprocess_lp_materialize_max`, default 0.45)
+
+### Added
+- `--truncation_min_rows` and `--preprocess_lp_materialize_max` — the facet-2 and
+  facet-3 preprocessing fix controls (above).
+- `--merge_max_weight` and `--force_preprocess` — DIAGNOSTIC flags for the
+  preprocessing investigation; default-inert (no effect on normal runs).
+- Diagnostic tooling under `tools/preprocessing_analysis/` (relation / genus
+  verifiers used to characterise and validate the fixes).
+
+### Notes
+- Preprocessing at high LP fraction is now **correct** but remains **≤ legacy** in
+  yield; prefer legacy / keep the large-prime bound below the cliff at high LP. The
+  default `--matrix_mode` AUTO → legacy is unchanged. Validated: RSA-100 factored
+  (235 s); RSA-100 / 94-digit / RSA-110 preprocess all factor.
+
 ## [1.0.1] - 2026-06-05
 ### Added
 - `--char_mode {norm,branch,none}` — selectable quadratic character-column symbol:

@@ -233,6 +233,18 @@ void print_usage(const char* prog_name) {
               << "  --truncation_factor <F>  Matrix truncation enable flag (>0 enabled, 0 disabled) [Default: 1.05]\n"
               << "                            Actual target is excess-based; see --matrix_truncation_excess.\n"
               << "  --matrix_truncation_excess <N>  Excess rows above (n_cols + n_extra_cols) [Default: 200]\n"
+              << "  --truncation_min_rows <N>  Skip preprocess truncation when reduced rows <= N [Default: 5000000].\n"
+              << "                            Above N, truncation row-selection is a known limitation (can confine the kernel to the trivial subspace).\n"
+              << "  --preprocess_lp_materialize_max <F>  Facet-3 gate: above this combined-smooth LP fraction, the\n"
+              << "                            preprocess path skips materializing raw 1-partial 2-cycle rows (they\n"
+              << "                            capture the genus character -> 0% nontrivial). [Default: 0.45]. Keeps\n"
+              << "                            below-cliff partials (94d); 1.0 = never skip (pre-fix), 0.0 = always skip.\n"
+              << "  --merge_max_weight <K>  DIAGNOSTIC: max column weight for higher-weight merges (preprocess\n"
+              << "                            CPU path). Default 10 (no change). K=2 disables weight>=3 multi-cycle\n"
+              << "                            merges, leaving singleton+weight-2 only (legacy-like 2-cycles).\n"
+              << "  --force_preprocess      DIAGNOSTIC: force the preprocess expand+merge path even with 0\n"
+              << "                            partials (else orchestrator force-legacies). Runs preprocess's\n"
+              << "                            reduction on a smooths-only relation set. Default off.\n"
               << "  --matrix_gf2_floor_factor <F>   M12-S2: stop compact-merge when GF(2) cols fall below\n"
               << "                                  factor x initial_gf2_cols [0.0-1.0, default: 0.5]\n"
               << "  --matrix_gf2_min_floor <N>      M12-S2: absolute minimum GF(2) col floor [Default: 8192]\n"
@@ -379,6 +391,10 @@ ParsedArgs parse_args(int argc, char** argv) {
         } else if (arg == "--dump_combine_provenance") {
             args.config.dump_combine_provenance = true;
         }
+        else if (arg == "--force_preprocess") {
+            args.config.force_preprocess = true;
+            args.mark("force_preprocess");
+        }
 
         // --- Modes ---
         else if (arg == "--full") args.config.mode = ExecutionMode::FULL_PIPELINE;
@@ -514,6 +530,12 @@ ParsedArgs parse_args(int argc, char** argv) {
             args.config.lp_preprocess_threshold = val;
             args.mark("lp_preprocess_threshold");
         }
+        else if (arg == "--preprocess_lp_materialize_max" && i + 1 < argc) {
+            double val;
+            if (!parse_double(argv[++i], val)) exit(1);
+            args.config.preprocess_lp_materialize_max = val;
+            args.mark("preprocess_lp_materialize_max");
+        }
         else if (arg == "--partial_subsample" && i + 1 < argc) {
             double val;
             if (!parse_double(argv[++i], val)) exit(1);
@@ -555,6 +577,18 @@ ParsedArgs parse_args(int argc, char** argv) {
             if (!parse_uint32(argv[++i], val)) exit(1);
             args.config.matrix_truncation_excess = val;
             args.mark("matrix_truncation_excess");
+        }
+        else if (arg == "--truncation_min_rows" && i + 1 < argc) {
+            uint32_t val;
+            if (!parse_uint32(argv[++i], val)) exit(1);
+            args.config.truncation_min_rows = val;
+            args.mark("truncation_min_rows");
+        }
+        else if (arg == "--merge_max_weight" && i + 1 < argc) {
+            uint32_t val;
+            if (!parse_uint32(argv[++i], val)) exit(1);
+            args.config.merge_max_weight = val;
+            args.mark("merge_max_weight");
         }
         else if (arg == "--matrix_gf2_floor_factor" && i + 1 < argc) {
             double val;

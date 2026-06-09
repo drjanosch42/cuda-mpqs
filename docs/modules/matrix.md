@@ -567,12 +567,15 @@ The construction path is chosen in `orchestrator.cpp` from `--matrix_mode`, `--m
 the execution mode.
 
 **AUTO resolves to legacy for normal runs.** The old LP-fraction → preprocess auto-switch was
-removed: validation showed preprocessing *degrades* the obstructed high-LP regime (the merge/
-compaction destroys the row/cycle diversity the legacy projected matrix preserves, pulling the
-2-cycle collapse below the legacy cliff and turning a legacy success into a failure). Preprocessing
-now engages only via explicit `--matrix_mode preprocess`, or implicitly in `MATRIX_ONLY` replay mode
-when raw partials are present. `--lp_preprocess_threshold` / `--lp_matrix_threshold` are still parsed
-for backward compatibility but are **inert** — they no longer trigger any auto-switch.
+removed: validation showed the explicit CPU preprocess path *degrades* the obstructed high-LP
+regime, collapsing to all-trivial factorizations (X ≡ ±Y) where legacy factors the *same* on-disk
+relations. The pinned root cause is the matrix-stage re-expansion of raw 1-partials into 2-cycle
+rows, which captures the genus character into the matrix row space (compounded by two CPU-reduction
+bugs) — see [Preprocessing Collapse — CPU Merge-Tree Path](#preprocessing-collapse--cpu-merge-tree-path-3-facet-investigation-2026-06-08).
+Preprocessing now engages only via explicit `--matrix_mode preprocess`, or implicitly in
+`MATRIX_ONLY` replay mode when raw partials are present. `--lp_preprocess_threshold` /
+`--lp_matrix_threshold` are still parsed for backward compatibility but are **inert** — they no
+longer trigger any auto-switch.
 
 | Mode | Pipeline | Reason |
 |---|---|---|
@@ -604,8 +607,183 @@ Flag spellings and defaults below are the single source of truth as parsed in
 | `--matrix_gf2_floor_factor <float>` | 0.5 | M12-S2: stop compact-merge cycles when GF(2) cols fall below `factor × initial_gf2_cols` [0.0–1.0] |
 | `--matrix_gf2_min_floor <N>` | 8192 | M12-S2 absolute minimum GF(2) column floor |
 | `--compact_cycles <N>` | 5 | M10 max compact-merge cycles (GPU backend); 0 = single pass (pre-M10 behavior) |
+| `--merge_max_weight <K>` | 10 | **DIAGNOSTIC** (CPU preprocess `mergeHigherWeight` `k_max`). `K=2` disables all weight≥3 multi-cycle merges (singleton + weight-2 only, legacy-like 2-cycles). See [Preprocessing Collapse](#preprocessing-collapse--cpu-merge-tree-path-3-facet-investigation-2026-06-08) |
+| `--force_preprocess` | off | **DIAGNOSTIC** — force the preprocess expand+merge path even with 0 raw partials (else the orchestrator force-legacies). Runs the reduction on a smooths-only set to isolate reduction vs. partial inclusion |
 | `--lp_preprocess_threshold <float>` | 0.55 | **DEPRECATED / INERT.** Formerly the LP fraction above which AUTO selected preprocess; the auto-switch was removed. Still parsed, no effect |
 | `--lp_matrix_threshold <float>` | — | **DEPRECATED** alias for `--lp_preprocess_threshold` (backwards compatibility; also inert) |
 | `--matrix_only` | off | Load v2 relations, run matrix preprocessing + BW + sqrt (no sieving) |
 | `--partial_subsample <float>` | 1.0 | `matrix_only` experiments: fraction of partials/LP-combined to retain [0.0–1.0] |
 | `--smooth_subsample <float>` | 1.0 | `matrix_only` experiments: fraction of pure smooths to retain (LP-combined always kept) [0.0–1.0] |
+
+---
+
+## Preprocessing Collapse — CPU Merge-Tree Path (3-Facet Investigation, 2026-06-08)
+
+The explicit **`--matrix_mode preprocess --matrix_backend cpu`** path (V1 merge-tree pipeline) was
+found to yield **only trivial factorizations (X ≡ ±Y)** on relation sets where the **legacy** path
+factors the *same on-disk relations* normally — including **below** the high-LP "2-cycle cliff".
+Every Block-Wiedemann dependency it produces is a genuine congruence of squares (0 INVALID) but
+trivial, so the GCD test never recovers a factor; the run completes silently with no factor and no
+warning. The investigation (documented in the project's internal preprocessing investigation)
+isolated **three independent root causes**, all three addressed by correctness fixes to the CPU
+preprocess path (see the CHANGELOG). The **default AUTO → legacy product path, the cluster path, and
+the GPU packed backend (M9v2) are unaffected** — only the explicit CPU preprocess opt-in was
+defective.
+
+> **Scope.** This concerns the **CPU merge-tree (V1)** path. The GPU packed backend
+> (`--matrix_backend gpu`, M9v2) has a *separate*, harder-collapsing reduction (its GF(2) column
+> count collapses much further on high-LP data) and was **not** addressed here — see the
+> "GPU preprocessing column diversity gap" known issue.
+
+**Method / independent confirmation.** The collapse was confirmed by three mutually-independent
+routes (internal verifiers): (1) the binary itself (factor recovery is ground truth — the recovered
+factor literally divides N); (2) a *factorization verifier* that recomputes each dependency's
+congruence from the *stored* per-relation factorization (independent of both the matrix reduction
+and the GPU sqrt stage); (3) a *raw-root verifier* that trusts only `(a·x+b)` and N. The verifiers
+reproduce legacy's rates exactly (94d 47.7 %, RSA-110 56.7 %) and recover the true factors,
+validating the framework; they then report **0 %** on every preprocess dump with **0 INVALID** (all
+squares genuine, all trivial). The per-dependency *genus signature* (see
+[genus mechanism](#the-genus-mechanism) below) is measured using the known factors of the test
+composites.
+
+### Facet 1 — non-nullspace-preserving higher-weight merge (FIXED)
+
+`mergeHigherWeight` (`merge_filter.cpp`) deleted the pivot row and counted the column eliminated
+**whenever ANY non-pivot XOR succeeded** — even when fill-in-cap *skips* left the target column
+un-eliminated in the skipped rows. That removed a row **without** removing its column
+(Δnullity = −1 per occurrence; ~1,037 such columns on the 94d expanded matrix), so the reduction
+stopped being nullspace-preserving and the surviving kernel collapsed into the trivial-genus
+subspace. Direct read of the dumped reduced matrix confirmed the footprint: ~12,569 columns of
+weight 1–10 survived a reduction that should have left none. **Fix:** true *all-or-nothing
+(plan-then-commit)* column elimination — pre-check that *every* non-pivot XOR fits the fill-in cap;
+if all fit, apply them and delete the pivot (Δnullity = 0); if any exceeds, skip the whole column
+and perform **no** merges (pivot retained, Δnullity = 0). (An earlier *gate-only* attempt that kept
+the partial XORs was wrong — the kept merges inflate spurious rank-deficiency and it stayed 0 %.)
+
+### Facet 2 — truncation lightest-row selection (FIXED)
+
+Even with the facet-1 reduction repaired, the default path stayed 0 %: `truncateMatrix`
+(`matrix_truncation.cpp`) is lightest-row-biased and discards the heavy rows needed to form the
+dense nontrivial dependencies, confining the kept kernel to sparse trivial cycles. This is a
+**selection** bias, not a count effect — raising `--matrix_truncation_excess` to 8000 on the fixed
+reduction is still 0 %, while truncation-off factors (an unbiased ~8,032-dim kernel would be ~50 %
+nontrivial). **Fix:** a size-gate flag **`--truncation_min_rows`** (default **5,000,000**) that
+**skips truncation when the reduced matrix is already BW-tractable** (≤ 5M rows — covers
+94d/RSA-110/RSA-120), so the default preprocess path now factors without manual flags. Above the
+gate, truncation engages as before. (De-biasing the selection itself is the proper fix only if
+preprocess is ever used at a scale where truncation is *mandatory* for BW tractability.)
+
+### Facet 3 — raw-1-partial 2-cycle materialization captures the genus (FIXED via gate)
+
+With facets 1+2 applied (truncation off), the CPU preprocess path **still** yields **0 %** on the
+high-LP RSA-110 set (76.6 % combined-smooth fraction), while legacy factors the same data at ~56 %.
+This is the **preprocess-matrix manifestation** of the high-LP trivial-coset collapse documented in
+an internal companion report: preprocess's **matrix-stage re-expansion of raw 1-partials into
+matched-partial 2-cycle rows** drives the *entire* BW nullspace into the trivial coset (every
+dependency X ≡ ±Y). A factor-aware measurement ([genus mechanism](#the-genus-mechanism) below)
+localizes the cause to the genus character entering the matrix row space.
+
+This was localized by a decisive ablation: `--force_preprocess` on legacy's *exact* 698K smooths
+(0 partials), running the full reduction including 107K higher-weight merges, **factors at 34.7 %
+with the genus FREE** — so the reduction/merges are **genus-neutral**. Adding even ~5 % of the raw
+partials back (≈3,163 rows) flips 34.7 % → 0 %. It is therefore *specifically* the raw-1-partial
+re-expansion, not the merges and not the sieve-combined smooths (which are present in the
+factoring smooths-only set; legacy uses them too).
+
+**Fix (operational gate, fix (a)):** **`--preprocess_lp_materialize_max`** (default **0.45**, just
+below the ~45–46 % genus cliff). When the combined-smooth LP fraction exceeds it, the preprocess
+path clears `host_partials_soa_` before building the expanded matrix — materializing smooths only
+(including the sieve-combined C's) with the full reduction, i.e. the validated genus-free 34.7 %
+path. Below the gate, partials are kept (no regression). `--preprocess_lp_materialize_max 1.0`
+restores the exact pre-fix behavior (never skip); `0.0` always skips.
+
+### The genus mechanism
+
+Because the test composites have **known factors** p, q, we can *measure* each dependency's genus
+directly. This is a **factor-aware diagnostic** — it demonstrates the fix on the test cases; it is
+**not** an a-priori proof that the genus must be captured (the internal companion report likewise
+treats the high-LP triviality as empirically observed and declines such a proof).
+
+For N = p·q the 2-rank of Cl(K)[2] is 1, so there is a single non-trivial genus character. For a BW
+dependency giving X² ≡ Y² mod N, set ε_p = +1 if X ≡ +Y mod p (else −1) and ε_q likewise mod q. Then:
+
+- The dependency is **NONTRIVIAL ⟺ ε_p ≠ ε_q**; **TRIVIAL ⟺ ε_p = ε_q**.
+- The genus character **g = ε_p·ε_q** is a **GF(2)-linear functional on the kernel** (g = +1 trivial, g = −1 nontrivial).
+- **g ≡ +1 on the whole kernel ⟺ g lies in the matrix's row space ⟺ 0 % nontrivial.** When g is
+  *free* (not in the row space) the kernel spans both genus cosets and ~50 % of dependencies are nontrivial.
+
+The per-dependency genus signature makes this concrete (cells = counts of (ε_p, ε_q); off-diagonal
+= nontrivial):
+
+| run | (+,+) | (−,−) | (+,−) | (−,+) | nontrivial | genus |
+|-----|------:|------:|------:|------:|-----------:|:------|
+| legacy (RSA-110) | 22 | 8 | 22 | 28 | ~60 % | **free** (all four cells) |
+| force_preprocess, smooths-only | 16 | 16 | 10 | 7 | **34.7 %** | **free** |
+| preprocess full (gate off) | 20 | 20 | **0** | **0** | **0 %** | **PINNED** (off-diagonal exactly 0) |
+| preprocess gated (fix on) | 16 | 16 | 10 | 7 | **34.7 %** | **FREED** |
+
+Note ε_p alone is balanced in every run (~20/20) — preprocess does not push deps into one genus
+marginal; the measurement instead shows the *correlation* pinned (off-diagonal exactly 0). This is
+the preprocess-matrix manifestation of the high-LP trivial-coset collapse documented in the
+project's internal preprocessing investigation (whose canonical writeup treats the triviality as
+empirically observed and declines an a-priori proof, with a companion genus/2-torsion analysis of
+the underlying 1-partial 2-cycle obstruction). The measurement refines the picture in two ways: it
+is **path-specific** (legacy resolves LP at sieve time and never materializes the 2-cycles as matrix
+rows → unobstructed) and, on these test cases, **deterministic** (off-diagonal cells measured at
+*exactly* 0, not merely a probabilistic skew). The re-expansion **removes** the nontrivial-genus
+kernel directions (adds one effective genus constraint) rather than flooding the kernel with trivial
+ones — dims barely change (~+0.3 %) yet the result flips 34.7 % → 0 %.
+
+### Validation results
+
+| run | before | after fix | independent check |
+|-----|:------:|:---------:|-------------------|
+| 94d preprocess-cpu (facet 1, truncation off) | 0 % | **~50 % + factor recovered** | factorization verifier 97/194; raw factor 38d × 57d divides N |
+| 94d default (gate silent, 42.9 % < 45 %) | — | **50.0 % + factor (no regression)** | facets 1+2+3 all applied |
+| RSA-110 explicit preprocess (gate ON) | 0 % | **34.7 % + factor**, genus **FREED** (16/16/10/7) | factorization verifier 17/49, product = N ✓ |
+| RSA-110 gate-off control (`--preprocess_lp_materialize_max 1.0`) | — | **0 %**, genus **PINNED** (20/20/0/0) | same binary + data, only the gate flag differs |
+
+The gate-off control is decisive: flipping a single flag moves the off-diagonal genus cells from
+**exactly 0 (pinned) → populated (freed)**, directly demonstrating that the fix removes the
+*mechanism*, not just the number.
+
+### Flags
+
+| Flag | Default | Role |
+|------|:-------:|------|
+| `--truncation_min_rows <N>` | 5,000,000 | **Facet-2 fix.** Skip CPU-preprocess truncation when the reduced matrix has ≤ N rows (already BW-tractable) |
+| `--preprocess_lp_materialize_max <F>` | 0.45 | **Facet-3 fix.** Above this combined-smooth LP fraction, skip materializing matched raw-1-partial 2-cycle rows |
+| `--merge_max_weight <K>` | 10 | **Diagnostic.** `mergeHigherWeight` `k_max`; `K=2` disables weight≥3 merges (legacy-like 2-cycles) |
+| `--force_preprocess` | off | **Diagnostic.** Force the expand+merge path with 0 partials (smooths-only reduction isolation) |
+
+The facet-1 fix carries no flag — it is an unconditional correctness fix to `mergeHigherWeight`.
+**AUTO → legacy is unaffected** by all four flags (they live inside the preprocess path the default
+never enters), as is the GPU packed backend.
+
+### Operational guidance & future direction
+
+These are **correctness** fixes: the explicit CPU preprocess path is now correct at high LP (no
+silent 0 % / all-trivial collapse) and factors the validated cases. It is **not** competitive with
+legacy there — preprocess recovers ~34.7 % nontrivial vs legacy ~56 %, because the merge reduction
+shaves the nontrivial fraction even when the genus is free. **AUTO → legacy therefore remains the
+correct default**, and the standing operational mitigation for high-LP collapse is unchanged: **keep
+the LP bound below the ~45 % genus cliff** (the facet-3 gate's default).
+
+The genus pinning is **not a localized code bug** — the reduction and matrix construction are
+correct; capture is an exact algebraic consequence of putting 1-partial 2-cycles into the matrix.
+The only path to a high-LP-*competitive* preprocess is **fix (b): a CADO-NFS-style full-LP-cycle
+filter** (≥3-partial cycles, which provide combinatorial paths to cancel the genus signs) replacing
+the current `freq≥2` 2-matching. This is a **documented future direction** — a large LP-matching/
+expansion rewrite, **unverified here, and not currently warranted** given AUTO → legacy.
+
+### Pointers
+
+- **Source:** facet-1 fix in `src/matrix/merge_filter.cpp` (`mergeHigherWeight`); facet-2 size-gate in
+  `src/matrix/matrix_truncation.cpp` + the orchestrator; facet-3 materialization gate in
+  `src/orchestrator/orchestrator.cpp`.
+- **Flags:** `--truncation_min_rows`, `--preprocess_lp_materialize_max` (fixes); `--merge_max_weight`,
+  `--force_preprocess` (diagnostics) — see the [CLI](#cli) table.
+- **Release notes:** the three fixes are summarized in the CHANGELOG.
+- The full diagnosis, the factorization / raw-root / genus-signature verifiers, the reproduction
+  harness, and the theory writeups live in the project's internal preprocessing investigation (not
+  part of the public release).
