@@ -187,8 +187,22 @@ bool TcpSocket::sendMsg(MsgType type, const void* payload, uint32_t payload_len)
 }
 
 bool TcpSocket::recvMsg(MsgType& out_type, std::vector<uint8_t>& out_payload) {
+    return recvMsg(out_type, out_payload, nullptr);
+}
+
+bool TcpSocket::recvMsg(MsgType& out_type, std::vector<uint8_t>& out_payload,
+                        RecvStatus* out_status) {
     // Buffered recv: accumulates partial data in recv_buf_ across calls.
     // Works correctly for both blocking and non-blocking sockets.
+    //
+    // @p out_status distinguishes the three "no message" outcomes so callers can
+    // tell a benign timeout (keep waiting) from a dead socket (peer gone):
+    //   GOT_MSG : a complete frame was returned (return true).
+    //   TIMEOUT : SO_RCVTIMEO elapsed with no data (recv()<0, EAGAIN), OR a
+    //             framing/CRC error left the stream desynced — socket still open,
+    //             caller may retry (the chunk-wait hard cap bounds retries).
+    //   CLOSED  : recv()==0 (EOF/FIN) or recv()<0 with a real errno — peer gone.
+    auto set_status = [out_status](RecvStatus s) { if (out_status) *out_status = s; };
     while (true) {
         // Check if recv_buf_ contains a complete frame
         if (recv_buf_.size() >= sizeof(FrameHeader)) {
@@ -199,6 +213,7 @@ bool TcpSocket::recvMsg(MsgType& out_type, std::vector<uint8_t>& out_payload) {
                 LOG(LOG_WARNING) << "[TCP] Bad magic: 0x" << std::hex << hdr.magic
                                  << " (expected 0x" << kProtocolMagic << ")";
                 recv_buf_.clear();
+                set_status(RecvStatus::TIMEOUT);  // framing desync, socket alive
                 return false;
             }
 
@@ -209,6 +224,7 @@ bool TcpSocket::recvMsg(MsgType& out_type, std::vector<uint8_t>& out_payload) {
                 LOG(LOG_WARNING) << "[TCP] Rejecting frame: payload_len=" << hdr.payload_len
                                  << " exceeds maximum (" << kMaxPayloadBytes << " bytes)";
                 recv_buf_.clear();
+                set_status(RecvStatus::TIMEOUT);  // framing desync, socket alive
                 return false;
             }
 
@@ -224,6 +240,7 @@ bool TcpSocket::recvMsg(MsgType& out_type, std::vector<uint8_t>& out_payload) {
                     LOG(LOG_WARNING) << "[TCP] CRC mismatch: wire=0x" << std::hex << wire_crc
                                      << " computed=0x" << computed_crc;
                     recv_buf_.erase(recv_buf_.begin(), recv_buf_.begin() + frame_total);
+                    set_status(RecvStatus::TIMEOUT);  // corrupt frame, socket alive
                     return false;
                 }
 
@@ -231,6 +248,7 @@ bool TcpSocket::recvMsg(MsgType& out_type, std::vector<uint8_t>& out_payload) {
                 out_payload.assign(recv_buf_.begin() + sizeof(FrameHeader),
                                    recv_buf_.begin() + hdr_plus_payload);
                 recv_buf_.erase(recv_buf_.begin(), recv_buf_.begin() + frame_total);
+                set_status(RecvStatus::GOT_MSG);
                 return true;
             }
         }
@@ -241,11 +259,16 @@ bool TcpSocket::recvMsg(MsgType& out_type, std::vector<uint8_t>& out_payload) {
         if (n > 0) {
             recv_buf_.insert(recv_buf_.end(), tmp, tmp + n);
         } else if (n == 0) {
+            set_status(RecvStatus::CLOSED);  // peer performed orderly shutdown (FIN)
             return false;  // Connection closed
         } else {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return false;  // Non-blocking: no data yet
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                set_status(RecvStatus::TIMEOUT);  // SO_RCVTIMEO elapsed, no data
+                return false;  // Non-blocking / timeout: no data yet
+            }
             LOG(LOG_WARNING) << "[TCP] recv() error: " << strerror(errno);
+            set_status(RecvStatus::CLOSED);  // real socket error — peer unreachable
             return false;
         }
     }

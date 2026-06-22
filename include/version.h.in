@@ -3,10 +3,14 @@
 // This file is part of cuda-mpqs (GPU-accelerated SIQS/MPQS factorization).
 // See LICENSE at the repository root for licensing terms, including the NVIDIA CUDA Toolkit exception.
 #pragma once
-#define CUDAMPQS_VERSION       "@CUDAMPQS_VERSION@"
+// CUDAMPQS_VERSION is the human-facing display string (includes any pre-release
+// suffix, e.g. "1.0.3a"); the numeric MAJOR.MINOR.PATCH components are exposed
+// separately for programmatic comparisons.
+#define CUDAMPQS_VERSION       "@CUDAMPQS_VERSION_STRING@"
 #define CUDAMPQS_VERSION_MAJOR @CUDAMPQS_VERSION_MAJOR@
 #define CUDAMPQS_VERSION_MINOR @CUDAMPQS_VERSION_MINOR@
 #define CUDAMPQS_VERSION_PATCH @CUDAMPQS_VERSION_PATCH@
+#define CUDAMPQS_VERSION_SUFFIX "@CUDAMPQS_VERSION_SUFFIX@"
 #define CUDAMPQS_LINALG_VERSION       "@CUDAMPQS_LINALG_VERSION@"
 #define CUDAMPQS_LINALG_VERSION_MAJOR @CUDAMPQS_LINALG_VERSION_MAJOR@
 #define CUDAMPQS_LINALG_VERSION_MINOR @CUDAMPQS_LINALG_VERSION_MINOR@

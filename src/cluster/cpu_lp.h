@@ -52,6 +52,10 @@ public:
     uint64_t totalInserts() const { return total_inserts_; }
     uint64_t totalMatches() const { return total_matches_; }
     uint64_t totalCombines() const { return total_combines_; }
+    /// Number of matches dropped because the two partials were byte-identical
+    /// (same sqrt_Q) — combining them would yield a perfect square (X==Y) and a
+    /// trivial sqrt. Diagnostic for the cross-node duplicate-partial pathology.
+    uint64_t totalDupDropped() const { return total_dup_dropped_; }
 
 private:
     /// Combine two partials with matching LP into a full relation.
@@ -76,6 +80,7 @@ private:
     uint64_t total_inserts_  = 0;
     uint64_t total_matches_  = 0;
     uint64_t total_combines_ = 0;
+    uint64_t total_dup_dropped_ = 0;
 };
 
 } // namespace mpqs::cluster

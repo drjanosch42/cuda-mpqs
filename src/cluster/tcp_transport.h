@@ -9,6 +9,7 @@
 /// @brief RAII TCP socket wrapper with length-prefixed framing + CRC32.
 
 #include "cluster_common.h"
+#include "comm_backend.h"  // RecvStatus
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -43,6 +44,14 @@ public:
     /// Receive a framed message. Blocks until complete frame or timeout/error.
     /// Returns false on connection close, error, or CRC mismatch.
     bool recvMsg(MsgType& out_type, std::vector<uint8_t>& out_payload);
+
+    /// Same as recvMsg, but reports *why* it returned via @p out_status so the
+    /// caller can tell a benign timeout (EAGAIN/EWOULDBLOCK after SO_RCVTIMEO)
+    /// from a dead socket (recv()==0 EOF, or recv()<0 with a real error). This
+    /// is what lets the worker chunk-wait loop exit promptly on coordinator
+    /// disconnect instead of spinning. @p out_status may be nullptr.
+    bool recvMsg(MsgType& out_type, std::vector<uint8_t>& out_payload,
+                 RecvStatus* out_status);
 
     /// Set TCP_NODELAY (disable Nagle's algorithm).
     void setNoDelay(bool enable);

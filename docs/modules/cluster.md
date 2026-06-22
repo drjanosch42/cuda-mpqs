@@ -23,7 +23,7 @@ Static library `mpqs_cluster`. Separable CUDA compilation ON. Namespace: `mpqs::
 | `accumulator.h` | 244 | `AccumulatorQueue` (MPSC thread-safe queue), `RelationAccumulator` (single-thread dedup + counting), `FinalBatchHandoff` (blocking condition-variable handoff) |
 | `cpu_lp.h` | 73 | `CPULargePrimeTable`: CPU hash table for single large prime matching in cluster mode |
 | `cpu_lp.cu` | 140 | `CPULargePrimeTable` implementation: insert-and-match, Montgomery-based partial combination, sorted factor merge |
-| `cluster_common.h` | 177 | Wire protocol: `FrameHeader`, `MsgType` enum (16+ types), payload structs, protocol constants |
+| `cluster_common.h` | 181 | Wire protocol: `FrameHeader`, `MsgType` enum (17+ types incl. `CHUNK_REQUEST`), payload structs, protocol constants |
 | `comm_backend.h` | 113 | Abstract `CommBackend` interface: lifecycle, point-to-point, collective, info. Factory `createCommBackend()` |
 | `tcp_transport.h` | 63 | `TcpSocket` RAII wrapper: listen/accept/connect, length-prefixed framing + CRC32 |
 | `tcp_transport.cpp` | 289 | POSIX TCP implementation: CRC32 table-driven, buffered recv, `sendExact` with EAGAIN retry |
@@ -31,11 +31,11 @@ Static library `mpqs_cluster`. Separable CUDA compilation ON. Namespace: `mpqs::
 | `tcp_backend.cpp` | 408 | TCP backend: HELLO/HELLO_ACK handshake, epoll multiplexing, barrier, peer management |
 | `serialization.h` | 85 | Binary serialization for `HostRelationBatch`, `WORK_ASSIGN`, and `INCREMENTAL_BATCH` |
 | `serialization.cpp` | 300 | Serialization implementation: bounds-checked `SafeReader`, CSR-aware batch encoding, backward-compatible M3 snapshot extension |
-| `work_pool.h` | 112 | `WorkPool`: thread-safe polynomial work-unit pool with tracked checkout, reclaim, and cursor restore |
-| `work_pool.cpp` | 130 | WorkPool implementation: LIFO reclaim queue, linear cursor fallback, per-worker in-flight tracking |
-| `chunk_scheduler.h` | 117 | `ChunkScheduler`: EMA throughput tracker, adaptive chunk sizing, contiguous range computation |
-| `chunk_scheduler.cpp` | 165 | Scheduler implementation: SM-proportional initial split, quantum/hypercube alignment, confidence ramp |
-| **Total** | **~3100** | |
+| `work_pool.h` | 135 | `WorkPool`: thread-safe polynomial work-unit pool with tracked checkout, reclaim, single-chunk return, and cursor restore |
+| `work_pool.cpp` | 171 | WorkPool implementation: LIFO reclaim/return queue, linear cursor fallback, per-worker in-flight tracking |
+| `chunk_scheduler.h` | 148 | `ChunkScheduler`: EMA throughput tracker, adaptive chunk sizing, contiguous range computation, default-inert debug window cap |
+| `chunk_scheduler.cpp` | 280 | Scheduler implementation: SM-proportional initial split, quantum/hypercube alignment, confidence ramp |
+| **Total** | **~3200** | |
 
 ## Architecture
 
@@ -124,9 +124,10 @@ Remote worker DataTap (`async_network_data_tap.h/.cpp`). Replaces the old synchr
 | `setRange(count, chunk_id, batch_a_vals)` | Set current chunk parameters before each `SieveStage()`. |
 | `shutdown()` | Signal I/O thread to flush and exit. Must be called before `CommBackend` destruction. |
 | `receivedStop()` | Distinguishes explicit STOP from range exhaustion. |
+| `tryTakeChunkAssign(out)` | Take a `CHUNK_ASSIGN` frame captured by the I/O thread (mid-sieve overflow re-dispatch), if pending. Returns `true` and fills `out` (and clears the slot) when a frame is waiting. The I/O thread is the **sole** socket reader, so the main thread's chunk-wait loop must route overflow assignments through here rather than a second, racing `recv()`. |
 | `batchesSent()` | Atomic counter for telemetry. |
 
-**I/O thread responsibilities:** Drains the SPSC ring, calls `mergeRelationBatches()` to coalesce small batches before TCP send, serializes and sends `INCREMENTAL_BATCH` messages, sends `HEARTBEAT` every `kHeartbeatIntervalMs` (5s), and polls for incoming STOP/ERROR messages. This thread is independent of the sieve loop — heartbeats continue during CUDA graph capture + JIT compilation regardless of how long the sieve thread is blocked.
+**I/O thread responsibilities:** Drains the SPSC ring, calls `mergeRelationBatches()` to coalesce small batches before TCP send, serializes and sends `INCREMENTAL_BATCH` messages, sends `HEARTBEAT` every `kHeartbeatIntervalMs` (5s), and is the **sole reader** of the worker socket — polling for incoming STOP/ERROR (set atomically), `CHUNK_RECALL` (atomic), and mid-sieve `CHUNK_ASSIGN` (overflow re-dispatch) frames. A `CHUNK_ASSIGN` is captured into a mutex-guarded slot (`pending_assign_`) and handed to the main thread's chunk-wait loop via `tryTakeChunkAssign()`. Having a single reader eliminates a former two-readers race that silently swallowed mid-sieve `CHUNK_ASSIGN` frames (stranding workers waiting for overflow work) and avoids `recv_buf_` framing corruption from interleaved reads. This thread is independent of the sieve loop — heartbeats continue during CUDA graph capture + JIT compilation regardless of how long the sieve thread is blocked.
 
 ### AccumulatorQueue
 
@@ -218,6 +219,7 @@ Thread-safe polynomial work-unit pool (`work_pool.h`, `work_pool.cpp`). Tracked-
 | `WorkPool(a_start, total_a, unit_size=64)` | Linear cursor from `a_start` to `a_start + total_a`. |
 | `checkoutWork(count, worker_id)` | Returns `CheckedOutWork` with unique `chunk_id`. Serves reclaimed work before linear cursor. |
 | `completeChunk(chunk_id)` | Remove from in-flight tracking. |
+| `returnChunk(chunk_id)` | Return a single checked-out chunk to the assignable (`returned_`) pool without consuming any of it — used when a `CHUNK_ASSIGN` send fails so the chunk can be re-dispatched immediately. No-op if not in flight. |
 | `reclaimWork(worker_id)` | Reclaim all in-flight chunks for a dead worker (returned to LIFO queue). |
 | `reclaimPartial(worker_id, chunk_id)` | Reclaim a specific in-flight chunk from a straggler (CHUNK_RECALL path). |
 | `remaining()`, `exhausted()`, `inFlight()` | Pool status queries. |
@@ -236,6 +238,8 @@ Adaptive chunk sizing with EMA throughput tracking (`chunk_scheduler.h`, `chunk_
 | `minChunk()` | max(H, 4*Q, 16). |
 
 **Initial balance modes:** `SM_COUNT` (default, proportional to SM count × clock frequency), `THROUGHPUT_PROBE` (5s probe), `MANUAL` (capacity_estimate from HelloPayload). Override weights via `--cluster_node_weights` (comma-separated floats). Per-node headroom extends each node's initial range by `--cluster_headroom` % (default 10%) to reduce straggler wait.
+
+**Debug repro hook (default-inert):** `applyDebugWindowCap()` caps every computed chunk (initial contiguous ranges *and* overflow chunks) to `MPQS_DEBUG_MAX_CHUNK_WINDOWS` hypercube windows (HC alignment preserved), forcing many `CHUNK_COMPLETE` → `CHUNK_ASSIGN` turnover cycles to exercise the overflow-assignment path. Parsed once per process; identity when the env var is unset. Used together with the orchestrator's `MPQS_DEBUG_DROP_CHUNK_ASSIGN=<worker>:<occurrence>` lost-send injector as the chunk-delivery race regression harness.
 
 ### CPULargePrimeTable
 
@@ -281,6 +285,7 @@ CRC32 covers header + payload (polynomial 0xEDB88320, table-driven). All platfor
 | `WORK_REQUEST` | 0x12 | W -> C | -- | Request more work |
 | `CHUNK_ASSIGN` | 0x13 | C -> W | `ChunkAssignPayload` (24B) | Chunk of a-values with flags (initial/final/overflow) |
 | `CHUNK_COMPLETE` | 0x14 | W -> C | `ChunkCompletePayload` (32B) | Chunk done + elapsed + relations + a-values consumed |
+| `CHUNK_REQUEST` | 0x15 | W -> C | -- | Idle worker re-requests work (carries **no** stats, distinct from `CHUNK_COMPLETE` so a retry never re-applies relation/partial counts). Recovers a dropped/failed `CHUNK_ASSIGN`; rate-limited to once / 15s on a socket-alive timeout. |
 | `CHUNK_RECALL` | 0x17 | C -> W | `ChunkRecallPayload` (4B) | Reclaim a specific in-flight chunk from a straggler; anti-thrashing guards (30s min, 60s cooldown) |
 | `RELATION_BATCH` | 0x20 | W -> C | Variable | Serialized `HostRelationBatch` |
 | `PARTIAL_BATCH` | 0x21 | W -> C | Variable | 1-partial relations for LP matching |
@@ -332,6 +337,23 @@ R_i   = ceil(W_est * W_i / W_total) * H    -- W_i = SM_count_i × clock_rate_i (
 
 Where H = 2^shc_dim (hypercube size). Each range is extended by `cluster_headroom` % to absorb imbalance. Weights can be overridden via `--cluster_node_weights`. Each range is also quantum-aligned (Q = batch_size * max(graph_unroll, 1)).
 
+### Overflow Pool Sizing
+
+The overflow `WorkPool` is pure on-demand index space, drawn only after a node exhausts its initial contiguous range with the relation target still unmet. The run is bounded by the relation cap, not the pool, so over-provisioning is free — but under-provisioning is fatal (the pool drains, workers idle out their timeout, and the matrix stage aborts on insufficient relations).
+
+The coordinator sizes the overflow pool (in `Orchestrator::Run()`, coordinator branch) from the **relation target**, not from a 1× doubling of the contiguous total:
+
+```
+windows_for_target = ceil(target_rels / (0.04 * H))   -- 0.04 = conservative per-a-index yield floor
+total_windows      = max(contiguous_windows, windows_for_target) * cluster_pool_oversize
+total_windows      = min(total_windows, (fb_size - 150) / 2)   -- a-factor walk capacity clamp
+overflow_windows   = total_windows - contiguous_windows
+```
+
+The `0.04` yield floor sits several times below the measured per-a-index relation yield on large composites, giving margin without risk. `--cluster_pool_oversize <float>` (coordinator only, default 1.0) further enlarges the pool. The clamp to `(fb_size - 150) / 2` windows is the a-factor sliding-window walk's capacity (each window slide yields one new a-coefficient; the walk begins near FB index ~150 and advances its upper half with stride 2 until it runs off the factor base), ensuring no overflow chunk maps to an invalid a-coefficient. The coordinator logs an auditable `a-value pool: contiguous=… overflow=… total=… windows (oversize=…x, target=… rels, walk_ceiling=… windows)` line at startup.
+
+> The earlier `overflow_size = overflow_start` (1× the contiguous total) combined with the scheduler's optimistic `w_est` (`5 * H` divisor, ~5 rel/a-index) sized the pool ~tens of times too small on large composites; it has been replaced by the target-derived sizing above. Initial contiguous ranges (`computeContiguousRanges` / `w_est`) are unchanged, so per-node startup work is unaffected.
+
 ### Dynamic Rebalancing
 
 After initial ranges are exhausted, the overflow pool (WorkPool) distributes additional chunks dynamically:
@@ -344,6 +366,18 @@ After initial ranges are exhausted, the overflow pool (WorkPool) distributes add
 Chunks from reclaimed dead-worker work (via `reclaimWork()`) are served before advancing the linear cursor.
 
 **Alignment:** All chunk sizes are rounded to multiples of H (hypercube alignment) and Q (quantum alignment). Minimum chunk size: max(H, 4Q, 16).
+
+#### Chunk-Assignment Delivery Recovery
+
+All overflow `CHUNK_ASSIGN` sends route through a single send-checked routine (`assignChunkTo()` in the coordinator's Thread A). It checks out a chunk, sends it, and sets the worker's `current_chunk_id` **only on a confirmed (`true`) send**; on a failed send it returns the chunk to the assignable pool (`WorkPool::returnChunk()`), bumps `failed_assign_sends`, and leaves the worker with no current chunk. It is idempotent — a no-op when the worker already holds a chunk — so the three dispatch sources below can never double-assign:
+
+- **`CHUNK_COMPLETE` path:** normal post-completion assignment (records stats first).
+- **Worker re-request (`CHUNK_REQUEST`):** an idle worker re-requests work at most once / 15s on a socket-alive timeout. A `CHUNK_REQUEST` is explicit proof the worker is idle, so the handler **forces** re-assignment — it returns any chunk the coordinator still believes is in flight to the pool and clears `current_chunk_id` before calling `assignChunkTo()`, so a previously-lost assignment cannot wedge the worker. Carries no stats, so a retry never double-counts.
+- **Proactive idle sweep:** each 5s timeout tick the coordinator hands a chunk to every alive worker that holds no chunk (`current_chunk_id == UINT32_MAX`) while assignable work remains and the target is unmet, draining reclaimed/returned chunks even without a re-request.
+
+**Worker `current_chunk_id` sentinels:** a worker starts with `kInitialChunk` (`UINT32_MAX - 1`, "busy with its initial WORK_ASSIGN range — not a pool chunk"), cleared to `UINT32_MAX` ("idle, eligible for overflow") only on its first `CHUNK_COMPLETE`. The idle sweep, heartbeat-timeout reclaim, and `CHUNK_REQUEST` handler all treat the sentinel as "not a pool chunk" (no spurious `returnChunk`/reclaim), preventing the sweep from handing a second chunk to a worker still on its initial range.
+
+`failed_assign_sends` and `redispatched_chunks` (chunks handed out via re-request or the idle sweep) are surfaced in the cluster sieve telemetry summary. The worker's 600s chunk-wait hard cap is now an absolute backstop that fires only on persistent timeout (heartbeats flowing, coordinator silent); a closed socket exits immediately.
 
 ## LP Processing
 

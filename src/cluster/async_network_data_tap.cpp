@@ -64,9 +64,19 @@ void AsyncNetworkDataTap::preallocateSlots(size_t max_rels, size_t max_factors) 
 void AsyncNetworkDataTap::onBatchComplete(
     const structures::HostRelationBatch& full_relations,
     const structures::HostRelationBatch& partials,
-    uint64_t batch_index)
+    uint64_t batch_index,
+    uint64_t a_values_advanced)
 {
     if (stop_.load(std::memory_order_relaxed)) return;
+
+    // True a-values consumed this call. Single-batch loops pass 0 and fall back
+    // to batch_a_values_ (= sieve_batch_size, the legacy semantics). The CUDA-
+    // graph replay loop advances graph_N batches per callback and passes the
+    // real count explicitly; honouring it keeps range_a_consumed_ exact so the
+    // per-worker a-range guard fires at the assigned width instead of ~graph_N×
+    // wide (root cause of cross-node duplicate partials).
+    const uint64_t a_advanced =
+        (a_values_advanced > 0) ? a_values_advanced : batch_a_values_;
 
     // Option A: copy into a local TapSlot, then move into the ring.
     // Vector copy triggers allocation + memcpy (~50us for RSA-100 batch sizes).
@@ -75,14 +85,14 @@ void AsyncNetworkDataTap::onBatchComplete(
     slot.full = full_relations;
     slot.partials = partials;
     slot.batch_index = batch_index;
-    slot.a_values_this_batch = batch_a_values_;
+    slot.a_values_this_batch = a_advanced;
 
     if (!ring_.tryPush(std::move(slot))) {
         dropped_batches_.fetch_add(1, std::memory_order_relaxed);
     }
 
     batches_sent_.fetch_add(1, std::memory_order_relaxed);
-    range_a_consumed_.fetch_add(batch_a_values_, std::memory_order_relaxed);
+    range_a_consumed_.fetch_add(a_advanced, std::memory_order_relaxed);
 }
 
 bool AsyncNetworkDataTap::shouldStop() const {
@@ -124,6 +134,13 @@ bool AsyncNetworkDataTap::receivedRecall() const {
 void AsyncNetworkDataTap::clearRecall() {
     recall_.store(false, std::memory_order_release);
     recalled_chunk_id_ = 0;
+}
+bool AsyncNetworkDataTap::tryTakeChunkAssign(ChunkAssignPayload& out) {
+    std::lock_guard<std::mutex> lock(assign_mutex_);
+    if (!has_pending_assign_) return false;
+    out = pending_assign_;
+    has_pending_assign_ = false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +210,12 @@ void AsyncNetworkDataTap::ioThreadMain() {
             last_send_time = clock::now();
         }
 
-        // 3. Poll for STOP/ERROR from coordinator
+        // 3. Poll for control frames from coordinator. The I/O thread is the
+        //    SOLE reader of the worker socket; the main thread must NOT also
+        //    recv() here (two racing readers previously swallowed CHUNK_ASSIGN
+        //    frames — root cause of the mid-sieve re-dispatch loss). Every
+        //    control frame the main thread cares about is captured here and
+        //    handed off via an atomic (STOP/RECALL) or a mutex slot (ASSIGN).
         RecvMessage msg;
         if (backend_.recv(msg) && msg.valid) {
             if (msg.type == MsgType::STOP || msg.type == MsgType::ERROR) {
@@ -205,6 +227,19 @@ void AsyncNetworkDataTap::ioThreadMain() {
                 if (cr.chunk_id == current_chunk_id_) {
                     recalled_chunk_id_ = cr.chunk_id;
                     recall_.store(true, std::memory_order_release);
+                }
+            } else if (msg.type == MsgType::CHUNK_ASSIGN) {
+                // Mid-sieve overflow assignment. Capture it for the main thread's
+                // chunk-wait loop (tryTakeChunkAssign). Last-writer-wins: if a
+                // prior frame is still unconsumed, the newest assignment supersedes
+                // it (the coordinator only re-dispatches when the worker is idle,
+                // so a superseded frame's chunk is already back in the pool).
+                if (msg.payload.size() >= sizeof(ChunkAssignPayload)) {
+                    ChunkAssignPayload ca{};
+                    memcpy(&ca, msg.payload.data(), sizeof(ca));
+                    std::lock_guard<std::mutex> lock(assign_mutex_);
+                    pending_assign_ = ca;
+                    has_pending_assign_ = true;
                 }
             }
         }

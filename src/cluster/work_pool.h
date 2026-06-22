@@ -67,6 +67,13 @@ public:
     /// Mark chunk as completed. Removes from in_flight_.
     void completeChunk(uint32_t chunk_id);
 
+    /// Return a single checked-out chunk to the assignable (returned_) pool
+    /// without consuming any of it — used when a CHUNK_ASSIGN send fails so the
+    /// chunk can be re-dispatched immediately. Removes the chunk from in_flight_
+    /// and pushes its full WorkUnit onto returned_. No-op if not in flight.
+    /// Returns the number of a-values returned (0 if not found). Thread-safe.
+    uint64_t returnChunk(uint32_t chunk_id);
+
     /// Reclaim all in-flight chunks for a dead worker. Returns count of a-values
     /// returned to returned_ queue (available for redistribution via checkoutWork).
     uint64_t reclaimWork(uint8_t worker_id);

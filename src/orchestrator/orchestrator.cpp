@@ -67,6 +67,64 @@ static std::vector<double> parseNodeWeights(const std::string& s) {
 
 // Serialization moved to src/common/relation_io.{h,cpp}
 
+// -----------------------------------------------------------------------------
+// DEBUG repro harness: deterministic CHUNK_ASSIGN drop injection (DEFAULT-INERT)
+// -----------------------------------------------------------------------------
+// Reproduces the lost-overflow-assignment race (orchestrator.cpp send site ~6005)
+// without any wire-level fault: when armed via the environment variable
+// MPQS_DEBUG_DROP_CHUNK_ASSIGN, the coordinator SKIPS the real send() for a
+// targeted overflow CHUNK_ASSIGN and reports it as having returned false, while
+// the surrounding buggy code (logs "Assigned overflow chunk…", sets
+// current_chunk_id) runs unchanged — faithfully stranding the worker.
+//
+// Syntax  : MPQS_DEBUG_DROP_CHUNK_ASSIGN=<worker_id>:<occurrence>
+//           MPQS_DEBUG_DROP_CHUNK_ASSIGN=<worker_id>:all
+//   <worker_id>  numeric coordinator-assigned worker id (1..254)
+//   <occurrence> 1-based index of the overflow CHUNK_ASSIGN to that worker to
+//                drop (the Nth overflow assignment); "all" drops every one.
+// Unset / empty / malformed => no drops, zero behavioural change (parsed once).
+//
+// Returns true when the caller MUST suppress this overflow CHUNK_ASSIGN (treat
+// the send as failed); false to transmit normally. `occurrence` is the 1-based
+// overflow-assignment counter for `worker_id` maintained by the caller.
+static bool mpqsDebugShouldDropChunkAssign(uint8_t worker_id, uint64_t occurrence) {
+    struct DropSpec {
+        bool     armed     = false;
+        uint8_t  worker    = 0;
+        bool     all       = false;
+        uint64_t occurrence = 0;  ///< target occurrence (1-based) when !all
+    };
+    // Parse the env var exactly once on first call; thereafter pure lookups.
+    static const DropSpec spec = [] {
+        DropSpec s;
+        const char* env = std::getenv("MPQS_DEBUG_DROP_CHUNK_ASSIGN");
+        if (!env || !*env) return s;
+        const std::string raw(env);
+        const auto colon = raw.find(':');
+        if (colon == std::string::npos) return s;
+        try {
+            const int w = std::stoi(raw.substr(0, colon));
+            if (w < 1 || w > 254) return s;
+            s.worker = static_cast<uint8_t>(w);
+            const std::string rhs = raw.substr(colon + 1);
+            if (rhs == "all" || rhs == "ALL") {
+                s.all = true;
+            } else {
+                const long long occ = std::stoll(rhs);
+                if (occ < 1) return s;
+                s.occurrence = static_cast<uint64_t>(occ);
+            }
+            s.armed = true;
+        } catch (...) {
+            s.armed = false;
+        }
+        return s;
+    }();
+
+    if (!spec.armed || worker_id != spec.worker) return false;
+    return spec.all || occurrence == spec.occurrence;
+}
+
 namespace mpqs {
 
 // -----------------------------------------------------------------------------
@@ -234,8 +292,16 @@ void MPQSOrchestrator::Run() {
             time_tuning_sec = std::chrono::duration<double>(clock::now() - t_tuning).count();
 
             // --- Autotune ---
+            // SIEVE_ONLY must also honour autotune: cluster coordinators (and solo
+            // sieve-only runs) launch with --sieve_only, so without this clause
+            // --autotune_stage1 would be silently ignored. Then config_.useParams
+            // stays false and the sieve falls back to the memory-bound
+            // loadStandardConfig() geometry (num_polys=8192, ~8.6 GB global bucket)
+            // instead of the efficient loadPartialCustomConfig() (num_polys≈512)
+            // that FULL_PIPELINE workers receive.
             if (config_.mode == ExecutionMode::AUTOTUNE_ONLY ||
-                (config_.mode == ExecutionMode::FULL_PIPELINE && config_.autotune_enabled))
+                ((config_.mode == ExecutionMode::FULL_PIPELINE ||
+                  config_.mode == ExecutionMode::SIEVE_ONLY) && config_.autotune_enabled))
             {
                 auto t_autotune = clock::now();
                 mpqs::autotune::AutotuneController atc(config_.autotune_config, config_, f_data_);
@@ -438,48 +504,116 @@ void MPQSOrchestrator::Run() {
                                   << " elapsed=" << std::fixed << std::setprecision(2)
                                   << chunk_elapsed_sec << "s";
 
-                    // Wait for CHUNK_ASSIGN or STOP (blocking, 30s timeout)
-                    cluster::RecvMessage resp;
-                    if (!comm_backend_->recvBlocking(resp, 30000)) {
-                        LOG(LOG_WARNING) << "Worker: timeout waiting for CHUNK_ASSIGN/STOP";
-                        worker_done = true;
-                        break;
-                    }
-
-                    if (resp.type == cluster::MsgType::STOP) {
-                        LOG(LOG_INFO) << "Worker: received STOP while waiting for chunk";
-                        worker_done = true;
-                        break;
-                    }
-
-                    if (resp.type == cluster::MsgType::CHUNK_ASSIGN) {
-                        if (resp.payload.size() >= sizeof(cluster::ChunkAssignPayload)) {
-                            cluster::ChunkAssignPayload ca;
-                            std::memcpy(&ca, resp.payload.data(), sizeof(ca));
-
-                            // Update config for next SieveStage re-entry
-                            config_.poly_range_start = ca.poly_range_start;
-                            config_.poly_range_count = ca.poly_range_count;
-                            current_chunk_id = ca.chunk_id;
-
-                            LOG(LOG_INFO) << "Worker: received overflow chunk "
-                                          << ca.chunk_id << " ["
-                                          << ca.poly_range_start << ", "
-                                          << ca.poly_range_start + ca.poly_range_count
-                                          << ")";
-                            // Loop back to SieveStage with new range
-                        } else {
-                            LOG(LOG_WARNING) << "Worker: malformed CHUNK_ASSIGN payload";
-                            worker_done = true;
-                            break;
+                    // Wait for CHUNK_ASSIGN or STOP. The coordinator's Thread A
+                    // may be busy CPU-LP-matching a large witness table and not
+                    // assign an overflow chunk promptly. Do NOT exit on a single
+                    // short timeout (that progressively loses workers over a long
+                    // run); keep waiting and only give up after a long hard
+                    // deadline (coordinator truly gone).
+                    //
+                    // CRITICAL (root-cause fix B): the worker socket has a SINGLE
+                    // reader — the AsyncNetworkDataTap I/O thread, which is still
+                    // running here. This thread MUST NOT call recvBlocking()/recv()
+                    // on the shared socket: two concurrent readers race, and the
+                    // I/O thread's tight recv() loop swallowed the mid-sieve
+                    // CHUNK_ASSIGN frame (async_network_data_tap.cpp), permanently
+                    // stranding the worker. Instead we poll the tap: the I/O thread
+                    // captures STOP (atomic) and CHUNK_ASSIGN (tryTakeChunkAssign)
+                    // and hands them to us. The I/O thread also emits a HEARTBEAT
+                    // every kHeartbeatIntervalMs (5s), keeping us under the
+                    // coordinator's kFlushTimeoutMs (120s) dead-threshold.
+                    constexpr uint32_t kChunkWaitPollMs     = 200;                            // tap poll slice
+                    // P4: absolute backstop only — with P2 actively re-requesting and
+                    // P3 sweeping idle workers, a healthy worker is unstranded long
+                    // before this fires. It triggers only when the coordinator never
+                    // assigns AND never STOPs (truly gone — the I/O thread would have
+                    // captured a STOP otherwise). Kept generous.
+                    constexpr int64_t  kChunkWaitHardCapMs  = 600000;                        // 10min
+                    constexpr int64_t  kChunkWaitLogEveryMs = 30000;                         // ≤1 log/30s
+                    // P2: after an initial grace period, actively re-request work
+                    // instead of only re-polling — recovers a dropped/failed
+                    // CHUNK_ASSIGN (P1) without waiting for the coordinator's slower
+                    // P3 sweep. Rate-limited; uses CHUNK_REQUEST (NOT CHUNK_COMPLETE)
+                    // so the coordinator never re-applies stats. The re-request send
+                    // is the only socket *write* from this thread; the I/O thread
+                    // writes too, but sendMsg is frame-atomic per call.
+                    constexpr int64_t  kChunkReReqEveryMs   = 15000;                         // ≥15s apart
+                    constexpr int64_t  kChunkReReqAfterMs   = 15000;                         // wait before 1st re-req
+                    cluster::ChunkAssignPayload assigned_ca{};
+                    {
+                        const auto wait_start = std::chrono::steady_clock::now();
+                        bool got_assign = false;
+                        int64_t last_log_ms = -kChunkWaitLogEveryMs;  // log on first wait
+                        int64_t last_rereq_ms = -kChunkReReqEveryMs;  // allow first re-req at threshold
+                        while (true) {
+                            // 1. CHUNK_ASSIGN captured by the I/O thread?
+                            if (network_tap.tryTakeChunkAssign(assigned_ca)) {
+                                got_assign = true;
+                                break;
+                            }
+                            // 2. STOP captured by the I/O thread?
+                            if (network_tap.receivedStop()) {
+                                LOG(LOG_INFO) << "Worker: STOP observed while "
+                                                 "awaiting CHUNK_ASSIGN";
+                                worker_done = true;
+                                break;
+                            }
+                            const auto now = std::chrono::steady_clock::now();
+                            const int64_t waited_ms = std::chrono::duration_cast<
+                                std::chrono::milliseconds>(now - wait_start).count();
+                            // 3. P4 absolute backstop: coordinator truly gone (no
+                            //    assign, no STOP) for the full hard cap.
+                            if (waited_ms >= kChunkWaitHardCapMs) {
+                                LOG(LOG_WARNING) << "Worker: no CHUNK_ASSIGN/STOP "
+                                                    "after " << (waited_ms / 1000)
+                                                 << "s — assuming coordinator gone, "
+                                                    "stopping";
+                                worker_done = true;
+                                break;
+                            }
+                            // 4. Rate-limited "still waiting" log (≤ once / 30s).
+                            if (waited_ms - last_log_ms >= kChunkWaitLogEveryMs) {
+                                last_log_ms = waited_ms;
+                                LOG(LOG_INFO) << "Worker: still awaiting "
+                                                 "CHUNK_ASSIGN/STOP — coordinator busy "
+                                                 "(" << (waited_ms / 1000) << "s waited, "
+                                                 "heartbeats ongoing)";
+                            }
+                            // 5. P2: active re-request after the grace period.
+                            if (waited_ms >= kChunkReReqAfterMs &&
+                                waited_ms - last_rereq_ms >= kChunkReReqEveryMs) {
+                                last_rereq_ms = waited_ms;
+                                comm_backend_->send(0, cluster::MsgType::CHUNK_REQUEST,
+                                                    nullptr, 0);
+                                LOG(LOG_INFO) << "Worker: re-requesting work "
+                                                 "(CHUNK_REQUEST) after "
+                                              << (waited_ms / 1000) << "s idle";
+                            }
+                            // 6. Sleep one poll slice (the I/O thread owns the socket;
+                            //    we only poll its handoff state, so a short slice is
+                            //    cheap and bounds CHUNK_ASSIGN pickup latency).
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(kChunkWaitPollMs));
                         }
-                    } else {
-                        LOG(LOG_WARNING) << "Worker: unexpected message type "
-                                         << static_cast<int>(
-                                                static_cast<uint8_t>(resp.type))
-                                         << " while waiting for CHUNK_ASSIGN";
-                        worker_done = true;
-                        break;
+                        if (!got_assign) break;  // worker_done set above
+                    }
+
+                    {
+                        // CHUNK_ASSIGN picked up from the tap — update config for the
+                        // next SieveStage re-entry.
+                        config_.poly_range_start = assigned_ca.poly_range_start;
+                        config_.poly_range_count = assigned_ca.poly_range_count;
+                        current_chunk_id = assigned_ca.chunk_id;
+
+                        LOG(LOG_INFO) << "Worker: received overflow chunk "
+                                      << assigned_ca.chunk_id << " ["
+                                      << assigned_ca.poly_range_start << ", "
+                                      << assigned_ca.poly_range_start +
+                                             assigned_ca.poly_range_count
+                                      << ")";
+                        // Loop back to SieveStage with new range. (The I/O thread
+                        // validated the payload size before storing it, so no
+                        // malformed/unexpected-type handling is needed here.)
                     }
                 }
 
@@ -591,6 +725,12 @@ void MPQSOrchestrator::Run() {
                         : 1;
 
                     // --- Network setup (M2+: accept remote workers) ---
+                    // coord_range_count: node-0's assigned a-range width. 0 means
+                    // "unbounded" — used when there are no remote workers (the
+                    // coordinator owns the whole a-space, same as solo). When set,
+                    // it bounds node-0's own local sieve so it cannot overrun into
+                    // worker a-ranges and emit byte-identical duplicate partials.
+                    uint64_t coord_range_count = 0;
                     bool has_remote_workers = (config_.expected_workers > 0);
                     if (has_remote_workers) {
                         LOG(LOG_INFO) << "Coordinator: initializing TCP backend, expecting "
@@ -681,10 +821,60 @@ void MPQSOrchestrator::Run() {
                         tmp_scheduler.reset();
                         dummy_pool.reset();
 
-                        // Create real WorkPool for overflow a-indices
+                        // Create real WorkPool for overflow a-indices.
+                        //
+                        // overflow_start = sum of the per-node INITIAL contiguous
+                        // ranges (sieved up front; kept modest by computeContiguousRanges).
                         uint64_t overflow_start = 0;
                         for (auto& r : ranges) overflow_start += r.count;
-                        uint64_t overflow_size = overflow_start;
+
+                        // Overflow windows are pure index space, consumed on demand
+                        // only after a node finishes its initial range with the
+                        // relation target still unmet; the run is bounded by the
+                        // relation cap, not the pool. So size the overflow generously
+                        // to cover the target at a CONSERVATIVE per-a-index yield
+                        // (RSA-130 measured ~0.12 rel/a-index; use a floor well below
+                        // that for margin), then apply the operator override, then
+                        // clamp to the a-factor walk's capacity (max distinct in-band
+                        // a-coefficients) so we never hand out chunks mapping to
+                        // invalid a-coefficients. The naive old behaviour
+                        // (overflow_size = overflow_start, i.e. 1x doubling) ran the
+                        // pool dry at ~15% of the target on RSA-130.
+                        const double kRelPerAIndexFloor = 0.04;   // ~3x margin at RSA-130
+                        const uint64_t H_u64 = static_cast<uint64_t>(H);
+
+                        // Walk capacity: the sliding-window a-factor walk advances by
+                        // moving its upper half RIGHT through the factor base with
+                        // stride 2 (advance_a_factors / advance(..., upperHalfStart,
+                        // +1, 2) in prime_algorithms.cu). Each window slide yields one
+                        // new a-coefficient (one hypercube of H a-indices). The number
+                        // of slides before the upper half runs off the end of the
+                        // factor base is bounded by (fb_size - a_factor_start_index)/2,
+                        // where the walk begins near FB index ~150 (init_a_factors).
+                        // Use a conservative form so the clamp can never over-allocate.
+                        const uint32_t kAFactorStartIndex = 150u;
+                        const uint64_t fb_size_u64 = static_cast<uint64_t>(f_data_.size);
+                        uint64_t walk_capacity_windows =
+                            (fb_size_u64 > kAFactorStartIndex)
+                                ? (fb_size_u64 - kAFactorStartIndex) / 2
+                                : 1;
+                        if (walk_capacity_windows < 1) walk_capacity_windows = 1;
+
+                        uint64_t windows_for_target = static_cast<uint64_t>(std::ceil(
+                            static_cast<double>(config_.target_relations)
+                            / (kRelPerAIndexFloor * static_cast<double>(H_u64))));
+                        uint64_t contiguous_windows = overflow_start / H_u64;
+                        uint64_t total_windows =
+                            std::max(contiguous_windows, windows_for_target);
+                        total_windows = static_cast<uint64_t>(std::ceil(
+                            static_cast<double>(total_windows)
+                            * config_.cluster_pool_oversize));
+                        total_windows = std::min(total_windows, walk_capacity_windows);
+                        uint64_t overflow_windows =
+                            (total_windows > contiguous_windows)
+                                ? (total_windows - contiguous_windows) : 0;
+                        uint64_t overflow_size = overflow_windows * H_u64;
+
                         cluster_work_pool_ = std::make_unique<cluster::WorkPool>(
                             overflow_start, overflow_size);
                         cluster_scheduler_ = std::make_unique<cluster::ChunkScheduler>(
@@ -700,9 +890,23 @@ void MPQSOrchestrator::Run() {
                                           << (i < sm_counts.size() ? sm_counts[i] : 0u)
                                           << " SMs)";
                         }
+                        LOG(LOG_INFO) << "Coordinator: a-value pool: contiguous="
+                                      << contiguous_windows << " windows, overflow="
+                                      << overflow_windows << " windows, total="
+                                      << total_windows << " windows (oversize="
+                                      << config_.cluster_pool_oversize << "x, target="
+                                      << config_.target_relations << " rels, walk_ceiling="
+                                      << walk_capacity_windows << " windows)";
                         LOG(LOG_INFO) << "Coordinator: overflow pool starts at "
-                                      << overflow_start << " (" << overflow_size / H
+                                      << overflow_start << " (" << overflow_windows
                                       << " windows)";
+
+                        // Capture node-0's assigned a-range width so the
+                        // coordinator's own local sieve (DirectChannel) is bounded
+                        // to [0, ranges[0].count). poly_range_start stays 0, so the
+                        // worker-only resetAndAdvanceTo guard is correctly skipped,
+                        // but the upper bound must still be enforced via the tap.
+                        if (!ranges.empty()) coord_range_count = ranges[0].count;
 
                         // Send WORK_ASSIGN to each remote worker with actual ranges
                         uint64_t threshold_override = 0;
@@ -732,6 +936,17 @@ void MPQSOrchestrator::Run() {
                     cluster_channel_ = std::make_unique<cluster::DirectChannel>();
                     config_.data_tap = cluster_channel_.get();
 
+                    // Bound node-0's own sieve to its assigned a-range when remote
+                    // workers exist. coord_range_count == 0 (no workers) leaves the
+                    // channel unbounded, preserving solo / single-node behaviour.
+                    if (coord_range_count > 0) {
+                        const uint32_t coord_batch_a =
+                            config_.sieve_batch_size > 0 ? config_.sieve_batch_size : 1;
+                        cluster_channel_->setRange(coord_range_count, coord_batch_a);
+                        LOG(LOG_INFO) << "Coordinator: local sieve bounded to a-range "
+                                      << "[0, " << coord_range_count << ")";
+                    }
+
                     // --- Create cluster infrastructure ---
                     cluster_queue_ = std::make_unique<cluster::AccumulatorQueue>();
                     cluster_accumulator_ = std::make_unique<cluster::RelationAccumulator>(
@@ -757,10 +972,81 @@ void MPQSOrchestrator::Run() {
                     try {
                         if (is_jetson_) logGpuMemory("Before sieve");
                         auto t_sieve = clock::now();
-                        SieveStage();
+                        SieveStage();   // node-0's initial bounded sieve [0, coord_range_count)
                         time_sieve_sec = std::chrono::duration<double>(
                             clock::now() - t_sieve).count();
                         if (is_jetson_) logGpuMemory("After sieve");
+
+                        // --- Fix A: coordinator self-assigns overflow chunks ---
+                        // After its initial bounded range, node 0's GPU would
+                        // otherwise idle for the rest of the run: commit 9881c00
+                        // hard-bounds the local sieve to stop cross-node a-range
+                        // overrun, but nothing wired node 0 into the overflow
+                        // rotation that keeps workers busy (measured ~12.7 % of
+                        // cluster sieve capacity wasted at RSA-130 scale).
+                        // Here the coordinator's GPU thread (Thread B) becomes one
+                        // more consumer of the SAME mutex-guarded cluster_work_pool_
+                        // that feeds remote workers, so its chunks are disjoint from
+                        // every worker's BY CONSTRUCTION — no new overlap surface.
+                        // It mirrors the worker loop (~:445-628) but checks out from
+                        // the LOCAL pool instead of over the network: node 0 never
+                        // traverses the CHUNK_COMPLETE / worker_trackers path, so it
+                        // cannot reintroduce the chunk_id aliasing fixed in 2ad540b.
+                        // Engaged ONLY with remote workers present (coord_range_count
+                        // > 0) — solo and worker paths are byte-for-byte unchanged.
+                        if (coord_range_count > 0 && cluster_work_pool_ &&
+                            cluster_scheduler_ && cluster_accumulator_ &&
+                            cluster_channel_) {
+                            const uint32_t coord_batch_a =
+                                config_.sieve_batch_size > 0 ? config_.sieve_batch_size : 1;
+
+                            // Record the initial bounded sieve as node-0's first
+                            // "chunk" (parity with workers, whose initial range is
+                            // chunk #1) so both the telemetry table and the
+                            // scheduler's throughput model account for it.
+                            cluster_scheduler_->recordCompletion(
+                                /*worker_id=*/0, /*rels=*/0,
+                                cluster_channel_->aValsConsumed(), time_sieve_sec);
+
+                            // Terminate on the EXPLICIT stop signal (target reached
+                            // → Thread A signalStop, or teardown), NOT on the
+                            // per-chunk a-range bound (which only means "this chunk
+                            // is done"). targetReached()/exhausted() are best-effort
+                            // early-outs; the inner SieveStage also honours
+                            // external_stop_flag_ at SUB-BATCH granularity, so when
+                            // the target is hit mid-chunk node 0 stops within one
+                            // sub-batch — it can never become a late straggler from
+                            // an oversized final chunk (and nextChunkSize already
+                            // clamps to maxChunk()).
+                            while (!cluster_channel_->stopped() &&
+                                   !cluster_accumulator_->targetReached() &&
+                                   !cluster_work_pool_->exhausted()) {
+                                uint64_t sz = cluster_scheduler_->nextChunkSize(/*worker_id=*/0);
+                                auto chunk = cluster_work_pool_->checkoutWork(sz, /*worker_id=*/0);
+                                if (!chunk) break;  // pool drained between checks
+
+                                config_.poly_range_start = chunk->unit.start;   // absolute a-index
+                                config_.poly_range_count = chunk->unit.count;
+                                cluster_channel_->setRange(chunk->unit.count, coord_batch_a);  // resets consumed=0
+                                cluster_prev_pers_count_ = 0;  // fresh per-chunk extraction watermark
+
+                                LOG(LOG_INFO) << "Coordinator: self-assigned overflow chunk "
+                                              << chunk->chunk_id << " [" << chunk->unit.start
+                                              << ", " << chunk->unit.start + chunk->unit.count
+                                              << ")";
+
+                                auto t_chunk = clock::now();
+                                SieveStage();   // jumps to chunk start; partials flow via DirectChannel→Thread A
+                                double el = std::chrono::duration<double>(
+                                    clock::now() - t_chunk).count();
+                                time_sieve_sec += el;
+
+                                const uint64_t consumed = cluster_channel_->aValsConsumed();
+                                cluster_scheduler_->recordCompletion(
+                                    /*worker_id=*/0, /*rels=*/0, consumed, el);
+                                cluster_work_pool_->reclaimPartial(chunk->chunk_id, consumed);
+                            }
+                        }
 
                         // Await handoff from Thread A
                         host_relations_soa_ = cluster_handoff_->await();
@@ -3099,14 +3385,22 @@ void MPQSOrchestrator::SieveStage() {
     logGpuMemory("After sieve/LP init");
 
     // =========================================================================
-    // 3b. M3 Cluster: Jump to assigned poly range (workers only)
+    // 3b. M3 Cluster: Jump to assigned poly range
     // =========================================================================
-    if (config_.poly_range_start > 0 && siever_) {
-        if (config_.cluster_mode == ClusterMode::WORKER) {
-            siever_->saveSnapshot();
-            siever_->resetAndAdvanceTo(config_.poly_range_start);
-            LOG(LOG_INFO) << "Siever: jumped to a_index=" << config_.poly_range_start;
-        }
+    // WORKER: every chunk (initial WORK_ASSIGN + overflow CHUNK_ASSIGN) arrives
+    //   with poly_range_start > 0, so the siever always jumps.
+    // COORDINATOR: its initial bounded sieve keeps poly_range_start == 0 (no
+    //   jump → starts at a_index 0); only its self-assigned OVERFLOW chunks (Fix
+    //   A, set on Thread B before re-entering SieveStage) carry poly_range_start
+    //   > 0 and must jump to the chunk's absolute a-index, exactly as a worker
+    //   does — keeping node-0's chunks disjoint from every worker's.
+    // SOLO: never sets poly_range_start (stays 0) → never jumps.
+    // Hence gating on != SOLO is correct for all three modes.
+    if (config_.poly_range_start > 0 && siever_ &&
+        config_.cluster_mode != ClusterMode::SOLO) {
+        siever_->saveSnapshot();
+        siever_->resetAndAdvanceTo(config_.poly_range_start);
+        LOG(LOG_INFO) << "Siever: jumped to a_index=" << config_.poly_range_start;
     }
 
     // =========================================================================
@@ -3442,9 +3736,15 @@ void MPQSOrchestrator::SieveStage() {
                         if (extract_pending) {
                             int prev_idx = active_staging ^ 1;
                             if (cudaEventQuery(extract_done_event[prev_idx]) == cudaSuccess) {
+                                // One graph replay advanced graph_N batches of
+                                // batch_size a-values each, but this callback fires
+                                // once per replay. Report the true count so the
+                                // DataTap a-range guard does not under-count by the
+                                // cuda_graph_unroll factor (cross-node overlap bug).
                                 data_tap_->onBatchComplete(staging_full[prev_idx],
                                                            staging_part[prev_idx],
-                                                           processed_batches - static_cast<int>(graph_N));
+                                                           processed_batches - static_cast<int>(graph_N),
+                                                           static_cast<uint64_t>(graph_N) * batch_size);
                                 extract_pending = false;
                             }
                         }
@@ -5575,9 +5875,18 @@ void MPQSOrchestrator::networkLoop() {
     std::unordered_map<uint8_t, std::chrono::steady_clock::time_point> last_recall_time_;
 
     // --- M3: Per-worker tracking for heartbeat timeout + chunk management ---
+    // current_chunk_id sentinels:
+    //   UINT32_MAX     = idle, no chunk in flight (eligible for P3 sweep / P2 assign)
+    //   kInitialChunk  = busy with its initial WORK_ASSIGN range (NOT a pool chunk;
+    //                    cleared to UINT32_MAX on the worker's first CHUNK_COMPLETE)
+    //   otherwise      = the overflow pool chunk_id currently in flight
+    // Fix C: workers begin BUSY with their initial range. Without this the P3 sweep
+    // saw UINT32_MAX at startup and double-assigned an overflow chunk while the
+    // worker was still sieving its initial WORK_ASSIGN range.
+    static constexpr uint32_t kInitialChunk = UINT32_MAX - 1;
     struct WorkerTracker {
         std::chrono::steady_clock::time_point last_heartbeat;
-        uint32_t current_chunk_id = UINT32_MAX;  // UINT32_MAX = no chunk in flight
+        uint32_t current_chunk_id = UINT32_MAX;  // see sentinel table above
         uint64_t total_rels = 0;
         bool alive = true;
     };
@@ -5587,10 +5896,26 @@ void MPQSOrchestrator::networkLoop() {
         for (uint32_t w = 1; w <= total_workers; ++w) {
             WorkerTracker wt;
             wt.last_heartbeat = now;
+            wt.current_chunk_id = kInitialChunk;  // busy until first CHUNK_COMPLETE
             worker_trackers[static_cast<uint8_t>(w)] = wt;
         }
     }
     auto last_timeout_check = std::chrono::steady_clock::now();
+
+    // DEBUG repro harness: 1-based count of overflow CHUNK_ASSIGN attempts per
+    // worker, used only by mpqsDebugShouldDropChunkAssign(). Always maintained
+    // (a single map increment); the drop helper is inert unless the env var is
+    // armed, so this adds no observable behaviour in normal runs.
+    std::unordered_map<uint8_t, uint64_t> overflow_assign_occurrence;
+
+    // --- Chunk-delivery fault tolerance telemetry (P5) ---
+    // failed_assign_sends:   CHUNK_ASSIGN sends that returned false (chunk
+    //                        returned to the pool, worker left with no chunk).
+    // redispatched_chunks:   chunks handed out via re-request (P2) or the
+    //                        proactive idle-worker sweep (P3), i.e. recovery
+    //                        dispatches that are not the normal CHUNK_COMPLETE path.
+    uint64_t failed_assign_sends = 0;
+    uint64_t redispatched_chunks = 0;
 
     // --- SM3: Per-node contribution telemetry (coordinator only, in-memory) ---
     struct NodeTelemetry {
@@ -5728,6 +6053,163 @@ void MPQSOrchestrator::networkLoop() {
         }
     };
 
+    // --- P1/P2/P3: single send-checked chunk-assignment routine ---
+    // Checks out one overflow chunk for `wid` and sends a CHUNK_ASSIGN.
+    //   * On a CONFIRMED send (true): logs "Assigned…" and sets the worker's
+    //     current_chunk_id (chunk is in flight, attributed to the worker).
+    //   * On a FAILED send (false): returns the just-checked-out chunk to the
+    //     assignable pool (so it can be re-dispatched), logs a warning, bumps the
+    //     failed-send counter, and leaves current_chunk_id == UINT32_MAX so P2/P3
+    //     can retry. The worker is never silently stranded.
+    // Idempotency: the routine is a no-op if the worker already holds a chunk
+    //   (current_chunk_id != UINT32_MAX) — guarding double-assignment between the
+    //   CHUNK_COMPLETE path, the worker re-request (P2), and the idle sweep (P3).
+    // The `debug_droppable`/`is_redispatch` flags select the repro-harness hook
+    //   (only the original CHUNK_COMPLETE overflow path is droppable) and whether
+    //   a successful dispatch counts as a recovery re-dispatch (P5 telemetry).
+    // Returns true iff a chunk is now confirmed in flight for the worker.
+    auto assignChunkTo = [&](uint8_t wid, bool debug_droppable,
+                             bool is_redispatch) -> bool {
+        if (!cluster_accumulator_ || !cluster_work_pool_ || !cluster_scheduler_ ||
+            !comm_backend_) {
+            return false;
+        }
+        auto& wt = worker_trackers[wid];
+        if (wt.current_chunk_id != UINT32_MAX) return false;  // already has work
+        if (cluster_accumulator_->targetReached() ||
+            cluster_work_pool_->exhausted()) {
+            return false;
+        }
+        uint64_t next_size = cluster_scheduler_->nextChunkSize(wid);
+        auto checkout = cluster_work_pool_->checkoutWork(next_size, wid);
+        if (!checkout) return false;
+
+        // Invariant guard (cheap, dispatch-time): a freshly checked-out overflow
+        // chunk MUST NOT overlap any OTHER in-flight chunk. The legitimate
+        // returned_/reclaim path only ever recycles ranges already freed by
+        // completed or dead chunks, so an overlap here signals a regression of the
+        // initial-range chunk_id aliasing bug (a live chunk split by a spurious
+        // reclaimPartial). Warn loudly — never abort a multi-hour cluster run on a
+        // single-GPU's worth of wasted sieving. inFlightChunks() is at most
+        // num_workers entries and this runs once per overflow dispatch (not per
+        // relation), so the cost is negligible.
+        {
+            const uint64_t new_lo = checkout->unit.start;
+            const uint64_t new_hi = new_lo + checkout->unit.count;
+            for (const auto& c : cluster_work_pool_->inFlightChunks()) {
+                if (c.chunk_id == checkout->chunk_id) continue;  // skip self
+                const uint64_t c_lo = c.unit.start;
+                const uint64_t c_hi = c_lo + c.unit.count;
+                if (new_lo < c_hi && c_lo < new_hi) {  // half-open overlap test
+                    LOG(LOG_WARNING) << "[Thread A] OVERFLOW OVERLAP BUG: chunk "
+                                     << checkout->chunk_id << " [" << new_lo << ", "
+                                     << new_hi << ") for worker " << (int)wid
+                                     << " overlaps in-flight chunk " << c.chunk_id
+                                     << " [" << c_lo << ", " << c_hi << ") on worker "
+                                     << (int)c.worker_id
+                                     << " — reclaim aliasing regression";
+                }
+            }
+        }
+
+        cluster::ChunkAssignPayload ca{};
+        ca.chunk_id = checkout->chunk_id;
+        ca.poly_range_start = checkout->unit.start;
+        ca.poly_range_count = checkout->unit.count;
+        ca.flags = cluster::ChunkAssignPayload::FLAG_OVERFLOW;
+
+        // DEBUG repro harness (DEFAULT-INERT): only the original CHUNK_COMPLETE
+        // overflow path is droppable, so the recovery dispatches (P2/P3) can still
+        // succeed and unstrand the worker once the harness has fired its one drop.
+        bool assign_sent;
+        if (debug_droppable) {
+            const uint64_t ovf_occ = ++overflow_assign_occurrence[wid];
+            if (mpqsDebugShouldDropChunkAssign(wid, ovf_occ)) {
+                assign_sent = false;
+                LOG(LOG_WARNING) << "[DEBUG-INJECT] suppressed CHUNK_ASSIGN to worker "
+                                 << (int)wid << " (occurrence " << ovf_occ << ")";
+            } else {
+                assign_sent = comm_backend_->send(wid, cluster::MsgType::CHUNK_ASSIGN,
+                                                  &ca, sizeof(ca));
+            }
+        } else {
+            assign_sent = comm_backend_->send(wid, cluster::MsgType::CHUNK_ASSIGN,
+                                              &ca, sizeof(ca));
+        }
+
+        // P1: honor the send result. On failure, return the chunk to the pool and
+        // leave the worker with no current chunk so P2/P3 retry it.
+        if (!assign_sent) {
+            cluster_work_pool_->returnChunk(checkout->chunk_id);
+            ++failed_assign_sends;
+            LOG(LOG_WARNING) << "[Thread A] CHUNK_ASSIGN send FAILED to worker "
+                             << (int)wid << " (chunk " << checkout->chunk_id
+                             << ") — returned to pool for re-dispatch";
+            return false;
+        }
+
+        wt.current_chunk_id = checkout->chunk_id;
+        if (is_redispatch) ++redispatched_chunks;
+        LOG(LOG_INFO) << "[Thread A] " << (is_redispatch ? "Re-dispatched" : "Assigned")
+                      << " overflow chunk " << checkout->chunk_id << " to worker "
+                      << (int)wid << " [" << ca.poly_range_start << ", "
+                      << ca.poly_range_start + ca.poly_range_count << ")";
+        return true;
+    };
+
+    // --- Chunk-assignment latency fix ---
+    // Process one INCREMENTAL_BATCH message: deserialize, accumulate full relations,
+    // run the CPU LP insert/match over partials, update telemetry. This is the HEAVY
+    // per-iteration work (LP-matching + Montgomery combines). It is factored out so the
+    // recv-drain pass can DEFER it: the drain handles cheap control messages first
+    // (notably CHUNK_COMPLETE → CHUNK_ASSIGN), then this runs the deferred batches.
+    //
+    // CRITICAL: deferred batches are processed in strict FIFO receive order, so the
+    // sequence of insertAndMatch() calls — and therefore the LP table / accumulator /
+    // dedup data path — is byte-identical to the previous inline processing. Only the
+    // *scheduling* relative to CHUNK_COMPLETE handling changes (disjoint state: the
+    // chunk pool / scheduler do not touch the LP table or accumulator partial path).
+    auto processIncrementalBatch = [&](const cluster::RecvMessage& m) {
+        structures::HostRelationBatch full_batch, partial_batch;
+        if (cluster::deserializeIncrementalBatch(
+                m.payload.data(), m.payload.size(),
+                full_batch, partial_batch)) {
+            if (full_batch.num_relations > 0) {
+                cluster_accumulator_->addRelations(
+                    full_batch, /*source_id=*/m.sender_id);
+            }
+            if (cluster_cpu_lp_ && partial_batch.num_relations > 0) {
+                bufferClusterPartials(partial_batch);  // M6
+                uint64_t lp_before = cluster_accumulator_->relationsFrom(255);
+                cluster_cpu_lp_->insertAndMatch(
+                    partial_batch, *cluster_accumulator_);
+                node_telemetry[0].lp_combined +=
+                    cluster_accumulator_->relationsFrom(255) - lp_before;
+            }
+            // Telemetry: per-sender accumulation
+            if (m.sender_id < node_telemetry.size()) {
+                double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - sieve_start).count();
+                auto& t = node_telemetry[m.sender_id];
+                t.full_relations += full_batch.num_relations;
+                t.partial_relations += partial_batch.num_relations;
+                if (t.first_relation_time == 0.0 && full_batch.num_relations > 0)
+                    t.first_relation_time = elapsed;
+                if (full_batch.num_relations > 0 || partial_batch.num_relations > 0)
+                    t.last_relation_time = elapsed;
+            }
+            sampleProgress();
+        } else {
+            LOG(LOG_WARNING) << "[Thread A] Failed to deserialize INCREMENTAL_BATCH from worker "
+                             << (int)m.sender_id;
+        }
+    };
+
+    // Deferred INCREMENTAL_BATCH buffer (Thread A only — no synchronization). Reused
+    // across iterations; cleared after each drain. Holds the heavy LP-match work so
+    // that CHUNK_COMPLETE → CHUNK_ASSIGN is never queued behind it within a drain pass.
+    std::vector<cluster::RecvMessage> deferred_batches;
+
     while (true) {
         // 1. Poll DirectChannel (M1/M3: local sieve via Thread B)
         if (cluster_channel_) {
@@ -5760,44 +6242,17 @@ void MPQSOrchestrator::networkLoop() {
         if (comm_backend_) {
             cluster::RecvMessage msg;
             auto now = std::chrono::steady_clock::now();
+            deferred_batches.clear();
             while (comm_backend_->recv(msg)) {
                 if (!msg.valid) continue;
 
                 switch (msg.type) {
                 case cluster::MsgType::INCREMENTAL_BATCH: {
-                    structures::HostRelationBatch full_batch, partial_batch;
-                    if (cluster::deserializeIncrementalBatch(
-                            msg.payload.data(), msg.payload.size(),
-                            full_batch, partial_batch)) {
-                        if (full_batch.num_relations > 0) {
-                            cluster_accumulator_->addRelations(
-                                full_batch, /*source_id=*/msg.sender_id);
-                        }
-                        if (cluster_cpu_lp_ && partial_batch.num_relations > 0) {
-                            bufferClusterPartials(partial_batch);  // M6
-                            uint64_t lp_before = cluster_accumulator_->relationsFrom(255);
-                            cluster_cpu_lp_->insertAndMatch(
-                                partial_batch, *cluster_accumulator_);
-                            node_telemetry[0].lp_combined +=
-                                cluster_accumulator_->relationsFrom(255) - lp_before;
-                        }
-                        // Telemetry: per-sender accumulation
-                        if (msg.sender_id < node_telemetry.size()) {
-                            double elapsed = std::chrono::duration<double>(
-                                std::chrono::steady_clock::now() - sieve_start).count();
-                            auto& t = node_telemetry[msg.sender_id];
-                            t.full_relations += full_batch.num_relations;
-                            t.partial_relations += partial_batch.num_relations;
-                            if (t.first_relation_time == 0.0 && full_batch.num_relations > 0)
-                                t.first_relation_time = elapsed;
-                            if (full_batch.num_relations > 0 || partial_batch.num_relations > 0)
-                                t.last_relation_time = elapsed;
-                        }
-                        sampleProgress();
-                    } else {
-                        LOG(LOG_WARNING) << "[Thread A] Failed to deserialize INCREMENTAL_BATCH from worker "
-                                         << (int)msg.sender_id;
-                    }
+                    // Chunk-assignment latency fix: defer the heavy LP-match work so
+                    // that any CHUNK_COMPLETE later in this drain pass gets its
+                    // CHUNK_ASSIGN sent promptly. Batches are replayed after the drain
+                    // in strict FIFO order (identical data path — see processIncrementalBatch).
+                    deferred_batches.push_back(std::move(msg));
                     break;
                 }
 
@@ -5814,16 +6269,39 @@ void MPQSOrchestrator::networkLoop() {
                                 cc.a_values_consumed,
                                 cc.elapsed_ms / 1000.0);
                         }
-                        // Mark chunk done in WorkPool.
-                        // reclaimPartial handles both full and partial completions:
-                        // if a_values_consumed < assigned, the remainder is returned
-                        // to WorkPool::returned_ for redistribution.
-                        if (cluster_work_pool_) {
+                        auto& wt = worker_trackers[msg.sender_id];
+
+                        // Mark chunk done in WorkPool — ONLY for a genuine pool
+                        // (overflow) chunk this worker actually holds. reclaimPartial
+                        // handles both full and partial completions: if
+                        // a_values_consumed < assigned, the remainder is returned to
+                        // WorkPool::returned_ for redistribution.
+                        //
+                        // ROOT-CAUSE FIX (overflow-chunk overlap on multi-node runs):
+                        // a worker's FIRST CHUNK_COMPLETE reports its INITIAL
+                        // WORK_ASSIGN range, which it labels chunk_id=0 (worker-side
+                        // default, see :422/:495). Pool overflow ids ALSO start at 0
+                        // (WorkPool::next_chunk_id_), so an initial-range completion
+                        // that arrives while pool chunk 0 is still in flight aliases
+                        // it: the old unconditional reclaimPartial(0, initial_width)
+                        // SPLIT the live pool chunk 0 and pushed a bogus remainder
+                        // onto returned_, which the next overflow checkout served as
+                        // an OVERLAPPING chunk (chunk 1 [737296,1197124) nested inside
+                        // chunk 0 [655360,1197124)). The coordinator's own tracker is
+                        // authoritative — kInitialChunk marks a worker still on its
+                        // initial range (never a pool chunk), UINT32_MAX marks idle —
+                        // so reclaim only the pool chunk the coordinator believes this
+                        // worker currently holds (id matches the worker-reported one).
+                        // This mirrors the guards already used by the heartbeat-reclaim
+                        // (:6306) and CHUNK_REQUEST (:6228) paths.
+                        if (cluster_work_pool_ &&
+                            wt.current_chunk_id == cc.chunk_id &&
+                            wt.current_chunk_id != kInitialChunk &&
+                            wt.current_chunk_id != UINT32_MAX) {
                             cluster_work_pool_->reclaimPartial(cc.chunk_id,
                                                                cc.a_values_consumed);
                         }
 
-                        auto& wt = worker_trackers[msg.sender_id];
                         wt.total_rels += cc.relations_found;
                         wt.current_chunk_id = UINT32_MAX;
 
@@ -5842,40 +6320,59 @@ void MPQSOrchestrator::networkLoop() {
                                       << " time=" << cc.elapsed_ms << "ms"
                                       << " a_vals=" << cc.a_values_consumed;
 
-                        // Assign next overflow chunk (if work remains and target not reached)
-                        if (!cluster_accumulator_->targetReached() &&
-                            cluster_work_pool_ && !cluster_work_pool_->exhausted()) {
-                            uint64_t next_size = cluster_scheduler_->nextChunkSize(msg.sender_id);
-                            auto checkout = cluster_work_pool_->checkoutWork(
-                                next_size, msg.sender_id);
-                            if (checkout) {
-                                cluster::ChunkAssignPayload ca{};
-                                ca.chunk_id = checkout->chunk_id;
-                                ca.poly_range_start = checkout->unit.start;
-                                ca.poly_range_count = checkout->unit.count;
-                                ca.flags = cluster::ChunkAssignPayload::FLAG_OVERFLOW;
-                                comm_backend_->send(msg.sender_id,
-                                    cluster::MsgType::CHUNK_ASSIGN,
-                                    &ca, sizeof(ca));
-                                wt.current_chunk_id = checkout->chunk_id;
-                                LOG(LOG_INFO) << "[Thread A] Assigned overflow chunk "
-                                              << checkout->chunk_id << " to worker "
-                                              << (int)msg.sender_id
-                                              << " [" << ca.poly_range_start << ", "
-                                              << ca.poly_range_start + ca.poly_range_count << ")";
-                            } else {
-                                LOG(LOG_INFO) << "[Thread A] No overflow work for worker "
-                                              << (int)msg.sender_id << " (pool exhausted)";
-                            }
-                        } else {
-                            LOG(LOG_DEBUG_1) << "[Thread A] No more work for worker "
-                                             << (int)msg.sender_id
-                                             << " (target reached or pool exhausted)";
-                        }
+                        // Assign next overflow chunk via the send-checked routine
+                        // (P1). debug_droppable=true: this is the original overflow
+                        // path the repro harness targets. A failed send returns the
+                        // chunk to the pool and leaves the worker idle for P2/P3 to
+                        // recover — it is no longer silently stranded.
+                        (void)assignChunkTo(msg.sender_id,
+                                            /*debug_droppable=*/true,
+                                            /*is_redispatch=*/false);
 
                         // S8: Check for stragglers after each CHUNK_COMPLETE.
                         checkStragglers();
                     }
+                    break;
+                }
+
+                // --- P2: worker re-request handler (NO stats) ---
+                // A worker that timed out awaiting a CHUNK_ASSIGN actively re-requests
+                // work. Unlike CHUNK_COMPLETE, this carries no relation/partial counts,
+                // so handling it never re-applies stats (no double-counting).
+                //
+                // Fix A: a CHUNK_REQUEST is EXPLICIT proof the worker has NO work, so
+                // it must FORCE re-assignment — it cannot be blocked by the
+                // assignChunkTo idempotency guard. The coordinator's view of the
+                // worker's current chunk is, by definition of this message, stale:
+                // the previous CHUNK_ASSIGN it believes succeeded was never received
+                // (e.g. swallowed before fix B, or a transient drop). So FIRST return
+                // any chunk the coordinator thinks is in-flight for this worker to the
+                // pool and clear current_chunk_id, THEN assign afresh. Without this,
+                // one not-received assignment permanently wedges the worker (it sets
+                // current_chunk_id, then every re-request is a guard no-op).
+                case cluster::MsgType::CHUNK_REQUEST: {
+                    LOG(LOG_INFO) << "[Thread A] CHUNK_REQUEST from worker "
+                                  << (int)msg.sender_id << " (re-request)";
+                    auto& wt = worker_trackers[msg.sender_id];
+                    wt.last_heartbeat = now;
+                    if (cluster_work_pool_ &&
+                        wt.current_chunk_id != UINT32_MAX &&
+                        wt.current_chunk_id != kInitialChunk) {
+                        // The coordinator believes a pool chunk is in flight that the
+                        // worker never received — return it so it can be re-dispatched.
+                        uint64_t ret = cluster_work_pool_->returnChunk(wt.current_chunk_id);
+                        LOG(LOG_WARNING) << "[Thread A] Worker " << (int)msg.sender_id
+                                         << " re-requested while coordinator believed it "
+                                         << "held chunk " << wt.current_chunk_id
+                                         << " (never received) — returned " << ret
+                                         << " a-vals to pool, re-assigning";
+                    }
+                    // FORCE re-assignment: clear the (stale) chunk so assignChunkTo's
+                    // idempotency guard cannot block this explicit-idle re-request.
+                    wt.current_chunk_id = UINT32_MAX;
+                    (void)assignChunkTo(msg.sender_id,
+                                        /*debug_droppable=*/false,
+                                        /*is_redispatch=*/true);
                     break;
                 }
 
@@ -5909,6 +6406,16 @@ void MPQSOrchestrator::networkLoop() {
                 }
             }
 
+            // Chunk-assignment latency fix: now that every control message in this
+            // drain pass (CHUNK_COMPLETE → CHUNK_ASSIGN) has been serviced, replay the
+            // deferred INCREMENTAL_BATCH messages in strict FIFO receive order. This
+            // preserves the exact insertAndMatch() sequence / dedup data path while
+            // ensuring chunk assignment is never starved by the LP-match backlog.
+            for (const auto& batch_msg : deferred_batches) {
+                processIncrementalBatch(batch_msg);
+            }
+            deferred_batches.clear();
+
             // --- M3: Heartbeat timeout check (every 5 seconds) ---
             if (now - last_timeout_check > std::chrono::seconds(5)) {
                 last_timeout_check = now;
@@ -5923,14 +6430,18 @@ void MPQSOrchestrator::networkLoop() {
                                          << "s since last heartbeat)";
                         wt.alive = false;
 
-                        // Reclaim in-flight work
-                        if (cluster_work_pool_ && wt.current_chunk_id != UINT32_MAX) {
-                            cluster_work_pool_->reclaimWork(wid);
+                        // Reclaim in-flight pool work (reclaimWork keys on worker_id,
+                        // so a worker still on its initial range — kInitialChunk, not
+                        // a pool chunk — reclaims nothing, which is correct).
+                        if (cluster_work_pool_ &&
+                            wt.current_chunk_id != UINT32_MAX &&
+                            wt.current_chunk_id != kInitialChunk) {
+                            uint64_t reclaimed = cluster_work_pool_->reclaimWork(wid);
                             LOG(LOG_INFO) << "[Thread A] Reclaimed in-flight chunk "
-                                          << wt.current_chunk_id << " from worker "
-                                          << (int)wid;
-                            wt.current_chunk_id = UINT32_MAX;
+                                          << wt.current_chunk_id << " (" << reclaimed
+                                          << " a-vals) from worker " << (int)wid;
                         }
+                        wt.current_chunk_id = UINT32_MAX;
                         if (comm_backend_) {
                             comm_backend_->disconnectPeer(wid);
                         }
@@ -5939,6 +6450,23 @@ void MPQSOrchestrator::networkLoop() {
                         if (workers_flushed >= total_workers) {
                             all_workers_flushed = true;
                         }
+                    }
+                }
+
+                // --- P3: proactive re-dispatch sweep ---
+                // Drain reclaimed/returned chunks (e.g. from a failed CHUNK_ASSIGN
+                // send, P1) to any ALIVE worker that currently has no chunk, even if
+                // it never re-requests. assignChunkTo guards on current_chunk_id ==
+                // UINT32_MAX and only sets it on a confirmed send, so this never
+                // double-assigns and is idempotent with the P2 re-request path.
+                if (cluster_accumulator_ && cluster_work_pool_ && cluster_scheduler_ &&
+                    !cluster_accumulator_->targetReached() &&
+                    !cluster_work_pool_->exhausted()) {
+                    for (auto& [wid, wt] : worker_trackers) {
+                        if (!wt.alive || wt.current_chunk_id != UINT32_MAX) continue;
+                        if (cluster_work_pool_->exhausted()) break;
+                        (void)assignChunkTo(wid, /*debug_droppable=*/false,
+                                            /*is_redispatch=*/true);
                     }
                 }
             }
@@ -6146,7 +6674,14 @@ void MPQSOrchestrator::networkLoop() {
         LOG(LOG_INFO) << "[Thread A] CPU LP: inserts=" << cluster_cpu_lp_->totalInserts()
                       << " matches=" << cluster_cpu_lp_->totalMatches()
                       << " combines=" << cluster_cpu_lp_->totalCombines()
+                      << " dup_dropped=" << cluster_cpu_lp_->totalDupDropped()
                       << " witnesses=" << cluster_cpu_lp_->witnesses();
+        if (cluster_cpu_lp_->totalDupDropped() > 0) {
+            LOG(LOG_WARNING) << "[Thread A] CPU LP: dropped "
+                             << cluster_cpu_lp_->totalDupDropped()
+                             << " identical-partial 'matches' (same sqrt_Q) — "
+                             << "indicates cross-node a-range overlap; verify range bounding";
+        }
     }
 
     // --- SM3: Cluster sieve telemetry table (coordinator only) ---
@@ -6158,6 +6693,18 @@ void MPQSOrchestrator::networkLoop() {
         uint64_t total_full = 0, total_partial = 0, total_lp = 0;
         uint32_t total_chunks = 0;
         uint64_t total_a = 0;
+
+        // Fix A: node 0's self-assigned (overflow + initial) chunks/a-vals are
+        // tracked by the scheduler — Thread B records them via recordCompletion(0,
+        // …) — since node 0 never traverses the CHUNK_COMPLETE handler that bumps
+        // these counters for remote workers. Surface them so the table reflects
+        // the coordinator's reclaimed sieve work. (Node-0 Full/Partial/Duration
+        // already update on Thread A from the DirectChannel drain.)
+        if (cluster_scheduler_ && !node_telemetry.empty()) {
+            const auto& t0 = cluster_scheduler_->throughput(0);
+            node_telemetry[0].chunks_completed = t0.chunks_completed;
+            node_telemetry[0].a_values_consumed = t0.total_a_vals;
+        }
 
         for (auto& t : node_telemetry) {
             double duration = t.last_relation_time - t.first_relation_time;
@@ -6195,6 +6742,16 @@ void MPQSOrchestrator::networkLoop() {
                       << " |          |         |         "
                       << "| " << std::setw(6) << total_chunks
                       << " | " << std::setw(8) << total_a;
+
+        // P5: chunk-delivery fault-tolerance telemetry.
+        LOG(LOG_INFO) << "Chunk delivery: failed CHUNK_ASSIGN sends="
+                      << failed_assign_sends
+                      << ", recovery re-dispatches=" << redispatched_chunks;
+        if (failed_assign_sends > 0) {
+            LOG(LOG_WARNING) << "[Thread A] " << failed_assign_sends
+                             << " CHUNK_ASSIGN send(s) failed and were re-dispatched "
+                             << "(no worker stranded; see P1/P2/P3 recovery)";
+        }
     }
 
     // --- Aggregate end-of-run summary ---

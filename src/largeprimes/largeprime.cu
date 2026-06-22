@@ -425,6 +425,16 @@ __global__ void global_combine_kernel(
         uint64_t lp_witness = (uint64_t)global_witness_view.large_primes[target_global_idx];
         if (lp_input != lp_witness) return;  // Tag collision, not a true match — skip
 
+        // TODO (cluster duplicate-partial follow-up, CHANGELOG [1.0.3a]): no sqrt_Q
+        // identity guard here. If input and witness are the SAME relation (identical
+        // sqrt_Q), combining yields a perfect square (X≡Y → trivial sqrt). NOT
+        // load-bearing: this kernel runs only in solo/single-node mode, which emits
+        // no duplicate partials (duplicates are a cross-node artifact, and the CPU
+        // matcher cpu_lp.cu::combinePartials carries the canonical guard). If this
+        // path is ever fed aggregated multi-node partials, add:
+        //   if (input_view.sqrt_Q[my_idx] == global_witness_view.sqrt_Q[target_global_idx]) return;
+        // See logs/preproc_exp/dup_diag/.
+
         // 1. Algebra Merge
         mpqs::uint512 Q_res = input_view.sqrt_Q[my_idx];
         Q_res.mul_mod(global_witness_view.sqrt_Q[target_global_idx], N);

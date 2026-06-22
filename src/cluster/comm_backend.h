@@ -27,6 +27,18 @@ struct RecvMessage {
     bool      valid = false;    ///< True if a message was successfully received
 };
 
+/// Why a (blocking) receive returned without a message.
+/// Lets callers distinguish a genuine poll timeout (keep waiting) from a
+/// closed/errored socket (peer gone — stop waiting). Collapsing both to a bare
+/// `false` previously caused a tight spin-and-log-flood in the worker
+/// chunk-wait loop when the coordinator closed the connection (recv()==0
+/// returns immediately, not after the full timeout).
+enum class RecvStatus {
+    GOT_MSG,   ///< A complete message was received (return value true).
+    TIMEOUT,   ///< Poll interval elapsed with no message; socket still alive.
+    CLOSED,    ///< Socket closed (EOF) or errored — peer is gone.
+};
+
 /// Abstract communication backend for cluster sieve.
 ///
 /// Encapsulates all transport-level concerns: connection management, framing,
@@ -66,8 +78,12 @@ public:
     virtual bool recv(RecvMessage& out) = 0;
 
     /// Blocking receive with timeout (milliseconds). 0 = indefinite wait.
+    /// @param out_status  Optional: receives why the call returned (GOT_MSG /
+    ///                    TIMEOUT / CLOSED). Lets callers tell a benign poll
+    ///                    timeout from a dead peer. May be nullptr.
     /// @return true if a complete message was received before timeout
-    virtual bool recvBlocking(RecvMessage& out, uint32_t timeout_ms = 0) = 0;
+    virtual bool recvBlocking(RecvMessage& out, uint32_t timeout_ms = 0,
+                              RecvStatus* out_status = nullptr) = 0;
 
     // --- Collective ---
 

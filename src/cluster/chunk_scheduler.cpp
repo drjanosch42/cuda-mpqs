@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
+#include <string>
 
 namespace mpqs::cluster {
 
@@ -100,6 +102,10 @@ std::vector<ChunkScheduler::ContiguousRange> ChunkScheduler::computeContiguousRa
             }
         }
 
+        // DEBUG repro harness (DEFAULT-INERT): shrink initial ranges to force
+        // overflow turnover. Cap is a multiple of H, preserving HC alignment.
+        count = applyDebugWindowCap(count);
+
         ContiguousRange r;
         r.node_id = static_cast<uint8_t>(i);
         r.start = cursor;
@@ -162,6 +168,10 @@ std::vector<ChunkScheduler::ContiguousRange> ChunkScheduler::computeContiguousRa
             if (Q > 1) count = ((count + Q - 1) / Q) * Q;
         }
 
+        // DEBUG repro harness (DEFAULT-INERT): shrink initial ranges to force
+        // overflow turnover. Cap is a multiple of H, preserving HC alignment.
+        count = applyDebugWindowCap(count);
+
         ContiguousRange r;
         r.node_id = static_cast<uint8_t>(i);
         r.start   = cursor;
@@ -184,6 +194,24 @@ uint64_t ChunkScheduler::roundToQuantum(uint64_t count) const {
 uint64_t ChunkScheduler::alignToHypercube(uint64_t count) const {
     if (H_ == 0) return count;
     return ((count + H_ - 1) / H_) * H_;
+}
+
+uint64_t ChunkScheduler::applyDebugWindowCap(uint64_t count) const {
+    // Parse MPQS_DEBUG_MAX_CHUNK_WINDOWS exactly once (0 = disabled).
+    static const uint64_t cap_windows = [] {
+        const char* env = std::getenv("MPQS_DEBUG_MAX_CHUNK_WINDOWS");
+        if (!env || !*env) return uint64_t{0};
+        try {
+            const long long w = std::stoll(std::string(env));
+            return (w >= 1) ? static_cast<uint64_t>(w) : uint64_t{0};
+        } catch (...) {
+            return uint64_t{0};
+        }
+    }();
+    if (cap_windows == 0) return count;  // default-inert
+    const uint64_t window = (H_ > 0) ? H_ : 1;
+    const uint64_t cap = cap_windows * window;
+    return std::min(count, cap);
 }
 
 uint64_t ChunkScheduler::minChunk() const {
@@ -215,7 +243,7 @@ uint64_t ChunkScheduler::nextChunkSize(uint8_t worker_id) const {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = throughput_.find(worker_id);
     if (it == throughput_.end() || it->second.chunks_completed < kCalibrationChunks)
-        return baseChunk();
+        return applyDebugWindowCap(baseChunk());
 
     // Compute mean a_vals_per_sec across all workers with >= kCalibrationChunks
     double total_aps = 0.0;
@@ -236,7 +264,10 @@ uint64_t ChunkScheduler::nextChunkSize(uint8_t worker_id) const {
     // Prefer hypercube alignment, then quantum rounding
     uint64_t aligned = alignToHypercube(size);
     aligned = roundToQuantum(aligned);
-    return std::clamp(aligned, minChunk(), maxChunk());
+    // DEBUG repro harness (DEFAULT-INERT): cap overflow chunk size to force many
+    // CHUNK_COMPLETE -> CHUNK_ASSIGN cycles. Applied after the [min,max] clamp so
+    // the cap is the binding upper bound when armed.
+    return applyDebugWindowCap(std::clamp(aligned, minChunk(), maxChunk()));
 }
 
 const WorkerThroughput& ChunkScheduler::throughput(uint8_t worker_id) const {

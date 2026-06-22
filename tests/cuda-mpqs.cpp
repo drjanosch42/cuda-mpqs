@@ -262,6 +262,8 @@ void print_usage(const char* prog_name) {
               << "  --cluster_init_timeout <SEC> Init window: worker retries + coordinator accept (default 300)\n"
               << "  --cluster_node_weights <W>  Comma-separated per-node weights (overrides SM*clock)\n"
               << "  --cluster_headroom <PCT>    Per-node headroom percent [Default: 10]\n"
+              << "  --cluster_pool_oversize <X> a-value overflow-pool over-provisioning multiplier\n"
+              << "                              (coordinator only; >1 enlarges on-demand pool) [Default: 1.0]\n"
               << "\n--- Sieve stage ---\n"
               << "  --probe_timeout <SEC>  Hard timeout for sieve probes (default 120.0)\n"
               << "  --sieve_batch_size <N> Sieving batch size (Default 0 = legacy sieving)\n"
@@ -444,6 +446,9 @@ ParsedArgs parse_args(int argc, char** argv) {
         }
         else if (arg == "--cluster_headroom" && i+1 < argc) {
             args.config.cluster_headroom = std::stod(argv[++i]);
+        }
+        else if (arg == "--cluster_pool_oversize" && i+1 < argc) {
+            args.config.cluster_pool_oversize = std::stod(argv[++i]);
         }
 
         // --- Tuning ---

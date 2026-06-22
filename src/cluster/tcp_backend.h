@@ -33,7 +33,8 @@ public:
     void finalize() override;
     bool send(uint8_t target_id, MsgType type, const void* data, uint32_t len) override;
     bool recv(RecvMessage& out) override;
-    bool recvBlocking(RecvMessage& out, uint32_t timeout_ms) override;
+    bool recvBlocking(RecvMessage& out, uint32_t timeout_ms,
+                      RecvStatus* out_status = nullptr) override;
     void broadcast(MsgType type, const void* data, uint32_t len) override;
     void barrier() override;
     uint32_t peerCount() const override;

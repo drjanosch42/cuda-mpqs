@@ -59,6 +59,18 @@ bool CPULargePrimeTable::combinePartials(
     const mpqs::structures::HostRelationBatch& batch, size_t idx,
     mpqs::structures::HostRelationBatch& output)
 {
+    // Identity guard (defense-in-depth against cross-node duplicate partials):
+    // if the incoming partial is byte-identical to the stored one (same sqrt_Q),
+    // the two share the same large prime *and* the same Q-root, so combining them
+    // produces a perfect square (X ≡ Y) and a trivial sqrt. Skip without
+    // combining. sqrt_Q is the cheapest discriminator and is sufficient — two
+    // distinct relations sharing an LP have different (a,b) hence different
+    // sqrt_Q. See logs/preproc_exp/dup_diag/.
+    if (stored.sqrt_Q == batch.sqrt_Q[idx]) {
+        total_dup_dropped_++;
+        return false;
+    }
+
     // sqrt_Q values are in standard form — transform, multiply, reduce.
     mpqs::uint512 a_mont = mont_.transform(stored.sqrt_Q);
     mpqs::uint512 b_mont = mont_.transform(batch.sqrt_Q[idx]);

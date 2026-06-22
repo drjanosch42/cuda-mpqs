@@ -98,6 +98,19 @@ uint64_t WorkPool::reclaimWork(uint8_t worker_id) {
     return reclaimed;
 }
 
+uint64_t WorkPool::returnChunk(uint32_t chunk_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = in_flight_.begin(); it != in_flight_.end(); ++it) {
+        if (it->chunk_id == chunk_id) {
+            uint64_t returned = it->unit.count;
+            returned_.push_back(it->unit);
+            in_flight_.erase(it);
+            return returned;
+        }
+    }
+    return 0;
+}
+
 void WorkPool::reclaimPartial(uint32_t chunk_id, uint64_t consumed_count) {
     std::lock_guard<std::mutex> lock(mutex_);
 

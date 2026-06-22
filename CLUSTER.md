@@ -19,7 +19,7 @@ For architecture details see [docs/modules/cluster.md](docs/modules/cluster.md).
     --lp1_hash_bits 21 --lp1_max_witnesses 8388608 --verbose
 
 # Terminal 2 -- Worker (retries automatically until coordinator is up)
-ssh ${USER}@conceptd "cd ~/dev/cuda-mpqs && ./build/tests/cuda-mpqs --RSA100 \
+ssh user@worker-host "cd /path/to/cuda-mpqs && ./build/tests/cuda-mpqs --RSA100 \
     --cluster_mode worker --coordinator_host <coordinator-ip> --coordinator_port 9300 \
     --sieve_batch_size 2 --verbose"
 ```
@@ -42,6 +42,7 @@ ssh ${USER}@conceptd "cd ~/dev/cuda-mpqs && ./build/tests/cuda-mpqs --RSA100 \
 |------|------|---------|-------------|
 | `--listen_port` | `uint16_t` | 9100 | TCP port to listen on |
 | `--expected_workers` | `uint32_t` | 0 | Number of remote workers to wait for (0 = coordinator-only with Thread B local sieve) |
+| `--cluster_pool_oversize` | `double` | 1.0 | a-value **overflow**-pool over-provisioning multiplier. `>1` enlarges the on-demand pool of polynomial a-value windows the coordinator hands out once initial contiguous ranges are exhausted, so it cannot run dry before the relation target is met. Overflow windows are drawn only on demand and the run still stops at the relation cap, so over-sizing is essentially free. Coordinator-only; no effect on initial ranges or solo/single-node behaviour. |
 
 ### Worker Flags
 
@@ -63,6 +64,39 @@ ssh ${USER}@conceptd "cd ~/dev/cuda-mpqs && ./build/tests/cuda-mpqs --RSA100 \
 The transport is fixed to TCP: there is **no** `--transport` CLI flag. The `MPQSConfig::transport` field defaults to `"tcp"` and TCP is the only backend.
 
 All standard flags (`--fb_bound`, `--sieve_bound`, `--lp1_bound`, `--sieve_batch_size`, `--cuda_graph_unroll`, etc.) work identically to solo mode and can be set independently per node. Workers receive N, factor base, and polynomial parameters from the coordinator via `WORK_ASSIGN`.
+
+---
+
+## Work Distribution and Reliability
+
+Each node is first assigned an initial contiguous range of polynomial a-values,
+split across nodes by throughput weight (SM × clock auto-detection, overridable
+via `--cluster_node_weights`). Once a node exhausts its initial range with the
+relation target still unmet, it draws additional work on demand from the
+coordinator's **overflow pool** of a-value windows.
+
+- **Overflow pool sizing.** The overflow pool is sized from the relation target
+  (not a fixed multiple of the initial total) and clamped to the a-factor walk's
+  capacity, so it does not run dry before the target is met. Enlarge it further
+  with `--cluster_pool_oversize <X>` (`>1`); because windows are drawn only on
+  demand and the run stops at the relation cap, over-sizing is essentially free.
+- **Coordinator local GPU at full duty.** The coordinator's own GPU keeps sieving
+  for the whole run: after finishing its initial bounded range it self-assigns
+  overflow chunks from the same local pool that feeds workers (its chunks are
+  disjoint from every worker's by construction), instead of idling.
+- **Delivery robustness.** Lost or delayed overflow-chunk assignments no longer
+  strand a worker: assignments are send-checked and returned to the pool on
+  failure, idle workers re-request work, and the coordinator proactively re-hands
+  reclaimed chunks — so a node never sits idle while assignable work remains.
+- **Cross-node correctness.** Large-prime partials combined across nodes are
+  guarded against accidentally pairing a relation with a byte-identical duplicate
+  of itself (which would yield a trivial square root); the matcher drops such
+  self-pairs.
+
+Solo and single-node runs are unaffected by all of the above (no overflow pool,
+no remote workers). For the full design — wire protocol, chunk scheduler, overflow
+pool internals, and the delivery-recovery state machine — see
+[docs/modules/cluster.md](docs/modules/cluster.md).
 
 ---
 
@@ -113,18 +147,17 @@ This telemetry is unconditional — it runs during every cluster sieve, not just
 
 ## Setup Requirements
 
-1. **Build on all nodes.** Each node must have a built binary at `~/dev/cuda-mpqs/build/tests/cuda-mpqs`.
+1. **Build on all nodes.** Each node must have a built binary at `/path/to/cuda-mpqs/build/tests/cuda-mpqs`.
    - RTX / x86: `cmake -B build -DGPU_TARGET=native && cmake --build build -j16`
    - Jetson: `cmake -B build -DGPU_TARGET=Orin && cmake --build build -j4`
 
-2. **Sync code via git.** Push from the development node, pull on all other nodes:
+2. **Sync code to every node.** Build the same revision on all nodes (e.g. pull
+   the shared repository and rebuild on each remote host):
    ```bash
-   git push origin main
-   ssh ${USER}@conceptd "cd ~/dev/cuda-mpqs && git pull && cmake --build build -j16"
-   ssh ${USER}@<jetson-host-1> "cd ~/dev/cuda-mpqs && git pull && cmake --build build -j4"
+   ssh user@worker-host "cd /path/to/cuda-mpqs && git pull && cmake --build build -j16"
    ```
 
-3. **SSH access.** All nodes must be reachable via `ssh ${USER}@<hostname>` without interactive password prompt (key-based auth).
+3. **SSH access.** All nodes must be reachable via `ssh user@<hostname>` without interactive password prompt (key-based auth).
 
 4. **Network.** Nodes must be on the same LAN. The coordinator's LAN IP must be routable from all workers. Network is not a bottleneck: RSA-100 transfers ~59 MB total relation data across the entire run.
 
@@ -200,48 +233,22 @@ For Jetson workers with cold JIT cache, use `--cuda_graph_unroll 0` to skip grap
 
 ## Launch Scripts
 
-All scripts are in `tools/cluster/`. They handle coordinator-first ordering, checkpoint cleanup, and per-node parameter tuning. The directory covers three configurations: RTX 2-node, Jetson 2-node, and 4-node heterogeneous.
+A ready-to-edit launch template ships at `tools/cluster/example_2node.sh`. It
+starts the coordinator locally in the background and one worker on a remote host
+over SSH, with the detach pattern described under
+[Headless Launch Pattern](#headless-launch-pattern). Edit the coordinator IP, the
+worker SSH target, the binary paths, and the per-node parameters before use:
 
-**RTX 2-node** (localhost RTX 5070 Ti coordinator + conceptd RTX 2080 Super MaxQ worker):
-
-| Script | Input | Description |
-|--------|-------|-------------|
-| `rtx_cluster_default_launch.sh` | Default (~80d) | Quick validation. RTX coordinator (bs=32), 2080 worker (bs=2). |
-| `rtx_cluster_launch.sh` | RSA-100 | 2-node RTX cluster with full LP and CUDA graph. |
-| `rtx_cluster_rsa110_launch.sh` | RSA-110 | 2-node RTX RSA-110 with F=9M, L=20T, hash_bits=21. |
-
-**Jetson 2-node** (<jetson-host-1> coordinator + <jetson-host-2> worker):
-
-| Script | Input | Description |
-|--------|-------|-------------|
-| `jetson_cluster_launch.sh` | RSA-100 | 2-node Jetson cluster. Worker uses `cuda_graph_unroll=0`. |
-| `jetson_90d_cluster_launch.sh` | 90-digit | 2-node Jetson 90d run with M6 matrix preprocessing. |
-| `jetson_rsa100_launch.sh` | RSA-100 | 2-node Jetson RSA-100 baseline. |
-| `jetson_rsa100_m6v2_launch.sh` | RSA-100 | 2-node Jetson RSA-100 with M6v2 matrix preprocessing. |
-| `jetson_rsa110_m6v3_launch.sh` | RSA-110 | 2-node Jetson RSA-110 with M6v3 matrix preprocessing. |
-| `jetson_rsa110_overnight_launch.sh` | RSA-110 | 2-node Jetson RSA-110 overnight run. Uses `nohup` for SSH resilience. |
-| `jetson_rsa110_overnight_launch_v2.sh` | RSA-110 | Variant: both nodes use CUDA graph capture. |
-| `jetson_rsa110_overnight_launch_v3.sh` | RSA-110 | Variant: 200% oversieving + disk I/O. |
-| `jetson_rsa110_overnight_launch_v4.sh` | RSA-110 | Variant: 100% oversieving + disk I/O + character columns. |
-| `jetson_rsa110_overnight_v5_launch.sh` | RSA-110 | Variant: F=9M, M=131072, L=20T. |
-| `rsa110_jetson_2node_2026_04_27.sh` | RSA-110 | Dated reproduction script (M12-S5b). |
-| `rsa110_jetson_2node_2026_04_28.sh` | RSA-110 | Dated reproduction script (post-M12). |
-
-**4-node heterogeneous** (localhost + conceptd + <jetson-host-1> + <jetson-host-2>):
-
-| Script | Input | Description |
-|--------|-------|-------------|
-| `rtx_4node_rsa100_launch.sh` | RSA-100 | 4-node heterogeneous cluster (3 workers). |
-| `rtx_4node_rsa110_launch.sh` | RSA-110 | 4-node RSA-110 with L=20T, hash_bits=21. |
-
-**Usage:**
 ```bash
-bash tools/cluster/rtx_cluster_launch.sh [extra_coordinator_flags]
+bash tools/cluster/example_2node.sh
 ```
 
-**Logs** are written to `/tmp/` on the machine running the script:
-- `/tmp/rtx_cluster_coord.log` -- coordinator output
-- `/tmp/rtx_cluster_worker.log` -- worker output
+The template is intentionally minimal; adapt it for additional workers,
+per-node parameter tuning (see [Platform-Specific Parameters](#platform-specific-parameters)),
+heterogeneous topologies, and your own logging conventions. A robust launch
+script typically also performs the [pre-flight checks](#pre-flight-checklist)
+(stale-process detection, GPU availability, code sync, build) before launching
+each node, and writes per-node logs to a known location (e.g. under `/tmp/`).
 
 ---
 
@@ -304,43 +311,23 @@ No `sleep` between launches is required. Workers that start before the coordinat
 
 ### Pre-flight Checklist
 
-All launch scripts run a standard pre-flight sequence before launching:
+A robust launch script should run a standard pre-flight sequence before launching
+each node:
 
 1. **Process conflict check** — `pgrep -x cuda-mpqs`: aborts if a prior run is still alive
 2. **GPU availability** — `nvidia-smi --query-gpu=name,memory.free`: confirms GPU is accessible
 3. **Code sync** — `git pull --ff-only`: ensures all nodes run the same binary
 4. **Build** — `cmake --build build -jN`: compiles any changed files
 
-### cluster_watch Integration
-
-Scripts auto-start `cluster_watch` in `--text-continuous` mode after launching all nodes:
-
-```bash
-cd /home/${USER}/dev/cluster-watch && python3 -m cluster_watch \
-    --text-continuous --interval 5 \
-    --nodes <node1>,<node2>,... \
-    --telemetry /tmp/cluster-watch-telemetry \
-    >> /tmp/cluster-watch-<script>-<timestamp>.log 2>&1 &
-```
-
-- Log: `/tmp/cluster-watch-<script>-<timestamp>.log`
-- Telemetry JSONL: `/tmp/cluster-watch-telemetry/`
-- `--nodes` is set to exactly the nodes launched by the script
-- `cluster_watch` runs in the background; the script exits immediately after printing monitor commands
-
 ---
 
 ## Monitoring
 
-The `cluster_watch` tool (at `~/dev/cluster-watch/`) provides real-time monitoring:
-- Relation progress across all nodes
-- Per-worker heartbeat status and throughput
-- LP matching rates on the coordinator
-- ETA based on global relation accumulation rate
-
-Alternatively, tail the log files directly:
+The coordinator emits aggregate progress, ETA, and LP-yield telemetry to its log
+every ~5 seconds (see [Cluster Telemetry](#cluster-telemetry)). For live
+monitoring, tail the coordinator and worker logs:
 ```bash
-tail -f /tmp/rtx_cluster_coord.log
+tail -f /tmp/coord.log
 ```
 
 ---
@@ -362,8 +349,8 @@ tail -f /tmp/rtx_cluster_coord.log
 ### Low GPU utilization on workers
 
 **Symptom:** Worker GPU utilization is 30-40% instead of 90%+.
-**Cause (M3 and earlier):** `NetworkDataTap::onBatchComplete()` serialized synchronously on the sieve thread with small `batch_size`.
-**Fix (M5):** `AsyncNetworkDataTap` uses an SPSC ring buffer + dedicated I/O thread. `onBatchComplete()` is now <50us. If utilization is still low, increase `--sieve_batch_size` to amortize per-batch overhead.
+**Cause:** if `onBatchComplete()` serializes synchronously on the sieve thread with a small `batch_size`, per-batch overhead dominates.
+**Fix:** `AsyncNetworkDataTap` uses an SPSC ring buffer + dedicated I/O thread, making `onBatchComplete()` <50us. If utilization is still low, increase `--sieve_batch_size` to amortize per-batch overhead.
 
 ### LP slab overflow (zero LP contribution)
 
@@ -392,35 +379,47 @@ tail -f /tmp/rtx_cluster_coord.log
 
 ---
 
-## Hardware Inventory
+## Example Heterogeneous Topology
 
-| Node | GPU | SM | SMs | VRAM | LAN IP | Build Target |
-|------|-----|----|-----|------|--------|-------------|
-| localhost | RTX 5070 Ti | 12.0 | 70 | 16 GB GDDR7 | <coordinator-ip> | `native` |
-| conceptd | RTX 2080 Super MaxQ | 7.5 | ~48 | 8 GB GDDR6 | -- | `Turing` |
-| <jetson-host-1> | Jetson Orin Nano Super | 8.7 | 8 | 8 GB unified | <worker-ip> | `Orin` |
-| <jetson-host-2> | Jetson Orin Nano Super | 8.7 | 8 | 8 GB unified | -- | `Orin` |
+The cluster code is GPU-architecture agnostic: nodes of different SM
+generations and memory sizes can cooperate, with per-node parameters tuned
+independently (see [Platform-Specific Parameters](#platform-specific-parameters)).
+An example mixed topology — one Blackwell desktop GPU as coordinator plus Turing
+and Jetson Orin workers — illustrates the supported range:
 
-Access: `ssh ${USER}@<hostname>`, repo at `~/dev/cuda-mpqs` on all nodes.
+| Role | GPU class | SM | SMs | VRAM | Build Target |
+|------|-----------|----|-----|------|-------------|
+| Coordinator | RTX 5070 Ti (Blackwell) | 12.0 | 70 | 16 GB GDDR7 | `native` |
+| Worker | RTX 2080 Super MaxQ (Turing) | 7.5 | ~48 | 8 GB GDDR6 | `Turing` |
+| Worker | Jetson Orin Nano Super | 8.7 | 8 | 8 GB unified | `Orin` |
 
-Validated per-node optimal parameters and performance data are maintained
-alongside the cluster launch scripts under `tools/cluster/`.
+All nodes must be reachable over SSH without an interactive password prompt
+(key-based auth) and check out the same repository revision (see
+[Setup Requirements](#setup-requirements)).
 
 ---
 
 ## Validated Results
 
-### 2-Node RTX RSA-100 (localhost + conceptd)
+### 2-Node RTX RSA-100 (Blackwell coordinator + Turing worker)
 
-**106.90s** core time (M5, vs 112.64s at M3). RTX coordinator with `batch_size=32`, 2080 Super MaxQ worker with `batch_size=2`.
+**106.90s** core time. RTX coordinator with `batch_size=32`, RTX 2080 Super MaxQ worker with `batch_size=2`.
 
-### 2-Node RTX RSA-110 (localhost + conceptd)
+### 2-Node RTX RSA-110 (Blackwell coordinator + Turing worker)
 
-**1009.65s** core time (M5). RTX coordinator + 2080 Super MaxQ worker. F=9M, L=20T, hash_bits=21.
+**1009.65s** core time. RTX coordinator + RTX 2080 Super MaxQ worker. F=9M, L=20T, hash_bits=21.
 
-### 2-Node Jetson RSA-100 (jetson-01 + jetson-02)
+### 2-Node Jetson RSA-100 (two Jetson Orin nodes)
 
-**1692.97s (28m 13s)** core time (M5, 22% faster than M3 baseline of 2182s).
+**1692.97s (28m 13s)** core time.
+
+### Multi-node A100 (RSA-130)
+
+RSA-130 has been factored end-to-end on an 8-GPU A100-SXM4-40GB cluster (2 nodes
+× 4 GPUs, 1 GPU per process) on the PC2 cluster, validating the v1.0.3 cluster
+correctness and performance fixes at scale (overflow-chunk allocator, coordinator
+self-assign keeping the local GPU at full duty, and the duplicate-partial
+correctness guard).
 
 ### Solo Regression
 

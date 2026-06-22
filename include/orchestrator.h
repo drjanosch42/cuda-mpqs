@@ -250,6 +250,14 @@ struct MPQSConfig {
     uint32_t cluster_init_timeout = 300;      ///< Seconds: worker retry window + coordinator accept timeout
     std::string cluster_node_weights;         ///< Comma-separated per-node weights (overrides SM×clock)
     double cluster_headroom = 10.0;           ///< Per-node headroom percent (0 = exact, default 10)
+    double cluster_pool_oversize = 1.0;       ///< a-value pool over-provisioning multiplier (cluster
+                                              ///< coordinator only; >1 enlarges the on-demand OVERFLOW
+                                              ///< pool of polynomial windows so it cannot run dry before
+                                              ///< the relation target is met). Overflow windows are pure
+                                              ///< index space drawn only after a node's initial range is
+                                              ///< exhausted with the target still unmet, so over-sizing
+                                              ///< is essentially free — the run still stops at the
+                                              ///< relation cap. Does NOT affect initial contiguous ranges.
 
     // Worker chunk tracking (set from WORK_ASSIGN / CHUNK_ASSIGN)
     uint64_t poly_range_start = 0;   ///< First a-index for this node (0 = natural start)

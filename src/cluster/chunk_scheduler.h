@@ -134,6 +134,15 @@ private:
 
     /// Round count up to nearest multiple of hypercube size H_.
     uint64_t alignToHypercube(uint64_t count) const;
+
+    /// DEBUG repro harness (DEFAULT-INERT): when the environment variable
+    /// MPQS_DEBUG_MAX_CHUNK_WINDOWS=<W> is set (W>=1), cap any computed chunk
+    /// `count` to W hypercube windows (W * max(H_,1) a-values). This shrinks
+    /// both the initial contiguous ranges and the overflow chunks so that a
+    /// short run produces many CHUNK_COMPLETE -> CHUNK_ASSIGN turnover cycles,
+    /// exercising the overflow-assignment path. Returns the (possibly) capped
+    /// count; identity when the var is unset/invalid (parsed once per process).
+    uint64_t applyDebugWindowCap(uint64_t count) const;
 };
 
 } // namespace mpqs::cluster

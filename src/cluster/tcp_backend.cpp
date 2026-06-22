@@ -236,15 +236,23 @@ bool TCPBackend::recv(RecvMessage& out) {
     }
 }
 
-bool TCPBackend::recvBlocking(RecvMessage& out, uint32_t timeout_ms) {
+bool TCPBackend::recvBlocking(RecvMessage& out, uint32_t timeout_ms,
+                              RecvStatus* out_status) {
     if (is_coordinator_) {
-        return recvFromEpoll(out, static_cast<int>(timeout_ms));
+        // Coordinator (epoll) path: external behaviour unchanged. epoll-level
+        // peer-close is handled elsewhere (recvFromEpoll / disconnectPeer), so a
+        // bare false here is reported as a benign TIMEOUT to the optional status.
+        bool got = recvFromEpoll(out, static_cast<int>(timeout_ms));
+        if (out_status) *out_status = got ? RecvStatus::GOT_MSG : RecvStatus::TIMEOUT;
+        return got;
     } else {
         coord_sock_.setRecvTimeout(timeout_ms);
         MsgType type;
         std::vector<uint8_t> payload;
-        bool got = coord_sock_.recvMsg(type, payload);
+        RecvStatus status = RecvStatus::TIMEOUT;
+        bool got = coord_sock_.recvMsg(type, payload, &status);
         coord_sock_.setRecvTimeout(0);
+        if (out_status) *out_status = status;
         if (got) {
             out.sender_id = 0;
             out.type = type;
