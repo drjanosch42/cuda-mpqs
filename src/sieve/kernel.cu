@@ -118,7 +118,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
         // Roots are now unsigned uint32_t residues [0, p-1]
         uint32_t root1 = 0;
         uint32_t root2 = 0;
-        rootsFromPolyId(polyIdPrefix, fs_params.shc_dim, curPrimeData, root1, root2);
+        rootsFromPolyId(polyIdPrefix, fs_params.shc_dim, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
 
         reducedSieveStart = ((sieveIntervalStart % p) + p) % p;
 
@@ -151,7 +151,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
                 uint32_t root2 = (uint32_t)(((offsets2[i] % p) + p) % p);
 
                 // Update roots for Gray code step (uses uint32_t internally)
-                advanceRoots(prevPolyId, polyId, curPrimeData, root1, root2);
+                advanceRoots(prevPolyId, polyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
 
                 reducedSieveStart = ((sieveIntervalStart % p) + p) % p;
 
@@ -403,7 +403,7 @@ __global__ void globalMetaSieveKernel(devicePointers dev_pointers, fixedSievingP
                 int log2p = (31 - __clz(p)) * (1 - curPrimeData.inactive);
                 uint32_t root1;
                 uint32_t root2;
-                rootsFromPolyId(fullPolyId, shc_dim, curPrimeData, root1, root2);
+                rootsFromPolyId(fullPolyId, shc_dim, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)currentPrimeIndex, fs_params.fb_size, root1, root2);
                 int maxOffsetCount = ((gms_conf.num_activeBlocksPerCycle * gs_conf.sievingBlockSize) / (primeData[currentPrimeIndex - threadIdx.x].p)) + 1; //using the first prime as an upper bound to have a constant inner loop length
                 int reducedSieveStart = ((currentStart % (int)p) + (int)p ) % (int)p;// Formula: ((S % p) + p) % p ensures result is in [0, p-1]
 
@@ -460,7 +460,7 @@ __global__ void globalMetaSieveKernel(devicePointers dev_pointers, fixedSievingP
                     polyIndex = modAdd(polyIndex, 1, gms_conf.polyBlockSize);
                     polyId = gray(polyIndex);
                     fullPolyId = fullPolyIdPrefix | polyId;
-                    advanceRoots(prevFullPolyId, fullPolyId, curPrimeData, root1, root2);
+                    advanceRoots(prevFullPolyId, fullPolyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)currentPrimeIndex, fs_params.fb_size, root1, root2);
                 }
                 //poly loop finished, nothing to do here
             }
@@ -505,7 +505,7 @@ __global__ void initPrimeDataKernel(devicePointers dev_pointers, generalSievingC
     int stride = gridDim.x * blockDim.x;
     int id = blockIdx.x * blockDim.x + threadIdx.x;
 
-    uint512 local_B_values[16];
+    uint512 local_B_values[MAX_SHC_DIM];
     for (int i = 0; i < shc_dim; i++) {
         local_B_values[i] = B_values[i];
     }
@@ -537,11 +537,14 @@ __global__ void initPrimeDataKernel(devicePointers dev_pointers, generalSievingC
 	// Note: Field name updated to match sieving_data_structs.h
         tmpPrimeData.mod_inverse_a = result;
 
-        //now calculate the B_values used to update roots modulo p
+        //now calculate the B_values used to update roots modulo p.
+        // Stored in the separate column-major device array dev_primeBValues
+        // [j*fb_size + i] (coalesced across the grid-stride threads at fixed j),
+        // NOT in the per-prime struct (which the hot sieve streams every pass).
         for (int j = 0; j < shc_dim; j++) {
             // Reduce B_value mod p first, then multiply by inverse_a
             uint32_t b_val_mod = local_B_values[j].mod_uint32(p);
-            tmpPrimeData.B_values[j] = (uint32_t)(((uint64_t)b_val_mod * result) % p);
+            dev_pointers.dev_primeBValues[(size_t)j * fb_size + i] = (uint32_t)(((uint64_t)b_val_mod * result) % p);
         }
 
         tmpPrimeData.p = p;
@@ -590,6 +593,10 @@ void loadSievingData(std::vector<uint32_t>& factorBase,
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_a_factors, shc_dim * sizeof(uint32_t)));
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_B_values, shc_dim * sizeof(uint512)));
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_primeData, factorBase.size() * sizeof(primeDataSIQS)));
+    // Per-prime Gray-code B-update values, decoupled from primeDataSIQS (column-major,
+    // sized to the actual run shc_dim, not MAX_SHC_DIM). Persistent across the
+    // candidate-reload path (allocated once here, reused by loadSievingDataParamTest).
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_primeBValues, (size_t)factorBase.size() * shc_dim * sizeof(uint32_t)));
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_globalBucketEntries, ((long long)gs_conf.num_polysPerSieveCall * gs_conf.num_sievingBlocksPerSieveCall * gs_conf.globalBucketSize * sizeof(uint64_t))));
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_globalBucketCounts, gs_conf.num_polysPerSieveCall * gs_conf.num_sievingBlocksPerSieveCall*sizeof(uint32_t)));
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_blockRelationCounts, ss_conf.num_threadBlocks * sizeof(uint32_t)));
@@ -609,16 +616,42 @@ void loadSievingDataParamTest(std::vector<uint32_t>& factorBase,
     sieveAndScanConfig ss_conf,
     devicePointers& dev_pointers){
     //allocate memory
+    //
+    // Scratch-zeroing parity with the batch path (audit S2-follow-up): the batch
+    // allocator (DeviceSievingController::allocateBatchBuffers) zeros
+    // dev_blockRelationCounts, and clearCandidates() zeros dev_candidateRelations
+    // before every sieve. cudaMalloc returns UNINITIALIZED device memory, so this
+    // candidate-reload path must reproduce that hygiene or the sieve kernels can
+    // consume stale/garbage scratch (e.g. dev_indexToCandidate entries read by the
+    // backward scan via blockEntries, or dev_globalBucketCounts fill levels) left
+    // over from a prior candidate config's allocation. The fresh cudaMalloc'd
+    // buffers are zeroed here exactly as the batch path zeroes them.
+    const size_t bucketEntriesBytes =
+        (size_t)gs_conf.num_polysPerSieveCall * gs_conf.num_sievingBlocksPerSieveCall
+        * gs_conf.globalBucketSize * sizeof(uint64_t);
+    const size_t bucketCountsBytes =
+        (size_t)gs_conf.num_polysPerSieveCall * gs_conf.num_sievingBlocksPerSieveCall * sizeof(uint32_t);
+    const size_t blockCountsBytes  = (size_t)ss_conf.num_threadBlocks * sizeof(uint32_t);
+    const size_t candidatesBytes   =
+        (size_t)gs_conf.maxRelationsPerBlock * ss_conf.num_threadBlocks * sizeof(candidateRelation);
+    const size_t indexBytes        =
+        (size_t)gs_conf.sievingBlockSize * ss_conf.num_threadBlocks * sizeof(uint32_t);
+
     cudaFree(dev_pointers.dev_globalBucketEntries);
-    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_globalBucketEntries, ((long long)gs_conf.num_polysPerSieveCall * gs_conf.num_sievingBlocksPerSieveCall * gs_conf.globalBucketSize * sizeof(uint64_t))));
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_globalBucketEntries, bucketEntriesBytes));
+    SIEVE_CUDA_CHECK(cudaMemset(dev_pointers.dev_globalBucketEntries, 0, bucketEntriesBytes));
     cudaFree(dev_pointers.dev_globalBucketCounts);
-    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_globalBucketCounts, gs_conf.num_polysPerSieveCall * gs_conf.num_sievingBlocksPerSieveCall*sizeof(uint32_t)));
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_globalBucketCounts, bucketCountsBytes));
+    SIEVE_CUDA_CHECK(cudaMemset(dev_pointers.dev_globalBucketCounts, 0, bucketCountsBytes));
     cudaFree(dev_pointers.dev_blockRelationCounts);
-    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_blockRelationCounts, ss_conf.num_threadBlocks * sizeof(uint32_t)));
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_blockRelationCounts, blockCountsBytes));
+    SIEVE_CUDA_CHECK(cudaMemset(dev_pointers.dev_blockRelationCounts, 0, blockCountsBytes));
     cudaFree(dev_pointers.dev_candidateRelations);
-    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_candidateRelations, gs_conf.maxRelationsPerBlock * ss_conf.num_threadBlocks * sizeof(candidateRelation)));
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_candidateRelations, candidatesBytes));
+    SIEVE_CUDA_CHECK(cudaMemset(dev_pointers.dev_candidateRelations, 0, candidatesBytes));
     cudaFree(dev_pointers.dev_indexToCandidate);
-    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_indexToCandidate, gs_conf.sievingBlockSize * ss_conf.num_threadBlocks * sizeof(uint32_t)));
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_indexToCandidate, indexBytes));
+    SIEVE_CUDA_CHECK(cudaMemset(dev_pointers.dev_indexToCandidate, 0, indexBytes));
 }
 
 void warmup(){
@@ -647,14 +680,19 @@ Calculates root of (ax+b)^2 - N (mod p).
 Roots are strictly in [0, p-1].
 */
 __device__ __forceinline__
-void rootsFromPolyId(uint32_t id, int shc_dim, primeDataSIQS& primeData, uint32_t& result1, uint32_t& result2){
+void rootsFromPolyId(uint32_t id, int shc_dim, const primeDataSIQS& primeData,
+                     const uint32_t* __restrict__ bvalues, uint32_t primeIndex, uint32_t fb_size,
+                     uint32_t& result1, uint32_t& result2){
     uint32_t minus_b_aInv = 0;
     uint32_t p = primeData.p;
 
-    // Calculate -b * a^-1 (mod p) by summing B_values
+    // Calculate -b * a^-1 (mod p) by summing B_values.
+    // B_values are stored column-major in a separate device array:
+    // bvalues[k*fb_size + primeIndex] = (b_k * a^-1) mod p. Only the live shc_dim
+    // slots are read (no MAX_SHC_DIM padding), coalesced across the warp at fixed k.
     for (int i = 0; i < shc_dim; i++) {
             int bit = id & 1;
-            uint32_t B_val = primeData.B_values[i];
+            uint32_t B_val = bvalues[(size_t)i * fb_size + primeIndex];
             // If bit is 0, add B_val. If bit is 1, add -B_val (which is p - B_val).
             // (p - B_val) is safe because B_val < p.
             uint32_t term = (bit == 0) ? B_val : (p - B_val);
@@ -696,7 +734,17 @@ Updates roots when moving between adjacent Gray codes.
 Uses the precalculated B_value for the flipped bit.
 */
 __device__ __forceinline__
-void advanceRoots(uint32_t id1, uint32_t id2, primeDataSIQS& primeData, uint32_t& root1, uint32_t& root2) {
+void advanceRoots(uint32_t id1, uint32_t id2, const primeDataSIQS& primeData,
+                  const uint32_t* __restrict__ bvalues, uint32_t primeIndex, uint32_t fb_size,
+                  uint32_t& root1, uint32_t& root2) {
+    // No Gray-code transition (id1 == id2, e.g. when polyBlockSize == 1): the roots
+    // do not change. Guard the degenerate __ffs(0) - 1 == 0xFFFFFFFF, which would index
+    // the B-values OOB. This was previously a benign out-of-bounds read of the LOCAL
+    // struct copy whose garbage result was discarded (it is the poly loop's final,
+    // unused iteration); with B-values now in a separate GLOBAL array the same bogus
+    // index is a fatal illegal access. Returning here reproduces the effective old
+    // semantics (no-op) while staying in bounds.
+    if (id1 == id2) return;
     uint32_t bitToFlip = __ffs((id1^id2))-1;
 
     // sign is +1 if bit flipped 1->0, -1 if bit flipped 0->1 (or vice versa depending on definition)
@@ -704,8 +752,9 @@ void advanceRoots(uint32_t id1, uint32_t id2, primeDataSIQS& primeData, uint32_t
     // If new bit is 1, sign is -1. If new bit is 0, sign is 1.
     int sign = 1 - (int)2 * ((id2 >> bitToFlip) & 1);
 
-    // Safe cast: B_values elements are < 2^31, fitting in signed int32 logic
-    int32_t delta = sign * (int32_t)primeData.B_values[bitToFlip];
+    // Safe cast: B_values elements are < 2^31, fitting in signed int32 logic.
+    // B_values are column-major in the separate array: bvalues[bitToFlip*fb_size + primeIndex].
+    int32_t delta = sign * (int32_t)bvalues[(size_t)bitToFlip * fb_size + primeIndex];
 
     root1 = modSum(root1, delta, primeData.p);
     root1 = modSum(root1, delta, primeData.p); // Applied twice (original logic?) - Yes, usually for N/A vs -N/A shift?
@@ -880,7 +929,7 @@ __global__ void globalMetaSieveBatchKernel(
                 int log2p = (31 - __clz(p)) * (1 - curPrimeData.inactive);
                 uint32_t root1;
                 uint32_t root2;
-                rootsFromPolyId(fullPolyId, shc_dim, curPrimeData, root1, root2);
+                rootsFromPolyId(fullPolyId, shc_dim, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)currentPrimeIndex, fs_params.fb_size, root1, root2);
                 int maxOffsetCount = ((gms_conf.num_activeBlocksPerCycle * gs_conf.sievingBlockSize) / (primeData[currentPrimeIndex - threadIdx.x].p)) + 1; //using the first prime as an upper bound to have a constant inner loop length
                 int reducedSieveStart = ((currentStart % (int)p) + (int)p ) % (int)p;// Formula: ((S % p) + p) % p ensures result is in [0, p-1]
 
@@ -937,7 +986,7 @@ __global__ void globalMetaSieveBatchKernel(
                     polyIndex = modAdd(polyIndex, 1, gms_conf.polyBlockSize);
                     polyId = gray(polyIndex);
                     fullPolyId = fullPolyIdPrefix | polyId;
-                    advanceRoots(prevFullPolyId, fullPolyId, curPrimeData, root1, root2);
+                    advanceRoots(prevFullPolyId, fullPolyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)currentPrimeIndex, fs_params.fb_size, root1, root2);
                 }
                 //poly loop finished, nothing to do here
             }
@@ -1032,7 +1081,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
         // Roots are now unsigned uint32_t residues [0, p-1]
         uint32_t root1 = 0;
         uint32_t root2 = 0;
-        rootsFromPolyId(polyIdPrefix, fs_params.shc_dim, curPrimeData, root1, root2);
+        rootsFromPolyId(polyIdPrefix, fs_params.shc_dim, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
 
         reducedSieveStart = ((sieveIntervalStart % p) + p) % p;
 
@@ -1063,7 +1112,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                 uint32_t root2 = (uint32_t)(((offsets2[i] % p) + p) % p);
 
                 // Update roots for Gray code step (uses uint32_t internally)
-                advanceRoots(prevPolyId, polyId, curPrimeData, root1, root2);
+                advanceRoots(prevPolyId, polyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
 
                 reducedSieveStart = ((sieveIntervalStart % p) + p) % p;
 
@@ -1506,14 +1555,17 @@ __global__ void initPrimeDataBatchKernel(
 	// Set inactive
 	tmpPrimeData.inactive = 0;
 
-        // C. Calculate B_values used to update roots (reading from Shared Memory)
+        // C. Calculate B_values used to update roots (reading from Shared Memory).
+        // Stored in the separate column-major device array dev_primeBValues
+        // [j*fb_size + i] (coalesced across the grid-stride threads at fixed j),
+        // NOT in the per-prime struct (which the hot sieve streams every pass).
         // B_val_stored = (B_val_original * inv_a) % p
         for (int j = 0; j < shc_dim; j++) {
             // Reduce 512-bit B value mod p
             uint32_t b_val_mod = s_B_values[j].mod_uint32(p);
 
             // Multiply by inverse a
-            tmpPrimeData.B_values[j] = (uint32_t)(((uint64_t)b_val_mod * result) % p);
+            dev_pointers.dev_primeBValues[(size_t)j * fb_size + i] = (uint32_t)(((uint64_t)b_val_mod * result) % p);
         }
 
         tmpPrimeData.p = p;
@@ -1544,31 +1596,36 @@ __global__ void generatePolynomialsKernel(
     // --- 1. Compute 'a' via Reduction ---
     uint32_t tid = threadIdx.x;
 
-    // Each thread loads a prime (if tid < dim)
-    uint32_t p = 1;
-    if (tid < shc_dim) {
-        uint32_t fb_idx = factor_indices_flat[step_idx * shc_dim + tid];
-        p = dev_factorBase[fb_idx];
-    } else if (tid < 16) {
-        // Zero out padding to ensure reduction works
-        s_storage[1 + tid] = mpqs::uint512((uint32_t)1);
-    }
+    // --- 1. Compute 'a' via a variable-depth tree reduction over shc_dim primes ---
+    // rdim mirrors the launch-site smem sizing: smallest power of two >= shc_dim,
+    // clamped to >= 32 (identical recurrence to prepareSievingBatch / prepareSievingBatchFromStaged).
+    // Invariant: rdim == launch-site reduction_dim. For shc_dim in [1..32], rdim == 32.
+    // Slots s_storage[1 .. rdim] hold the leaves; s_storage[0] (== s_a) receives the product.
+    uint32_t rdim = 32;
+    while (rdim < shc_dim) rdim <<= 1;  // == launch-site reduction_dim; stays 32 for shc_dim <= 32
 
-    // Initialize shared memory with primes as uint512
-    if (tid < 16) {
-      s_storage[1 + tid] = (tid < shc_dim ? mpqs::uint512(p) : mpqs::uint512((uint32_t)1)); // Padding for reduction
+    // Each thread owns leaf tid: load its prime if active, else pad with multiplicative identity.
+    // (threads-per-block = 64 >= rdim, so every leaf has an owner.)
+    if (tid < rdim) {
+        if (tid < shc_dim) {
+            uint32_t fb_idx = factor_indices_flat[step_idx * shc_dim + tid];
+            s_storage[1 + tid] = mpqs::uint512(dev_factorBase[fb_idx]);
+        } else {
+            s_storage[1 + tid] = mpqs::uint512((uint32_t)1);   // multiplicative identity pad
+        }
     }
     __syncthreads();
 
-    // Simple Tree Reduction (for dim=16)
-    // Needs proper sync and care for uint512 copy cost
-    if (tid < 8) s_storage[1+tid].mult(s_storage[1+tid+8]); __syncthreads();
-    if (tid < 4) s_storage[1+tid].mult(s_storage[1+tid+4]); __syncthreads();
-    if (tid < 2) s_storage[1+tid].mult(s_storage[1+tid+2]); __syncthreads();
+    // Variable-depth pairwise fold: stride rdim/2, rdim/4, ..., 1.
+    // __syncthreads() is outside the divergent guard — all 64 threads reach every barrier.
+    for (uint32_t stride = rdim >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) s_storage[1 + tid].mult(s_storage[1 + tid + stride]);
+        __syncthreads();
+    }
+
     if (tid == 0) {
-        s_storage[1].mult(s_storage[2]);
-        *s_a = s_storage[1]; // Store 'a' in shared[0]
-        out_a[step_idx] = *s_a; // Write to global
+        *s_a = s_storage[1];         // s_a == &s_storage[0]
+        out_a[step_idx] = *s_a;      // write 'a' to global
     }
     __syncthreads();
 

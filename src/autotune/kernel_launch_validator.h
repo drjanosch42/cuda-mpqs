@@ -76,6 +76,28 @@ public:
     /// Designed for diagnostics, not bulk filtering.
     std::string diagnose(const Params8& p) const;
 
+    /// Autotune OOM guard (S2): true iff the candidate's COMPLETE device footprint
+    /// (sieve bucket + persistent + scratch via mpqs::sieve::estimateSieveFootprint,
+    /// PLUS the caller-supplied non_sieve_bytes = postprocessing/LP + context reserve)
+    /// fits the operative budget (kSieveBudget fraction, 0.80) of free_vram.
+    ///
+    /// This is ADDITIVE to (never looser than) the bucket-only checkGlobalMem/isValid
+    /// gate: it can reject a candidate the bucket-only check accepts, never the reverse.
+    /// The candidate geometry mirrors loadPartialCustomConfig (num_polys=p[0],
+    /// num_sievingBlocks=p[1], num_threadBlocks=p[6]=sasGridDim, maxRelationsPerBlock=64)
+    /// on this validator's SieveConstants (globalBucketSize/sievingBlockSize/shc_dim).
+    ///
+    /// @param p             candidate 8-tuple
+    /// @param fb_size       factor base size (validator does not carry it)
+    /// @param free_vram     cudaMemGetInfo free bytes (amortized once per Stage-1)
+    /// @param non_sieve_bytes  postprocessing/LP footprint + CUDA-context reserve
+    /// @param est_total_out optional: receives the candidate's full footprint estimate
+    bool fitsTotalFootprint(const Params8& p,
+                            uint64_t fb_size,
+                            uint64_t free_vram,
+                            uint64_t non_sieve_bytes,
+                            uint64_t* est_total_out = nullptr) const;
+
     const DeviceLimits& getDeviceLimits() const { return dev_; }
     const SieveConstants& getSieveConstants() const { return sc_; }
 

@@ -17,6 +17,22 @@ namespace sieve {
 // =============================================================================
 
 /**
+ * @brief Maximum hypercube dimension (number of factors in 'a').
+ *
+ * Must be >= fs_params.shc_dim for the target composite. RSA-140 requires
+ * shc_dim=19; 32 provides headroom through RSA-155 and beyond.
+ *
+ * NOTE: The per-prime B_values are NO LONGER stored inside primeDataSIQS (which
+ * the hot meta-sieve kernels stream once per factor-base prime each pass). They
+ * live in a SEPARATE device array (devicePointers::dev_primeBValues), sized to
+ * the actual run shc_dim (not MAX_SHC_DIM), column-major [k*fb_size + prime].
+ * Hence MAX_SHC_DIM only bounds that separate array and per-thread caches; it no
+ * longer inflates the hot-streamed struct, so it is bandwidth-neutral for the
+ * sieve at every size (the bloat that regressed RSA-100 is eliminated).
+ */
+static constexpr int MAX_SHC_DIM = 32;
+
+/**
  * @brief Per-Prime data structure for the SIQS Factor Base.
  *
  * Stores precomputed modular inverses and Gray code update constants
@@ -26,14 +42,6 @@ struct primeDataSIQS {
     uint32_t p;             ///< The prime number p.
     uint32_t r;             ///< Root of N mod p: r^2 = N (mod p).
     uint32_t mod_inverse_a; ///< (a^-1) mod p. Used to update roots when 'a' changes.
-
-    /**
-     * @brief Precomputed update values for the Hypercube traversal.
-     * B_values[k] = (b_k * a^-1) mod p.
-     * Used to update polynomial roots when flipping the k-th bit in the Gray code.
-     */
-    uint32_t B_values[16];
-
     uint32_t inv_aN;        ///< (a^-1 * r) mod p.
 
     /**
@@ -42,6 +50,16 @@ struct primeDataSIQS {
      * If == 0, prime divides 'a' and is skipped for this batch.
      */
     uint32_t inactive;
+
+    // NOTE: The per-prime Gray-code update values B_values[k] = (b_k * a^-1) mod p
+    // were REMOVED from this struct and moved to a separate device array
+    // (devicePointers::dev_primeBValues), column-major [k*fb_size + primeIndex],
+    // sized to the actual run shc_dim. The hot meta-sieve kernels load this struct
+    // per factor-base prime every pass; embedding B_values[MAX_SHC_DIM] here bloated
+    // the per-prime stream stride (84->148 B at MAX_SHC_DIM=32) and made the sieve
+    // bandwidth-bound on padding. Decoupling restores the struct to 20 B for ALL
+    // sizes and reads only the live shc_dim B-values, coalesced. See rootsFromPolyId
+    // / advanceRoots in kernel.cu.
 };
 
 // =============================================================================
@@ -164,6 +182,10 @@ struct devicePointers {
     mpqs::uint512* dev_B_values = nullptr; // obsolete for batch sieving
     uint32_t* dev_factorBase = nullptr;
     primeDataSIQS* dev_primeData = nullptr;
+    // Per-prime Gray-code B-update values, decoupled from primeDataSIQS to keep the
+    // hot-streamed struct small. Column-major: dev_primeBValues[k*fb_size + prime]
+    // for k in [0, shc_dim). Size: fb_size * shc_dim * sizeof(uint32_t).
+    uint32_t* dev_primeBValues = nullptr;
     uint32_t* dev_rootN = nullptr;
     uint64_t* dev_globalBucketEntries = nullptr;
     uint32_t* dev_globalBucketCounts = nullptr;

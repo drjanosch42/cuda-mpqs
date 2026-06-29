@@ -126,6 +126,35 @@ public:
 
     void setThresholdOverride(uint64_t threshold_bound);
 
+    /// Autotune OOM-guard knob: an optional cap (in bytes) on the TOTAL device
+    /// footprint of one sieve instance (bucket + persistent + scratch), applied
+    /// inside loadStandardConfig() AFTER the bucket-only budget reduction. The
+    /// seed num_polysPerSieveCall is halved further (down to the validator's
+    /// minimum) until estimateSieveFootprint(...).total() fits this cap.
+    ///
+    /// DEFAULTED OFF (0 => no extra cap). The orchestrator/production paths never
+    /// set it, so loadStandardConfig is byte-identical there. Only the autotune
+    /// Stage-1 seed guard (AutotuneController::runStage1_KernelParams) sets it to
+    /// 0.80*free_VRAM - (postprocessing/LP bytes + CUDA-context reserve), so the
+    /// seed's ENTIRE footprint fits free VRAM before loadData() allocates it.
+    ///
+    /// Returns the clamp diagnostic (seed num_polys before/after, est totals) via
+    /// the out-params when a clamp fired; *clamped is false if the knob was off or
+    /// did not bind. Read after loadStandardConfig() to log the clamp.
+    void setMaxTotalSieveBytes(uint64_t max_total_bytes) {
+        max_total_sieve_bytes_ = max_total_bytes;
+    }
+    /// Diagnostic for the last loadStandardConfig() seed clamp under the knob.
+    struct SeedClampInfo {
+        bool     clamped = false;       ///< true iff the knob bound and reduced num_polys
+        uint32_t num_polys_before = 0;  ///< seed num_polys after the bucket-only budget loop
+        uint32_t num_polys_after = 0;   ///< seed num_polys after the total-footprint knob loop
+        uint64_t total_before = 0;      ///< estimateSieveFootprint().total() before the knob loop
+        uint64_t total_after = 0;       ///< estimateSieveFootprint().total() after the knob loop
+        uint64_t budget = 0;            ///< the max_total_sieve_bytes_ cap that was applied
+    };
+    SeedClampInfo getLastSeedClamp() const { return last_seed_clamp_; }
+
     /// Set external stop flag (cluster mode). If non-null, runSievingBatch()
     /// checks *external_stop_ before launching kernels and returns early if set.
     /// Host-side check only — no device-side modification.
@@ -243,6 +272,11 @@ private:
     size_t    pinned_factor_indices_capacity_ = 0;
     std::atomic<bool>* external_stop_ = nullptr;  ///< External stop signal (cluster mode)
     AFactorsSnapshot snapshot_;  ///< Saved after initiate() + init_a_factors()
+
+    /// Autotune OOM-guard knob (bytes). 0 => off (orchestrator/production default,
+    /// byte-identical loadStandardConfig). See setMaxTotalSieveBytes().
+    uint64_t max_total_sieve_bytes_ = 0;
+    SeedClampInfo last_seed_clamp_;  ///< Filled by loadStandardConfig() when the knob binds.
 
     // NOT NECESSARY / OBSOLETE / ONLY FOR DEBUGGING PURPOSES
     // Helper to clear candidate buffer before launch for validation clarity / safety

@@ -27,6 +27,15 @@ namespace memory_costs {
     inline constexpr std::size_t WITNESS_PAYLOAD_BYTES = 128;   // Payload slab (16 × 8B)
     inline constexpr std::size_t WITNESS_DIR_BYTES     = 8;     // Per directory entry
     inline constexpr std::size_t LP_PIPELINE_BYTES     = 41;    // Sort arrays + status
+
+    /// Fixed CUDA-context / runtime reserve (bytes) the OOM guard subtracts from
+    /// free VRAM before budgeting the sieve. cudaMemGetInfo "free" does NOT cover
+    /// the CUDA runtime/context working set, JIT/module scratch, cuBLAS handles,
+    /// stream pools, or allocator fragmentation that materialize as the pipeline
+    /// runs. 512 MB is a conservative pad (negligible on the 40 GB A100 target,
+    /// safe on the 16 GB local box). Over-reserving only skips a config slightly
+    /// earlier; under-reserving risks an OOM the guard was meant to prevent.
+    inline constexpr std::size_t CUDA_CONTEXT_RESERVE_BYTES = 512ull * 1024 * 1024;
 } // namespace memory_costs
 
 /// Hardware-derived minimum partial-buffer size (in relations).

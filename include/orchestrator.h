@@ -8,10 +8,12 @@
 #include <vector>
 #include <deque>
 #include <map>
+#include <utility>
 #include <memory>
 #include <cstdint>
 #include <atomic>
 #include <thread>
+#include <chrono>
 
 // Common and Data Structures
 #include "uint512.cuh"
@@ -85,6 +87,12 @@ struct MPQSConfig {
     bool disk_io = false;
     std::string work_dir = "./mpqs_work";
 
+    // --- Mid-sieve checkpointing (default-off; 0/false/empty = disabled, no-op) ---
+    uint32_t    checkpoint_interval_sec = 0;  // 0 = disabled (no-op)
+    uint32_t    checkpoint_batches      = 0;  // alternative interval in sieve batches; 0 = disabled
+    std::string checkpoint_dir          = ""; // "" → auto = work_dir + "/checkpoint"
+    bool        resume                  = false;
+
     // --- Diagnostic disk dumps (sqrt-failure investigation) ---
     // Both are ADDITIVE and strictly opt-in: when false, the standard code path
     // and its allocations/performance are byte-for-byte unchanged.
@@ -142,6 +150,12 @@ struct MPQSConfig {
     double smooth_subsample = 1.0;   ///< Fraction of pure smooths (large_primes <= 1) to retain in matrix_only.
                                       ///< LP-combined relations are always retained (inverse of partial_subsample).
                                       ///< Range [0.0, 1.0]. Default 1.0 (no subsampling). CLI: --smooth_subsample
+    uint64_t matrix_lp1_bound = 0;   ///< matrix_only L-magnitude down-filter: build the matrix at an effective LP
+                                      ///< bound BELOW the sieve's baked-in lp_bound, WITHOUT re-sieving. After load,
+                                      ///< DROP every LP-combined relation (and raw partial) whose stored large prime
+                                      ///< exceeds this value; pure smooths (large_primes <= 1) are NEVER dropped.
+                                      ///< 0 = inert (default; legacy behavior unchanged). Distinct from --lp1_bound
+                                      ///< (the sieve bound, restored from metadata at load). CLI: --matrix_lp1_bound
     double truncation_factor = 1.05; ///< Matrix truncation enable flag. > 0 = enabled, 0 = disabled.
                                       ///< Per M12-S1 the actual target is char-col-aware and excess-based:
                                       ///<   target_rows = n_cols + n_extra_cols + matrix_truncation_excess.
@@ -422,6 +436,52 @@ private:
     /// Emit fire-once near-full and overflow warnings for all buffers.
     void logBufferWarnings();
 
+    /// Sentinel for finalizePersistentToHost's deficit_floor: "use the default fb_size+64".
+    static constexpr uint64_t kDeficitFloorAuto = ~uint64_t(0);
+
+    // --- Mid-sieve checkpoint helpers (B1 split — see sieve_checkpoint.h) ---
+    /// Copy-only host snapshot of the live device persistent batch (and, iff LP active, the
+    /// witness table) into the supplied SCRATCH host buffers. Drains/syncs first. Reusable
+    /// mid-loop: it MUST NOT call deduplicatePersistentBatch() or otherwise mutate the live
+    /// device batch / witness table (B1). Output buffers are overwritten.
+    void copyPersistentToHost(mpqs::structures::HostRelationBatch& smooths_out,
+                              mpqs::structures::HostRelationBatch& partials_out);
+    /// End-of-sieve drain → device deduplicatePersistentBatch() + deficit-guard re-sieve →
+    /// copy into the live host_relations_soa_ / host_partials_soa_. The destructive device
+    /// dedup is correct ONLY here (nothing accumulates afterward). Reports the pre/post dedup
+    /// counts for the sieve summary.
+    ///
+    /// @param deficit_floor  Minimum post-dedup device count below which the guard re-sieves.
+    ///   `kDeficitFloorAuto` (default) → `fb_size + 64` (the normal/non-resume floor). S2 solo
+    ///   resume passes an explicit floor that accounts for the already-loaded relations so the
+    ///   guard does NOT push the (intentionally partial) new leg up to the full fb_size+64.
+    void finalizePersistentToHost(uint64_t& pre_dedup_count, uint64_t& post_dedup_count,
+                                  uint64_t deficit_floor = kDeficitFloorAuto);
+    /// S2 solo resume end-of-sieve: merge the loaded checkpoint (ckpt_loaded_smooths_/partials_)
+    /// with the freshly-sieved NEW leg. Device-dedups the new leg (resume-aware deficit floor),
+    /// builds the (loaded ∪ new) union dedup set via the shared computeRelationHash, re-asserts
+    /// the fb_size+64 floor on the UNION (re-sieving the new leg if short), then runs the solo
+    /// LP final host-match (cpu_lp combiner) over (loaded ∪ new) partials — appending only
+    /// genuine cross-checkpoint combines (m-dedup-order). Populates host_relations_soa_ /
+    /// host_partials_soa_ exactly as a single uninterrupted run would.
+    void finalizeResumeUnion(uint64_t& pre_dedup_count, uint64_t& post_dedup_count);
+    /// If checkpointing is enabled and the interval/batch threshold fired, emit one atomic
+    /// mid-sieve checkpoint (copy-only snapshot → host-dedup of the scratch copy → atomic
+    /// write). No-op when checkpointing is disabled or in cluster mode (solo only in S1).
+    /// Called at the bottom-of-loop boundary of the batch and graph-replay loops.
+    void maybeCheckpoint(uint64_t current_step, uint64_t processed_batches,
+                         double elapsed_sieve_sec);
+
+    /// S3 — coordinator-only mid-sieve checkpoint WRITE. Snapshots the pooled state at the
+    /// Thread-A sole-mutator boundary: the non-consuming RelationAccumulator::peek() smooths
+    /// + cluster_raw_partials_ as the v2 payload, plus a variable-size cluster block
+    /// {completedPrefixCursor (B2), per-node initial-range high-water array (M1)} via the
+    /// same atomic writeCheckpointAtomic. `initial_high_water` is assembled by the caller
+    /// (Thread A: worker marks from CHUNK_COMPLETE + node-0 from cluster_node0_initial_hw_).
+    /// Workers never call this; SOLO path is untouched.
+    void writeClusterCheckpoint(const std::vector<uint64_t>& initial_high_water,
+                                double elapsed_sieve_sec);
+
     /// Thread A main loop (coordinator only). CPU-only — no CUDA context.
     void networkLoop();
     /// Helper: buffer raw partials for expanded-matrix path. Thread A only.
@@ -511,6 +571,37 @@ private:
     std::unique_ptr<cluster::CommBackend> comm_backend_;  ///< TCP/MPI backend (coordinator + worker)
     std::unique_ptr<cluster::WorkPool> cluster_work_pool_;
     std::unique_ptr<cluster::ChunkScheduler> cluster_scheduler_;
+    // --- S3: per-node initial-range high-water tracking (coordinator checkpoint, M1) ---
+    /// Per-node initial contiguous range {start, count} as computed by
+    /// ChunkScheduler::computeContiguousRanges (index == node_id, node 0 = coordinator).
+    /// Written once during coordinator setup BEFORE Thread A starts, then read-only — so
+    /// Thread A and Thread B can both read it without synchronization. Used to clamp the
+    /// per-node high-water marks (≤ orig_count) at checkpoint-write time. (std::pair to keep
+    /// orchestrator.h free of the cluster::WorkUnit definition — types stay forward-declared.)
+    std::vector<std::pair<uint64_t, uint64_t>> cluster_initial_ranges_;
+    /// Node 0's (coordinator's own) initial-range contiguous high-water = a-values consumed
+    /// by its initial bounded sieve [0, coord_range_count). Set by Thread B once that sieve
+    /// completes (the DirectChannel a-val counter is reset for subsequent overflow chunks, so
+    /// it must be captured at that instant); read atomically by Thread A at checkpoint write.
+    std::atomic<uint64_t> cluster_node0_initial_hw_{0};
+    // --- S4: coordinator RESUME state (default-off — set only when --resume loads a valid
+    //     CLUSTER checkpoint at coordinator setup; consumed once at Thread A start) ---
+    /// True after a valid cluster checkpoint is loaded + restored in coordinator setup.
+    bool cluster_resume_active_ = false;
+    /// Per-node initial-range high-water loaded from the cluster block == the EFFECTIVE trim
+    /// offset applied to each node's re-issued initial range on THIS resume (index == node_id,
+    /// node 0 = coordinator). Empty when not resuming. Read by Thread A to (a) seed
+    /// worker_initial_hw so a node that hasn't reported its (trimmed) initial CHUNK_COMPLETE
+    /// before the next checkpoint re-reports its offset (a further resubmission re-issues the
+    /// same trimmed range — re-sieve, never skip), and (b) add the offset back when re-recording
+    /// the ABSOLUTE high-water for the next checkpoint (so multi-resume never mis-trims). See
+    /// computeResumeTrim() in sieve_checkpoint.h.
+    std::vector<uint64_t> cluster_initial_resume_offsets_;
+    /// Loaded checkpoint payload, re-injected into cluster_accumulator_ / cluster_cpu_lp_ /
+    /// cluster_raw_partials_ at networkLoop() start (after the raw-partials reset). Cleared
+    /// after re-injection — the live cluster structures own the data thereafter.
+    mpqs::structures::HostRelationBatch cluster_resume_smooths_;
+    mpqs::structures::HostRelationBatch cluster_resume_partials_;
     uint64_t cluster_prev_pers_count_ = 0;  ///< Persistent-batch extraction watermark (survives SieveStage re-entry)
     std::atomic<bool> external_stop_flag_{false};  ///< Set by Thread A; atomic for ARM/Jetson correctness.
     mpqs::sieve::AFactorsSnapshot a_factors_snapshot_;  ///< Saved after init_a_factors for cluster serialization
@@ -579,6 +670,24 @@ private:
     bool     interval_calibrated_        = false;
     bool     interval_recalibrated_      = false;
     static constexpr uint32_t N_LP_INTERVALS = 32;  ///< Target number of LP processing points
+
+    // --- Mid-sieve checkpoint state (solo; default-off) ---
+    /// Wall-clock anchor for the time-based checkpoint interval. Re-armed AFTER each write
+    /// so the per-checkpoint stall is not charged to the next interval.
+    std::chrono::steady_clock::time_point last_checkpoint_time_{};
+    bool     checkpoint_timer_started_ = false;  ///< Armed on the loop's first maybeCheckpoint().
+    uint64_t last_checkpoint_batch_    = 0;      ///< processed_batches at the last write.
+    /// Scratch host buffers for the copy-only mid-loop snapshot (NOT the live host_*_soa_).
+    mpqs::structures::HostRelationBatch ckpt_scratch_smooths_;
+    mpqs::structures::HostRelationBatch ckpt_scratch_partials_;
+
+    // --- Solo resume state (S2; default-off — set only when --resume loads a checkpoint) ---
+    bool     resume_active_         = false;  ///< True after a valid checkpoint loaded at SieveStage entry.
+    uint64_t resume_loaded_raw_     = 0;      ///< trailer.loaded_smooths_raw — RAW device count (M2 target acct).
+    uint64_t resume_global_a_index_ = 0;      ///< trailer.global_a_index — first un-sieved a-index.
+    /// Loaded checkpoint payload, held across SieveStage for the end-of-sieve union merge.
+    mpqs::structures::HostRelationBatch ckpt_loaded_smooths_;
+    mpqs::structures::HostRelationBatch ckpt_loaded_partials_;
 
     // --- Intermediate Data ---
     // Host-side SoA Container for downloaded relations

@@ -25,6 +25,7 @@
 ///                                      Thread B awaits <- deliver()
 
 #include "mpqs_soa.h"
+#include "relation_hash.h"   // m-sharedTU: single source of truth for computeRelationHash
 
 #include <mutex>
 #include <vector>
@@ -157,46 +158,23 @@ public:
         return std::move(accumulated_);
     }
 
+    /// Non-consuming const view of the accumulated deduped smooths (S3 coordinator
+    /// checkpoint, M3). Unlike extractFinal() — which std::moves accumulated_ out and
+    /// leaves the accumulator empty — peek() leaves it intact so the live cluster run
+    /// continues unperturbed. Thread A is the sole mutator, so a read taken at the
+    /// Thread-A between-batch boundary is host-consistent.
+    const mpqs::structures::HostRelationBatch& peek() const { return accumulated_; }
+
     uint64_t effectiveTarget() const { return effective_target_; }
     uint64_t rawTarget() const { return target_; }
 
 private:
-    /// Compute 64-bit hash matching compute_relation_hashes_soa in postprocessing.cu:
-    ///   hash = (len << 48) | (exp_xor << 32) | body_xor
-    /// where body_xor includes factor_indices * MAGIC, sign, and val_2_exp.
-    ///
-    /// Stage 4 invariant (M12-S5/S5b analogue): batch.char_bits is DELIBERATELY NOT
-    /// folded into this hash. char_bits is a deterministic function of (ax+b), so two
-    /// relations with identical factorization share identical char vectors — including
-    /// it cannot change dedup identity, and excluding it keeps this CPU coordinator
-    /// hash byte-for-byte equivalent to the GPU worker hash regardless of char_mode.
+    /// Compute the 64-bit relation dedup hash. Delegates to the single shared definition
+    /// in `src/common/relation_hash.h` (m-sharedTU) so the cluster coordinator, the solo
+    /// checkpoint host-dedup, and the GPU `compute_relation_hashes_soa` all agree byte-for-
+    /// byte. Do NOT inline a copy of the formula here — see relation_hash.h.
     static uint64_t computeRelationHash(const mpqs::structures::HostRelationBatch& batch, size_t i) {
-        constexpr uint32_t MAGIC = 0x9e3779b9;
-
-        uint64_t start = batch.factor_offsets[i];
-        uint64_t end   = batch.factor_offsets[i + 1];
-        uint16_t len   = static_cast<uint16_t>(end - start);
-
-        uint16_t exp_xor  = 0;
-        uint32_t body_xor = 0;
-        for (uint64_t k = start; k < end; k++) {
-            exp_xor  ^= static_cast<uint16_t>(batch.factor_counts[k]);
-            body_xor ^= (batch.factor_indices[k] * MAGIC);
-        }
-
-        // Encoding (canonical, see audit Appendix A): batch.signs[i] is uint8_t
-        // with {1 = positive Q, 0xFF = negative Q}. Use the M11c encoding-agnostic
-        // "negative iff != 1" extraction so this CPU dedup hash matches the GPU
-        // path in postprocessing.cu:594. M12-S5 fixed the GPU side; M12-S5b
-        // sweeps this parallel CPU site (cluster coordinator dedup) to prevent
-        // GPU-worker / CPU-coordinator hash divergence.
-        int32_t sign_val  = (batch.signs[i] != 1u) ? -1 : 1;
-        int32_t shift_val = sign_val * (1 << (batch.val_2_exps[i] & 0x1F));
-        body_xor ^= static_cast<uint32_t>(shift_val);
-
-        return (static_cast<uint64_t>(len) << 48)
-             | (static_cast<uint64_t>(exp_xor) << 32)
-             | static_cast<uint64_t>(body_xor);
+        return mpqs::computeRelationHash(batch, i);
     }
 
     /// Append a single relation from src at index idx to dest, maintaining CSR validity.

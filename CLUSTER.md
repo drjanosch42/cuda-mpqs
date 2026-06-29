@@ -61,6 +61,14 @@ ssh user@worker-host "cd /path/to/cuda-mpqs && ./build/tests/cuda-mpqs --RSA100 
 | `--dedup_safety_factor` | `double` | 1.05 | Dedup oversample margin. Coordinator collects `target × factor` relations before stopping to account for dedup losses. Auto-set to 1.35 for <80d inputs. |
 | `--probe_timeout` | `double` | 120.0 | Hard timeout (seconds) for `--estimate_only` probes. In cluster mode, the coordinator runs the full cluster sieve for this duration, then broadcasts STOP and prints the runtime estimate. Increase for slow GPUs (e.g., 600 for Jetson at RSA-120 scale). |
 
+**Coordinator checkpoint / resume** (default-off): pass
+`--checkpoint_interval <sec> --checkpoint_dir <run-stable-path>` to the coordinator to
+write periodic atomic `sieve.ckpt` snapshots; add `--resume` on resubmission to continue
+from the last checkpoint. Workers are stateless and reconnect normally — no worker-side
+flags required. See `docs/modules/cluster.md` (Coordinator Checkpointing section) for
+details and the SLURM sbatch template in `tools/cluster/rsa140_a100_4node_pc2.sbatch`
+for a production-ready example.
+
 The transport is fixed to TCP: there is **no** `--transport` CLI flag. The `MPQSConfig::transport` field defaults to `"tcp"` and TCP is the only backend.
 
 All standard flags (`--fb_bound`, `--sieve_bound`, `--lp1_bound`, `--sieve_batch_size`, `--cuda_graph_unroll`, etc.) work identically to solo mode and can be set independently per node. Workers receive N, factor base, and polynomial parameters from the coordinator via `WORK_ASSIGN`.

@@ -204,6 +204,8 @@ void print_usage(const char* prog_name) {
               << "\n--- Tuning / Sieving ---\n"
               << "  --fb_bound <N>   Factor Base Bound F (K/M/B/T suffix) [Default: Auto/20000]\n"
               << "  --lp1_bound <N>  Large Prime Bound 1 (K/M/B/T suffix)\n"
+              << "  --matrix_lp1_bound <N> matrix_only: drop LP-combined rows/partials with stored large prime > N\n"
+              << "                         (effective L down-filter; pure smooths kept; 0=inert; K/M/B/T suffix)\n"
               << "  --lp1_max_witnesses <SIZE> LP witness capacity (K/M suffix, snaps to pow2) [Default: 1M]\n"
               << "  --lp_interval <N>    LP processing frequency: 0=auto/adaptive, N>0=every N batches\n"
               << "  --target_rels <N> Target Relations [Default: Auto]\n"
@@ -561,6 +563,19 @@ ParsedArgs parse_args(int argc, char** argv) {
             args.config.smooth_subsample = val;
             args.mark("smooth_subsample");
         }
+        else if (arg == "--matrix_lp1_bound" && i + 1 < argc) {
+            // matrix_only L-magnitude down-filter: drop LP-combined rows / raw
+            // partials whose stored large prime exceeds this bound (pure smooths
+            // are NEVER dropped). 0 = inert. Lets the LA stage target an effective
+            // L below the sieve's baked-in lp_bound WITHOUT re-sieving. Accepts the
+            // same K/M/B/T suffix as --lp1_bound.
+            uint64_t val;
+            if (!parse_suffixed_uint64(argv[++i], val, false)) {
+                std::cerr << "Error: invalid value for --matrix_lp1_bound\n"; exit(1);
+            }
+            args.config.matrix_lp1_bound = val;
+            args.mark("matrix_lp1_bound");
+        }
         else if (arg == "--truncation_factor" && i + 1 < argc) {
             double val;
             if (!parse_double(argv[++i], val)) exit(1);
@@ -859,6 +874,21 @@ ParsedArgs parse_args(int argc, char** argv) {
             print_usage(argv[0]);
             exit(0);
         }
+
+        // --- Checkpointing (default-off; no behavior change when absent or at defaults) ---
+        else if (arg == "--checkpoint_interval" && i+1 < argc) {
+            args.config.checkpoint_interval_sec = (uint32_t)std::stoul(argv[++i]);
+        }
+        else if (arg == "--checkpoint_batches" && i+1 < argc) {
+            args.config.checkpoint_batches = (uint32_t)std::stoul(argv[++i]);
+        }
+        else if (arg == "--checkpoint_dir" && i+1 < argc) {
+            args.config.checkpoint_dir = argv[++i];
+        }
+        else if (arg == "--resume") {
+            args.config.resume = true;
+        }
+
         else {
             std::cerr << "Unknown argument: " << arg << "\n";
             print_usage(argv[0]);

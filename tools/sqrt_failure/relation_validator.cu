@@ -50,12 +50,14 @@
 // =============================================================================
 
 #include "relation_io.h"
+#include "sieve_checkpoint.h"   // read sieve.ckpt (footer + trailer + v2 payload)
 #include "mpqs_soa.h"
 #include "uint512.cuh"
 #include "math_utils.cuh"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -64,6 +66,7 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <filesystem>
 
 using mpqs::uint512;
 using mpqs::structures::HostRelationBatch;
@@ -600,6 +603,21 @@ void emit_batch_json(std::ostream& os, const char* label, BatchResults& R, bool 
     os << "    }" << (last ? "" : ",") << "\n";
 }
 
+// -----------------------------------------------------------------------------
+// Checkpoint detection: probe for the fixed EOF footer magic ("MPQS_CKFT").
+// -----------------------------------------------------------------------------
+bool looksLikeCheckpoint(const std::string& path) {
+    std::error_code ec;
+    uint64_t sz = std::filesystem::file_size(path, ec);
+    if (ec || sz < mpqs::ckpt::CKPT_FOOTER_SIZE) return false;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.seekg(static_cast<std::streamoff>(sz - mpqs::ckpt::CKPT_FOOTER_SIZE), std::ios::beg);
+    char magic[9];
+    f.read(magic, 9);
+    return f && std::memcmp(magic, mpqs::ckpt::CKPT_FOOTER_MAGIC, 9) == 0;
+}
+
 } // namespace
 
 // =============================================================================
@@ -609,10 +627,13 @@ void emit_batch_json(std::ostream& os, const char* label, BatchResults& R, bool 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
-            "Usage: %s <relations.v2|relations.soa> [--out <summary.json>]\n"
+            "Usage: %s <relations.v2|relations.soa|sieve.ckpt|<checkpoint_dir>> [--out <summary.json>]\n"
             "\n"
             "Exhaustively re-validates saved relations on the CPU, with a\n"
-            "deterministic primality test on every recorded large prime.\n",
+            "deterministic primality test on every recorded large prime.\n"
+            "Accepts a relations.v2/.soa file, a sieve.ckpt checkpoint (footer + trailer\n"
+            "are validated and reported), or a checkpoint directory (picks sieve.ckpt,\n"
+            "falling back to sieve.ckpt.prev).\n",
             argv[0]);
         return 2;
     }
@@ -626,10 +647,62 @@ int main(int argc, char** argv) {
 
     HostRelationBatch v1batch, smooths, partials;
     mpqs::io::V2Metadata meta;
-    int fmt = mpqs::io::detect_and_deserialize(path, v1batch, smooths, partials, meta);
-    if (fmt == 0) {
-        std::fprintf(stderr, "ERROR: failed to load relations from %s\n", path.c_str());
-        return 1;
+    int fmt = 0;
+
+    // --- Checkpoint path: a directory, or a file carrying the EOF footer magic. ---
+    bool is_ckpt = false;
+    {
+        std::error_code ec;
+        is_ckpt = std::filesystem::is_directory(path, ec) || looksLikeCheckpoint(path);
+    }
+    if (is_ckpt) {
+        mpqs::ckpt::CheckpointLoadResult res;
+        bool ok = std::filesystem::is_directory(path)
+            ? mpqs::ckpt::loadLatestCheckpoint(path, res)
+            : mpqs::ckpt::readCheckpoint(path, res);
+        if (!ok || !res.ok) {
+            std::fprintf(stderr, "ERROR: failed to load checkpoint from %s (torn/incomplete?)\n",
+                         path.c_str());
+            return 1;
+        }
+        const auto& tr = res.trailer;
+        std::printf("Loaded sieve.ckpt: footer + trailer OK (schema %u)\n",
+                    mpqs::ckpt::CKPT_SCHEMA_VERSION);
+        std::printf("  a_index (global_a_index) = %llu\n", (unsigned long long)tr.global_a_index);
+        std::printf("  target_relations         = %llu\n", (unsigned long long)tr.target_relations);
+        std::printf("  loaded_smooths_raw       = %llu\n", (unsigned long long)tr.loaded_smooths_raw);
+        std::printf("  loaded_smooths_dedup     = %llu\n", (unsigned long long)tr.loaded_smooths_dedup);
+        std::printf("  loaded_partials          = %llu\n", (unsigned long long)tr.loaded_partials);
+        std::printf("  elapsed_sieve_sec        = %llu\n", (unsigned long long)tr.elapsed_sieve_sec);
+        std::printf("  cluster_section_present  = %u\n", (unsigned)tr.cluster_section_present);
+        // S3 cluster block: completedPrefixCursor (B2) + per-node initial-range high-water (M1).
+        if (tr.cluster_section_present) {
+            const auto& cb = res.cluster;
+            std::printf("  [cluster] completed_prefix_cursor = %llu\n",
+                        (unsigned long long)cb.completed_prefix_cursor);
+            std::printf("  [cluster] node_count              = %zu\n",
+                        cb.initial_high_water.size());
+            for (size_t i = 0; i < cb.initial_high_water.size(); ++i)
+                std::printf("  [cluster]   node %2zu initial-range high-water = %llu\n",
+                            i, (unsigned long long)cb.initial_high_water[i]);
+        }
+        // Sanity: the deduped trailer count must equal the smooths actually in the payload.
+        if (tr.loaded_smooths_dedup != res.smooths.num_relations) {
+            std::fprintf(stderr,
+                "ERROR: trailer loaded_smooths_dedup=%llu != payload smooths=%zu (corrupt)\n",
+                (unsigned long long)tr.loaded_smooths_dedup, res.smooths.num_relations);
+            return 1;
+        }
+        smooths = std::move(res.smooths);
+        partials = std::move(res.partials);
+        meta = std::move(res.meta);
+        fmt = 2;
+    } else {
+        fmt = mpqs::io::detect_and_deserialize(path, v1batch, smooths, partials, meta);
+        if (fmt == 0) {
+            std::fprintf(stderr, "ERROR: failed to load relations from %s\n", path.c_str());
+            return 1;
+        }
     }
 
     std::vector<uint32_t> fb;

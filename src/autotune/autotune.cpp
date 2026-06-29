@@ -10,6 +10,7 @@
 #include "kernel_launch_validator.h"
 #include "kernel_param_optimizer.h"
 #include "device_sieving_controller.h"
+#include "sieve_memory_model.h"        // single source-of-truth sieve memory model
 #include "prime_algorithms.h"         // generateFactorBase, init_a_factors
 #include "memory_estimator.h"          // shared GPU memory cost constants
 
@@ -19,6 +20,7 @@
 #include "cost_models.h"
 
 #include <cuda_runtime.h>            // cudaGetDeviceProperties, cudaRuntimeGetVersion
+#include <algorithm>                 // std::min
 #include <cmath>
 #include <iomanip>
 
@@ -385,13 +387,136 @@ void AutotuneController::runStage1_KernelParams() {
     auto siever = std::make_unique<mpqs::sieve::DeviceSievingController>(
         pipeline_config_.device_id);
     siever->initiate(f_data_);
+
+    // ----- OOM-guard seed budget (S2, design §2.4(A)). -------------------------------
+    // loadData() -> loadSievingData() allocates ALL sieve buffers (FB, primeData,
+    // bucket, scratch) in ONE call, so free VRAM read NOW reflects a device with no
+    // sieve buffers resident — we must budget the ENTIRE sieve footprint, not just
+    // "the bucket left to fit". The DeviceSievingController "max total sieve bytes"
+    // knob caps bucket+persistent+scratch; we set it to 0.80*free minus the
+    // postprocessing/LP footprint and the CUDA-context reserve (the rest of the
+    // 0.80*free budget), so the seed's TOTAL demand fits free VRAM. The knob is
+    // applied inside loadStandardConfig() (which reduces num_polys until it fits) and
+    // is DEFAULTED OFF on the production/orchestrator paths (byte-identical there).
+    {
+        size_t free_vram = 0, total_vram = 0;
+        cudaError_t mi = cudaMemGetInfo(&free_vram, &total_vram);
+        if (mi == cudaSuccess && free_vram > 0) {
+            // 0.80*free, integer-exact, matching the in-tree sieveBucketBudget fraction.
+            const uint64_t gross =
+                (free_vram * mpqs::sieve::kSieveBudgetNum) / mpqs::sieve::kSieveBudgetDen;
+            const uint64_t pp_lp   = computePostprocessingLpBytes();
+            const uint64_t reserve = memory_costs::CUDA_CONTEXT_RESERVE_BYTES;
+            const uint64_t non_sieve = pp_lp + reserve;
+            // Budget for the sieve (bucket+persistent+scratch). If the non-sieve demand
+            // already exceeds 0.80*free, set the cap to 1 byte so loadStandardConfig
+            // reduces to its minimum num_polys; the post-loadStandardConfig feasibility
+            // check below then triggers the clean fallback if even that does not fit.
+            const uint64_t sieve_budget = (gross > non_sieve) ? (gross - non_sieve) : 1;
+            siever->setMaxTotalSieveBytes(sieve_budget);
+            LOG(LOG_DEBUG_2) << "[Autotune][OOM-guard] seed budget: free=" << (free_vram >> 20)
+                             << "MB 0.80*free=" << (gross >> 20) << "MB pp/LP="
+                             << (pp_lp >> 20) << "MB reserve=" << (reserve >> 20)
+                             << "MB sieve_budget=" << (sieve_budget >> 20) << "MB";
+        } else {
+            // cudaMemGetInfo failed — leave the knob off (no extra cap). The bucket-only
+            // 0.80*totalGlobalMem reduction in loadStandardConfig still applies.
+            LOG(LOG_WARNING) << "[Autotune][OOM-guard] cudaMemGetInfo failed ("
+                             << cudaGetErrorString(mi)
+                             << "); seed guard inactive (bucket-only budget applies)";
+        }
+    }
+
     siever->loadStandardConfig();
+
+    // M1 seed-geometry log (log-only, behavior-neutral). The loadStandardConfig seed
+    // num_polysPerSieveCall is otherwise logged NOWHERE in --autotune_stage1 mode (this
+    // ephemeral siever never calls printConfigs(); the production logs show the
+    // loadPartialCustomConfig params[0], not this seed). This line is the directly-
+    // checkable source the S1 byte-identity gate / S2 no-regression gate diffs against the
+    // S0 analytically-predicted seed num_polys (512 for the ~79d default, 1024 for RSA-100).
+    {
+        const auto gs  = siever->getGeneralConfig();
+        const auto ss  = siever->getSieveAndScanConfig();
+        const auto fsp = siever->getFixedParams();
+        const uint64_t bucket_entries =
+            mpqs::sieve::bucketEntriesBytes(gs.num_polysPerSieveCall,
+                                            gs.num_sievingBlocksPerSieveCall,
+                                            gs.globalBucketSize);
+        const auto fp = mpqs::sieve::estimateSieveFootprint(
+            gs.num_polysPerSieveCall, gs.num_sievingBlocksPerSieveCall,
+            gs.globalBucketSize, gs.sievingBlockSize,
+            ss.num_threadBlocks, gs.maxRelationsPerBlock,
+            fsp.fb_size, fsp.shc_dim);
+        LOG(LOG_DEBUG_1) << "[Autotune][seed-geometry] M=" << fsp.M
+                         << " shc_dim=" << fsp.shc_dim
+                         << " seed num_polys=" << gs.num_polysPerSieveCall
+                         << " num_sievingBlocks=" << gs.num_sievingBlocksPerSieveCall
+                         << " globalBucketSize=" << gs.globalBucketSize
+                         << " seed bucket bytes=" << bucket_entries
+                         << " (" << (bucket_entries / (1024 * 1024)) << " MB)"
+                         << " est total bytes=" << fp.total()
+                         << " (" << (fp.total() / (1024 * 1024)) << " MB)";
+
+        // OOM-guard clamp report (S2): when the knob reduced the seed num_polys.
+        const auto clamp = siever->getLastSeedClamp();
+        if (clamp.clamped) {
+            LOG(LOG_INFO) << "[Autotune][OOM-guard] seed bucket reduced num_polys "
+                          << clamp.num_polys_before << "->" << clamp.num_polys_after
+                          << " (M=" << fsp.M
+                          << ", est total " << (clamp.total_before / (1024 * 1024))
+                          << "MB->" << (clamp.total_after / (1024 * 1024))
+                          << "MB, sieve budget " << (clamp.budget / (1024 * 1024))
+                          << "MB, 0.80)";
+        }
+    }
+
+    // OOM-guard fallback (S2, design §2.6). If even the reduced seed geometry still
+    // does not fit the sieve budget (genuinely under-provisioned GPU for this M),
+    // do NOT allocate (loadData would OOM). Skip Stage-1 cleanly and let the real
+    // SieveStage's own loadStandardConfig reduction (now at 0.80) govern. Mirrors the
+    // preflight-fallback branch below.
+    {
+        const auto gs2  = siever->getGeneralConfig();
+        const auto ss2  = siever->getSieveAndScanConfig();
+        const auto fsp2 = siever->getFixedParams();
+        const auto clamp2 = siever->getLastSeedClamp();
+        if (clamp2.clamped) {
+            const uint64_t seed_total = mpqs::sieve::estimateSieveFootprint(
+                gs2.num_polysPerSieveCall, gs2.num_sievingBlocksPerSieveCall,
+                gs2.globalBucketSize, gs2.sievingBlockSize,
+                ss2.num_threadBlocks, gs2.maxRelationsPerBlock,
+                fsp2.fb_size, fsp2.shc_dim).total();
+            if (seed_total > clamp2.budget) {
+                LOG(LOG_WARNING) << "[Autotune][OOM-guard] no feasible sieve geometry at M="
+                                 << fsp2.M << " (min seed est total "
+                                 << (seed_total / (1024 * 1024)) << "MB > sieve budget "
+                                 << (clamp2.budget / (1024 * 1024))
+                                 << "MB); Stage-1 skipped, using heuristic defaults";
+                siever.reset();
+                cudaDeviceSynchronize();
+                cudaGetLastError();
+                pipeline_config_.useParams = false;
+                result_.stages[1].notes = "oom-guard fallback";
+                result_.stages[1].ran = true;
+                result_.stages[1].time_sec = duration(Clock::now() - t0);
+                return;
+            }
+        }
+    }
+
     siever->loadData();
     siever->updateState();
 
-    // 2. Run coordinate descent optimizer
+    // 2. Run coordinate descent optimizer. Pass the non-sieve footprint
+    //    (postprocessing/LP + CUDA-context reserve) so the optimizer's candidate
+    //    guard (and its own seed eval) budget the COMPLETE footprint against 0.80
+    //    of free VRAM (OOM-guard S2, design §2.4(B)).
+    const uint64_t guard_non_sieve_bytes =
+        computePostprocessingLpBytes() + memory_costs::CUDA_CONTEXT_RESERVE_BYTES;
     auto kp_result = optimizeKernelLaunchParams(
-        *siever, f_data_, pipeline_config_.device_id, atcfg_.thorough);
+        *siever, f_data_, pipeline_config_.device_id, atcfg_.thorough,
+        guard_non_sieve_bytes);
 
     // 3. Tear down siever — reset unique_ptr so destructor runs exactly once
     //    (clearSievingBuffers() + destructor = double-free, same as TruncatedSieveRun bug)
@@ -832,7 +957,7 @@ void AutotuneController::applyBufferRecommendations() {
 // Buffer recommendation summary
 // ---------------------------------------------------------------------------
 
-void AutotuneController::printBufferRecommendations() {
+uint64_t AutotuneController::computePostprocessingLpBytes() const {
     // Memory cost constants are shared with AutoApplyController::computeMemoryEstimate
     // — see memory_estimator.h for definitions and audit references.
     using memory_costs::DENSE_CANDIDATE_BYTES;
@@ -841,7 +966,9 @@ void AutotuneController::printBufferRecommendations() {
     using memory_costs::WITNESS_DIR_BYTES;
     using memory_costs::LP_PIPELINE_BYTES;
 
-    // Resolve buffer sizes to their effective values (0 = use defaults)
+    // Resolve buffer sizes to their effective values (0 = use defaults). Identical
+    // resolution to the former printBufferRecommendations body, so the estimate is
+    // byte-identical and the guard sees the same model.
     uint64_t accum   = pipeline_config_.accum_buffer_size > 0
                      ? pipeline_config_.accum_buffer_size : 524288ULL;
     uint64_t partial = pipeline_config_.partial_buffer_size > 0
@@ -861,8 +988,7 @@ void AutotuneController::printBufferRecommendations() {
 
     bool lp_active = pipeline_config_.lp1_bound > 0;
 
-    // Compute total estimated GPU memory
-    size_t mem = 0;
+    uint64_t mem = 0;
     mem += 2 * accum * DENSE_CANDIDATE_BYTES;  // Accum double-buffer
     mem += accum * SOA_PER_REL_BYTES;           // Full batch SoA (transient)
     mem += persist * SOA_PER_REL_BYTES;         // Persistent SoA
@@ -874,6 +1000,85 @@ void AutotuneController::printBufferRecommendations() {
         mem += lp_out * SOA_PER_REL_BYTES;           // Output SoA
         mem += partial * LP_PIPELINE_BYTES;          // LP pipeline transient
     }
+    return mem;
+}
+
+void AutotuneController::printBufferRecommendations() {
+    // Memory cost constants are shared with AutoApplyController::computeMemoryEstimate
+    // — see memory_estimator.h for definitions and audit references. Used by the
+    // per-field breakdown logging + the default-comparison total below.
+    using memory_costs::DENSE_CANDIDATE_BYTES;
+    using memory_costs::SOA_PER_REL_BYTES;
+    using memory_costs::WITNESS_PAYLOAD_BYTES;
+    using memory_costs::WITNESS_DIR_BYTES;
+    using memory_costs::LP_PIPELINE_BYTES;
+
+    // Postprocessing/LP footprint total (accum/SoA/witness/lp) — factored out so the
+    // Stage-1 OOM guard and this estimate share one model. The per-field resolution
+    // below mirrors computePostprocessingLpBytes() exactly, for the detailed log.
+    size_t mem = computePostprocessingLpBytes();
+
+    // Re-resolve the individual buffer sizes for the per-field log breakdown
+    // (identical resolution to computePostprocessingLpBytes()).
+    uint64_t accum   = pipeline_config_.accum_buffer_size > 0
+                     ? pipeline_config_.accum_buffer_size : 524288ULL;
+    uint64_t partial = pipeline_config_.partial_buffer_size > 0
+                     ? pipeline_config_.partial_buffer_size : accum;
+    uint64_t persist = pipeline_config_.persistent_buffer_size > 0
+                     ? pipeline_config_.persistent_buffer_size
+                     : pipeline_config_.target_relations + accum;
+    uint64_t witness = pipeline_config_.lp1_max_witness_capacity > 0
+                     ? pipeline_config_.lp1_max_witness_capacity : (1ULL << 20);
+    uint64_t lp_out  = pipeline_config_.lp1_max_combined_output > 0
+                     ? pipeline_config_.lp1_max_combined_output : 32768ULL;
+    uint32_t hbits   = pipeline_config_.lp1_hash_bits;
+    if (hbits == 0 && witness > 0) {
+        int log2_w = 63 - __builtin_clzll(witness > 0 ? witness : 1);
+        hbits = (log2_w > 4) ? (log2_w - 4) : 4;
+    }
+    bool lp_active = pipeline_config_.lp1_bound > 0;
+
+    // Sieve global bucket buffer (dev_globalBucketEntries, kernel.cu:593).  Previously
+    // omitted — at RSA-140 it dominates VRAM (tens of GB) and was the term that actually
+    // OOM'd, so leaving it out made this estimate a large under-count.  Closed form:
+    //   num_polysPerSieveCall * num_sievingBlocksPerSieveCall * globalBucketSize * 8
+    //   = num_polysPerSieveCall * M * 8     (globalBucketSize = sievingBlockSize/2,
+    //                                        num_sievingBlocksPerSieveCall = 2M/sievingBlockSize)
+    // num_polysPerSieveCall is params[0] on the production loadPartialCustomConfig path;
+    // on the loadStandardConfig fallback it starts at min(32768, 2^(shc_dim-1)) and is
+    // halved until the buffer fits 0.80*totalGlobalMem (mirrors loadStandardConfig()).
+    {
+        const uint64_t M = pipeline_config_.sieve_bound;
+        uint64_t num_polys;
+        if (pipeline_config_.useParams) {
+            num_polys = pipeline_config_.params[0];
+        } else {
+            cudaDeviceProp prop{};
+            cudaGetDeviceProperties(&prop, pipeline_config_.device_id);
+            uint64_t max_shared = (uint64_t)prop.sharedMemPerBlockOptin - 1024;
+            uint64_t sieving_block_size = 1;
+            while (sieving_block_size * 2 <= (3 * max_shared) / 4) sieving_block_size *= 2;
+            uint64_t global_bucket_size = sieving_block_size / 2;
+            uint64_t num_sieving_blocks = (2 * M) / sieving_block_size;
+            uint32_t shc_dim = (uint32_t)f_data_.a_factors.size();
+            num_polys = std::min<uint64_t>(32768u, (1ull << (shc_dim ? shc_dim - 1 : 0)));
+            // Routed through the single source-of-truth reduction helper
+            // (sieve_memory_model.h). sieveBucketBudget(totalGlobalMem,0,4,5) ==
+            // (4*totalGlobalMem)/5 == 0.80*VRAM (S2; kSieveBudget flipped 3/4 -> 4/5);
+            // reduceNumPolysToBudget with min_num_polys=1 mirrors this loop's `num_polys > 1`
+            // floor. Matches loadStandardConfig's reduction, so the printed estimate uses the
+            // same seed num_polys the production fallback path would.
+            num_polys = mpqs::sieve::reduceNumPolysToBudget(
+                static_cast<uint32_t>(num_polys),
+                num_sieving_blocks,
+                global_bucket_size,
+                mpqs::sieve::sieveBucketBudget((uint64_t)prop.totalGlobalMem, 0,
+                    mpqs::sieve::kSieveBudgetNum, mpqs::sieve::kSieveBudgetDen),
+                /*min_num_polys=*/1);
+        }
+        mem += num_polys * M * sizeof(uint64_t);   // Sieve bucket buffer
+    }
+
     size_t mem_mb = mem / (1024 * 1024);
 
     // Compute "default" memory for savings comparison

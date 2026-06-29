@@ -420,6 +420,100 @@ The I/O thread in `AsyncNetworkDataTap` ensures heartbeats continue during graph
 | `kBatchSendCeilingMs` | 10000 | Maximum time between sends |
 | `kCRC32Size` | 4 | CRC32 trailer size |
 
+## Coordinator Checkpointing and Resume
+
+Mid-sieve checkpointing is **coordinator-only** (workers are stateless and never checkpoint).
+Workers always reconnect and request work on a resume — no worker-side changes needed.
+
+### Checkpoint Flags (coordinator only)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--checkpoint_interval <T>` | 0 (OFF) | Wall-seconds between checkpoints. |
+| `--checkpoint_dir <path>` | `work_dir/checkpoint` | Checkpoint directory; must be on a run-stable path (not jobid-based). |
+| `--resume` | false | On startup, load `sieve.ckpt` from `checkpoint_dir` and resume. |
+
+`--checkpoint_batches` is a solo-sieve notion and has no effect on the coordinator path
+(the coordinator Thread A has no sieve-batch counter). Setting only `--checkpoint_batches` on a
+coordinator is a silent no-op.
+
+### Checkpoint Write (Thread A)
+
+The coordinator checkpoint is emitted from **Thread A (`networkLoop`)** at the
+**bottom-of-loop boundary** (immediately before the 1 ms idle sleep), on the wall-clock interval.
+Thread A is the **sole mutator** of `cluster_accumulator_`, `cluster_raw_partials_`, and
+`cluster_cpu_lp_`, so a snapshot taken there is host-consistent with nothing mid-flight.
+
+The checkpoint uses `RelationAccumulator::peek()` (non-consuming; `extractFinal()` is
+destructive) to read `accumulated_` without emptying the live pool.
+
+The cluster block appended between the progress trailer and the fixed EOF footer contains:
+- `completedPrefixCursor` — the completed contiguous prefix of the overflow `WorkPool`,
+  computed as `min(next_, min start over in_flight_ ∪ returned_)`. NOT `nextCursor()` (which
+  silently drops in-flight/returned chunks — see B2 rationale below).
+- per-node initial-range contiguous high-water array — captures `CHUNK_COMPLETE`/reclaim events
+  on the initial a-range specifically. Does NOT use `node_telemetry[].a_values_consumed` (which
+  sums initial + overflow and would overshoot). Conservative (under-report ⇒ re-sieve a little
+  on resume, never skip).
+
+Atomicity and crash safety are identical to the solo path (unlink stale `.tmp` → write → fsync
+→ rename-prev → rename → dir-fsync). Workers are byte-unchanged; default-off ⇒ a cluster run
+with no checkpoint flags is byte-unchanged.
+
+### Cluster Resume
+
+On `--resume` at the coordinator, **before Thread A starts and before any checkout**:
+
+1. Load `sieve.ckpt` via `readCheckpoint`; validate trailer `N == config N` (stale checkpoint
+   rejected — never silently consumed). Fall back to `sieve.ckpt.prev` on a torn live file.
+2. **Topology guard (`clusterResumeTopologyOk`):** reject if checkpoint `node_count` differs from
+   the current run, or if `completedPrefixCursor` falls outside the current overflow pool bounds.
+   A rejected resume starts fresh (safe; never skips a-values).
+3. **Re-inject smooths:** `cluster_accumulator_->addRelations(loaded_smooths, 0)` — rebuilds
+   `accumulated_` **and** the `seen_` dedup set, so the live pooled count includes the loaded
+   smooths and `targetReached()` works unchanged.
+4. **Re-feed partials:** `cluster_cpu_lp_->insertAndMatch(loaded_partials, *cluster_accumulator_)`
+   — rebuilds `table_`, re-emits deduped combines (same-`sqrt_Q` identity guard prevents
+   self-combine). Also buffers partials into `cluster_raw_partials_`.
+5. **Restore overflow cursor (B2):** `cluster_work_pool_->setCursor(completedPrefixCursor)`.
+   Using `nextCursor()` (= `next_`) instead would silently drop `in_flight_ ∪ returned_` chunks
+   (lost on kill), leaving those a-values never sieved → under-collection and faster overflow
+   drain → re-introduces the `4d20d7b` pool exhaustion. The completed prefix conservatively
+   re-sieves only the out-of-order overflow tail above it (dedup-safe).
+6. **Re-issue trimmed initial ranges (M1):** each node's `WORK_ASSIGN` is trimmed to
+   `[orig_start + hw_node, orig_count − hw_node)` from the per-node high-water array.
+   A node whose initial range is exactly complete re-sieves the last hypercube H (count==0
+   boundary guard; dedup-safe). The coordinator's own (node-0) initial range is handled via
+   `poly_range_start`/`poly_range_count` so the existing `resetAndAdvanceTo` jump gate applies.
+
+Thread A then proceeds; the cluster sieves only the remaining a-space (overflow tail above the
+prefix + trimmed initial tails) and tops up to the target.
+
+### Run-Stable Checkpoint Path
+
+A `CKPT_DIR` keyed on `SLURM_JOB_ID` breaks cross-resubmit resume (fresh jobid → fresh empty
+dir → checkpoint never found). The production sbatch uses a **jobid-independent** path:
+
+```bash
+RUN_TAG="${RUN_TAG:-rsa140_F40M_M131K_L40T}"
+CKPT_DIR="$RUN_BASE/cuda-mpqs/${RUN_TAG}_ckpt"
+if [ -s "$CKPT_DIR/sieve.ckpt" ]; then
+  COORD_RESUME="--resume"
+else
+  COORD_RESUME=""
+fi
+COORD_CKPT="--checkpoint_dir $CKPT_DIR --checkpoint_interval 1800 $COORD_RESUME"
+# Pass $COORD_CKPT to the coordinator rank only; workers run without checkpoint flags.
+```
+
+`$RUN_TAG` changes only to start a genuinely independent run (a new N or new param set). The
+loader validates the trailer `N == config N` so a stale checkpoint from a different run is
+rejected rather than silently consumed. The final `relations.v2` (Phase-2 matrix handoff) is
+written only at sieve completion, unchanged; `sieve.ckpt` is an internal resume artifact only.
+
+See `tools/cluster/rsa140_a100_4node_pc2.sbatch` (production) and
+`tools/cluster/rsa130_a100_2node_resume_smoke_pc2.sbatch` (2-node kill+resubmit smoke, ~20 min).
+
 ## Known Issues
 
 - **Thread B range enforcement:** Coordinator Thread B may slightly overshoot its assigned contiguous range due to batch quantization.

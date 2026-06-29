@@ -5,6 +5,7 @@
 
 #include "device_sieving_controller.h"
 #include "common.h"
+#include "sieve_memory_model.h"   // single source-of-truth sieve memory model
 #include <bit>
 #include <algorithm>
 #include <iostream>
@@ -59,6 +60,7 @@ DeviceSievingController::~DeviceSievingController()
     if (dev_pointers.dev_a_factors) cudaFree(dev_pointers.dev_a_factors);
     if (dev_pointers.dev_B_values) cudaFree(dev_pointers.dev_B_values);
     if (dev_pointers.dev_primeData) cudaFree(dev_pointers.dev_primeData);
+    if (dev_pointers.dev_primeBValues) cudaFree(dev_pointers.dev_primeBValues);
     if (dev_pointers.dev_globalBucketEntries) cudaFree(dev_pointers.dev_globalBucketEntries);
     if (dev_pointers.dev_globalBucketCounts) cudaFree(dev_pointers.dev_globalBucketCounts);
     if (dev_pointers.dev_candidateRelations) cudaFree(dev_pointers.dev_candidateRelations);
@@ -800,9 +802,96 @@ void DeviceSievingController::loadStandardConfig()
     gms_conf.maxActiveBucketsTotal = 2 << 15; //first, we choose how many active buckets per thread block we want
 
     gs_conf.num_sievingBlocksPerSieveCall = (2*fs_params.M)/gs_conf.sievingBlockSize; //next, we choose the sievingBlocksPerCall to cover the whole sieving interval
-    //reduce polys sieved until everything fits into global memory
-    while(gs_conf.num_polysPerSieveCall*gs_conf.num_sievingBlocksPerSieveCall*gs_conf.globalBucketSize*sizeof(uint64_t) > g_info.totalGlobalMem){
-        gs_conf.num_polysPerSieveCall >>= 1;
+    // Reduce polys sieved until the global bucket buffer fits with headroom.
+    //
+    // The bucket buffer (dev_globalBucketEntries, kernel.cu:593) is
+    //   num_polysPerSieveCall * num_sievingBlocksPerSieveCall * globalBucketSize * 8 bytes.
+    // Substituting num_sievingBlocksPerSieveCall = 2M/sievingBlockSize and
+    // globalBucketSize = sievingBlockSize/2, it collapses to num_polysPerSieveCall * M * 8
+    // bytes, i.e. it scales linearly with the sieve interval M. At large FB the loop is
+    // entered with num_polysPerSieveCall = min(32768, 2^(shc_dim-1)).
+    //
+    // The bound is 3/4 * totalGlobalMem, NOT totalGlobalMem: the config validator
+    // (validateConfig, the LEQ_CHECK below; KernelLaunchValidator::checkGlobalMem)
+    // already requires this exact 3/4 headroom, so capping the loop only at totalGlobalMem
+    // could leave a config the validator then rejects, AND a buffer consuming nearly all of
+    // VRAM with nothing left for the factor base, primeData, and the postprocessing/LP
+    // buffers (~13 GB at RSA-140).
+    //
+    // 32-BIT OVERFLOW FIX (verified root cause of the M=262K/RSA-140 OOM). The ORIGINAL
+    // hand-rolled loop condition computed
+    //   num_polysPerSieveCall * num_sievingBlocksPerSieveCall * globalBucketSize
+    // as a product of three uint32_t fields, evaluated left-to-right in 32-bit BEFORE the
+    // trailing * sizeof(uint64_t) promoted to size_t. For any bucket >= 4 GB the uint32_t
+    // product wraps. At the M=262144 seed (32768 * 8 * 32768 = 2^33) it wraps to 0, so the
+    // condition `0 > 3*total/4` is false, the loop never reduces num_polys, and the
+    // (long long)-cast allocation at kernel.cu:593 requests the true ~68.7 GB -> OOM on a
+    // 40 GB A100. This is why commit 383438f (which only tightened the RHS budget from
+    // totalGlobalMem to 3/4) did nothing for M=262K: the LHS had already wrapped to 0.
+    //
+    // The single source-of-truth helper (sieve_memory_model.h) computes the bucket term in
+    // 64-bit (reduceNumPolysToBudget casts num_polys to uint64_t first), so it correctly
+    // reduces num_polys at large buckets. The budget is now sieveBucketBudget(totalGlobalMem,
+    // 0, 4, 5) == (4*totalGlobalMem)/5 == 0.80*VRAM (S2 flipped kSieveBudget from 3/4 to 4/5;
+    // S1 used 3/4). Net effect of routing through the helper: the 64-bit LHS corrects the
+    // 32-bit overflow that OOMed M=262K/RSA-140; the RHS at 0.80 is a deliberate +5%-of-VRAM
+    // loosening shared with the production validator and the autotune OOM guard, so the
+    // validated operating points (e.g. M=131072 — well under budget) are unaffected.
+    //
+    // This loop governs ONLY loadStandardConfig() — the autotune Stage-1 benchmarking seed
+    // (whose chosen production params come from independent loadPartialCustomConfig() tuples,
+    // not from this npc) and the no-autotune/no-history/no-pinned-params fallback. The
+    // validated production path (--autotune_stage1 / pinned params / AutoApply history) calls
+    // loadPartialCustomConfig(), which sets num_polysPerSieveCall directly from the tuned
+    // tuple (e.g. 512) and never runs this loop.
+    gs_conf.num_polysPerSieveCall = reduceNumPolysToBudget(
+        gs_conf.num_polysPerSieveCall,
+        gs_conf.num_sievingBlocksPerSieveCall,
+        gs_conf.globalBucketSize,
+        sieveBucketBudget(g_info.totalGlobalMem, 0, kSieveBudgetNum, kSieveBudgetDen),
+        /*min_num_polys=*/0);
+
+    // ----- Autotune OOM-guard knob (S2). DEFAULTED OFF (0). ----------------------
+    // When the autotune Stage-1 seed guard set max_total_sieve_bytes_ (= 0.80*free
+    // VRAM minus the postprocessing/LP footprint and the CUDA-context reserve), the
+    // bucket-only reduction above is necessary but NOT sufficient: it bounds only
+    // dev_globalBucketEntries against 0.80*totalGlobalMem, ignoring the ~GB of
+    // persistent FB/primeData + scratch + the pp/LP buffers that share the same
+    // device. Halve num_polys further until the ENTIRE sieve footprint (bucket +
+    // persistent + scratch, via estimateSieveFootprint) fits the cap. The scratch
+    // grid (ss_conf.num_threadBlocks) is set below at min(256, num_polys); mirror
+    // that here so the estimate matches the realized geometry. Floor at the
+    // validator minimum so >= 1 feasible geometry always survives (the autotune's
+    // fallback, autotune.cpp, handles the genuinely-infeasible case).
+    last_seed_clamp_ = SeedClampInfo{};
+    if (max_total_sieve_bytes_ > 0) {
+        auto footprint_total = [&](uint32_t npc) -> uint64_t {
+            uint32_t ntb = std::min(256u, npc);
+            return estimateSieveFootprint(
+                       npc, gs_conf.num_sievingBlocksPerSieveCall,
+                       gs_conf.globalBucketSize, gs_conf.sievingBlockSize,
+                       ntb, gs_conf.maxRelationsPerBlock,
+                       fs_params.fb_size, fs_params.shc_dim).total();
+        };
+        // Validator minimum num_polys: must satisfy num_threadBlocks*polyBlockSize
+        // <= num_polysPerSieveCall; the smallest power-of-two seed the rest of this
+        // routine produces a valid config for is 1 (num_subCubes caps it above).
+        const uint32_t min_seed = 1u;
+        const uint32_t before = gs_conf.num_polysPerSieveCall;
+        const uint64_t total_before = footprint_total(before);
+        uint32_t npc = before;
+        while (npc > min_seed && footprint_total(npc) > max_total_sieve_bytes_) {
+            npc >>= 1;
+        }
+        if (npc != before) {
+            gs_conf.num_polysPerSieveCall = npc;
+            last_seed_clamp_.clamped          = true;
+            last_seed_clamp_.num_polys_before = before;
+            last_seed_clamp_.num_polys_after  = npc;
+            last_seed_clamp_.total_before     = total_before;
+            last_seed_clamp_.total_after      = footprint_total(npc);
+            last_seed_clamp_.budget           = max_total_sieve_bytes_;
+        }
     }
     gs_conf.num_subCubes = std::min(32768u,(1u << fs_params.shc_dim)/2)/gs_conf.num_polysPerSieveCall;
     //set activeBlocks to the max (that is how many subintervals are considered at once)
@@ -1046,8 +1135,16 @@ bool DeviceSievingController::validateConfigs() {
     LEQ_CHECK(gs_conf.num_polysPerSieveCall, ((1u << (fs_params.shc_dim - 1))), validFlag);
     LEQ_CHECK(gms_conf.num_activeBlocksPerCycle, gs_conf.num_sievingBlocksPerSieveCall, validFlag);
 
-    //memcheck
-    LEQ_CHECK(gs_conf.num_polysPerSieveCall*gs_conf.num_sievingBlocksPerSieveCall*gs_conf.globalBucketSize*sizeof(uint64_t), 3*g_info.totalGlobalMem/4, validFlag);//keep a buffer
+    //memcheck — routed through the single source-of-truth memory model (sieve_memory_model.h).
+    // Like the loadStandardConfig loop above, the ORIGINAL LHS here multiplied three uint32_t
+    // fields (num_polysPerSieveCall * num_sievingBlocksPerSieveCall * globalBucketSize) in
+    // 32-bit before the trailing * sizeof(uint64_t) promoted, so it WRAPPED for buckets >= 4 GB
+    // (e.g. the M=262K seed wraps to 0, masking the over-budget config). bucketEntriesBytes()
+    // computes the same dev_globalBucketEntries term in 64-bit; the RHS
+    // sieveBucketBudget(totalGlobalMem,0,4,5) == (4*totalGlobalMem)/5 == 0.80*VRAM (S2; S1
+    // used 3/4). The 64-bit LHS corrects the wrap (now rejects the over-budget config); the
+    // 0.80 RHS matches loadStandardConfig and the autotune OOM guard.
+    LEQ_CHECK(bucketEntriesBytes(gs_conf.num_polysPerSieveCall, gs_conf.num_sievingBlocksPerSieveCall, gs_conf.globalBucketSize), sieveBucketBudget(g_info.totalGlobalMem, 0, kSieveBudgetNum, kSieveBudgetDen), validFlag);//keep a buffer
     LEQ_CHECK(gms_conf.sharedMemReq, g_info.maxSharedMemPerBlock, validFlag);
     LEQ_CHECK(ss_conf.sharedMemReq, g_info.maxSharedMemPerBlock, validFlag);
 

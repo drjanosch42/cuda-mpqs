@@ -739,18 +739,24 @@ public:
     __host__ __device__ uint512 sqrt() const {
         if (is_zero()) return uint512((uint32_t)0);
         uint512 x;
-        // Guess: 2^(msb/2)
-        int b = msb() / 2;
+        // Seed from ABOVE the root: x0 = 2^(floor(msb/2)+1) >= sqrt(n) for every n>=1,
+        // since n < 2^(msb+1) => sqrt(n) < 2^((msb+1)/2) <= 2^(floor(msb/2)+1).
+        // Newton's map x=(x+n/x)/2 is non-increasing once x>=sqrt(n) (AM-GM), so the
+        // "stop when it stops decreasing" guard correctly yields floor(sqrt(n)). It
+        // also guarantees n/x<=x throughout, so x+n/x never overflows. (The old seed
+        // 2^floor(msb/2) sat BELOW the root: the first step ascended and tripped the
+        // guard on iteration 0, returning the un-refined seed -> result too small.)
+        int b = msb() / 2 + 1;
         x.limbs[b / 32] = (1U << (b % 32));
 
-        // Newton-Raphson: x = (x + n/x) / 2
+        // Newton-Raphson: x = (x + n/x) / 2  (descends from above to floor sqrt)
         for (int i = 0; i < 32; i++) {
             uint512 t = *this;
             t.div(x);
             t.add(x);
             t.rshift(1); // / 2
-            
-            if (!t.operator<(x)) return x; // Terminate if x stops decreasing
+
+            if (!t.operator<(x)) return x; // Terminate when x stops decreasing
             x = t;
         }
         return x;

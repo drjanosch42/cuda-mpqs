@@ -361,6 +361,7 @@ __device__ __forceinline__ void processCandidate(
     unsigned __int128 remainder = 0;
     bool is_valid_partial = false;
 
+
     if (!is_one) {
         bool fits_128 = true;
         #pragma unroll
@@ -641,13 +642,14 @@ __global__ void yield_prediction_kernel(
     mpqs::postprocessing::PredictionResult* __restrict__ result,
     const uint64_t* __restrict__ global_count,
     uint32_t target,
-    uint32_t total_steps,
+    uint64_t total_steps,
     const mpqs::lp::SLPPinnedStats* __restrict__ lp_stats
 ) {
     // Current relation count (lower 32 bits — count never exceeds 2^32)
     uint32_t R = static_cast<uint32_t>(*global_count);
 
-    // Yield rate: relations per sieve step
+    // Yield rate: relations per sieve step (total_steps is u64 — RSA-140 a-value counts
+    // exceed 2^32; the float division is value-preserving for the smaller-N regimes).
     float lambda = (total_steps > 0) ? static_cast<float>(R) / static_cast<float>(total_steps) : 0.0f;
 
     // LP match rate and predicted LP yield

@@ -5,7 +5,7 @@
 
 set(CUDAMPQS_VERSION_MAJOR 1)
 set(CUDAMPQS_VERSION_MINOR 0)
-set(CUDAMPQS_VERSION_PATCH 3)
+set(CUDAMPQS_VERSION_PATCH 4)
 # Numeric MAJOR.MINOR.PATCH only — consumed by project(... VERSION ...), so it must
 # stay strictly numeric. The non-numeric pre-release suffix (e.g. "a") lives in
 # CUDAMPQS_VERSION_SUFFIX and is appended in the human-facing display string below.

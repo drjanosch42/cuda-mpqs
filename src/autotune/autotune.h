@@ -126,6 +126,15 @@ private:
     void applyToConfig(uint32_t fb_bound, uint32_t sieve_bound, uint64_t lp1_bound);
     void applyBufferRecommendations();
     void printBufferRecommendations();
+
+    /// Postprocessing + large-prime device byte footprint for the current
+    /// pipeline_config_ (accum double-buffer, batch/persistent/partial SoA, and —
+    /// when LP is active — hash directory, payload slabs, witness/output SoA, LP
+    /// pipeline transient). EXCLUDES the sieve bucket (that is estimateSieveFootprint).
+    /// Shared by printBufferRecommendations (the estimate) and the Stage-1 OOM guard
+    /// (the seed/candidate budget) so both use one model. Pure arithmetic on
+    /// pipeline_config_ + memory_estimator.h constants.
+    uint64_t computePostprocessingLpBytes() const;
 };
 
 } // namespace mpqs::autotune

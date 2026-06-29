@@ -332,7 +332,9 @@ public:
         prediction_target_ = target;
         d_lp_stats_ = lp_stats_device_ptr;
     }
-    void updatePredictionSteps(uint32_t total_steps) { prediction_total_steps_ = total_steps; }
+    // total_steps is u64: the solo cursor `current_step` was widened u32→u64 for the
+    // mid-sieve checkpoint (RSA-140 scale exceeds 2^32 a-values), and it flows in here.
+    void updatePredictionSteps(uint64_t total_steps) { prediction_total_steps_ = total_steps; }
 
     /// @brief Lock-free accessor for buffer fill snapshot (mapped pinned memory).
     const BufferFillSnapshot* getBufferFillSnapshot() const { return h_buffer_fill_; }
@@ -390,7 +392,7 @@ private:
     // --- Prediction kernel state ---
     PredictionResult* d_prediction_result = nullptr;
     uint32_t prediction_target_ = 0;
-    uint32_t prediction_total_steps_ = 0;
+    uint64_t prediction_total_steps_ = 0;
     const mpqs::lp::SLPPinnedStats* d_lp_stats_ = nullptr;
 
     // --- Buffer fill telemetry (mapped pinned memory) ---

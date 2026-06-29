@@ -6,6 +6,8 @@
 #include "orchestrator.h"
 #include "mpqs_structures.h"
 #include "relation_io.h"
+#include "sieve_checkpoint.h"   // atomic mid-sieve checkpoint (B1 split + write path)
+#include "relation_hash.h"      // shared dedup hash (m-sharedTU)
 #include "autotune.h"
 #include "auto_apply.h"
 #include "autotune_history.h"
@@ -908,7 +910,122 @@ void MPQSOrchestrator::Run() {
                         // but the upper bound must still be enforced via the tap.
                         if (!ranges.empty()) coord_range_count = ranges[0].count;
 
+                        // S3 (M1): capture the per-node initial contiguous ranges
+                        // {start, count} (index == node_id) so Thread A can clamp the
+                        // per-node initial-range high-water marks at checkpoint-write
+                        // time. Written here, BEFORE Thread A is spawned (:964) and never
+                        // mutated after, so the later cross-thread reads are race-free.
+                        cluster_initial_ranges_.clear();
+                        for (const auto& r : ranges)
+                            cluster_initial_ranges_.emplace_back(r.start, r.count);
+                        cluster_node0_initial_hw_.store(0, std::memory_order_relaxed);
+
+                        // =====================================================
+                        // S4: coordinator RESUME restore (default-off; --resume).
+                        // MUST run BEFORE Thread A starts and BEFORE any
+                        // requestWork/checkoutWork (the setCursor startup-only
+                        // contract) AND before the initial WORK_ASSIGN loop below,
+                        // so each node's initial range is re-issued ALREADY trimmed.
+                        // node_trims stays empty on a fresh run ⇒ no trim, identity.
+                        // =====================================================
+                        std::vector<mpqs::ckpt::ResumeTrim> node_trims;  // empty ⇒ fresh
+                        if (config_.resume) {
+                            const std::string ckpt_dir = config_.checkpoint_dir.empty()
+                                ? (config_.work_dir + "/checkpoint") : config_.checkpoint_dir;
+                            mpqs::ckpt::CheckpointLoadResult lr;
+                            const uint64_t overflow_end = overflow_start + overflow_size;
+                            if (!mpqs::ckpt::loadLatestCheckpoint(ckpt_dir, lr)) {
+                                LOG(LOG_WARNING) << "[Resume] --resume set but no valid checkpoint in "
+                                                 << ckpt_dir << " — starting a fresh cluster run.";
+                            } else if (lr.trailer.N != config_.N) {
+                                LOG(LOG_ERROR_CRITICAL) << "[Resume] checkpoint N mismatch in "
+                                    << ckpt_dir << " — ignoring checkpoint, starting a fresh run.";
+                            } else if (lr.trailer.cluster_section_present != 1) {
+                                LOG(LOG_ERROR_CRITICAL) << "[Resume] checkpoint in " << ckpt_dir
+                                    << " has no cluster block (solo file) — cannot cluster-resume; "
+                                    << "starting a fresh run.";
+                            } else if (lr.trailer.loaded_smooths_dedup != lr.smooths.num_relations) {
+                                LOG(LOG_ERROR_CRITICAL) << "[Resume] checkpoint trailer dedup count "
+                                    << lr.trailer.loaded_smooths_dedup << " != payload smooths "
+                                    << lr.smooths.num_relations << " (corrupt) — starting a fresh run.";
+                            } else if (!mpqs::ckpt::clusterResumeTopologyOk(
+                                           lr.cluster.initial_high_water.size(), num_nodes,
+                                           lr.cluster.completed_prefix_cursor,
+                                           overflow_start, overflow_end)) {
+                                // N2 guard: node-count or overflow-geometry mismatch ⇒ the
+                                // per-node high-water index→range mapping (and the prefix
+                                // cursor) are NOT valid for this run. Reject rather than
+                                // silently mis-map (which would skip un-sieved a-values).
+                                LOG(LOG_ERROR_CRITICAL) << "[Resume] cluster topology/geometry "
+                                    << "mismatch — checkpoint node_count="
+                                    << lr.cluster.initial_high_water.size() << " vs current="
+                                    << num_nodes << ", prefix=" << lr.cluster.completed_prefix_cursor
+                                    << " overflow=[" << overflow_start << ", " << overflow_end
+                                    << "] — REJECTING resume, starting a fresh run.";
+                            } else {
+                                // --- Valid cluster checkpoint: restore. ---
+                                cluster_resume_active_ = true;
+
+                                // (1) Restore the overflow pool cursor from the COMPLETED
+                                //     PREFIX (B2), NOT next_. Called here, before any checkout
+                                //     (Thread A workers + node-0 overflow loop run later), so
+                                //     setCursor's startup-only asserts (in_flight_/returned_
+                                //     empty) hold.
+                                cluster_work_pool_->setCursor(lr.cluster.completed_prefix_cursor);
+
+                                // (2) Per-node initial-range trims (M1, corrected option (a)).
+                                //     N1: hw is conservative (telemetry lags a CHUNK_COMPLETE
+                                //     by a beat), so a few boundary a-values of an initial
+                                //     range may be RE-SIEVED rather than skipped — benign
+                                //     (count-based target + overflow oversieve absorb it; dedup
+                                //     drops the overlap). We do NOT try to make hw exact.
+                                cluster_initial_resume_offsets_.assign(num_nodes, 0);
+                                node_trims.resize(num_nodes);
+                                for (uint32_t i = 0; i < num_nodes; ++i) {
+                                    uint64_t hw = (i < lr.cluster.initial_high_water.size())
+                                                ? lr.cluster.initial_high_water[i] : 0;
+                                    node_trims[i] = mpqs::ckpt::computeResumeTrim(
+                                        ranges[i].start, ranges[i].count, hw, H);
+                                    cluster_initial_resume_offsets_[i] = node_trims[i].eff_hw;
+                                }
+
+                                // (3) Node 0 (coordinator's own initial sieve): re-issue its
+                                //     trimmed initial range. poly_range_start>0 makes SieveStage
+                                //     jump the siever (resetAndAdvanceTo) exactly like a worker;
+                                //     coord_range_count bounds the local DataTap. Seed node-0's
+                                //     high-water with its offset so a re-checkpoint BEFORE the
+                                //     trimmed leg completes re-reports the offset (re-sieve,
+                                //     never skip) on a further resubmission.
+                                coord_range_count        = node_trims[0].count;
+                                config_.poly_range_start = node_trims[0].start;  // ranges[0].start==0
+                                cluster_node0_initial_hw_.store(node_trims[0].eff_hw,
+                                                                std::memory_order_relaxed);
+
+                                // (4) Stash the loaded payload for re-injection into the pooled
+                                //     state at Thread A start (after the raw-partials reset in
+                                //     networkLoop). Smooths rebuild accumulated_+seen_ BEFORE
+                                //     partials re-feed insertAndMatch (m-dedup-order).
+                                cluster_resume_smooths_  = std::move(lr.smooths);
+                                cluster_resume_partials_ = std::move(lr.partials);
+
+                                LOG(LOG_INFO) << "[Resume] cluster checkpoint loaded from "
+                                    << ckpt_dir << ": smooths="
+                                    << cluster_resume_smooths_.num_relations << " partials="
+                                    << cluster_resume_partials_.num_relations << " prefix="
+                                    << lr.cluster.completed_prefix_cursor << " nodes=" << num_nodes
+                                    << " (target=" << config_.target_relations
+                                    << "). Overflow cursor restored; per-node initial ranges "
+                                    << "trimmed by their high-water.";
+                                for (uint32_t i = 0; i < num_nodes; ++i)
+                                    LOG(LOG_INFO) << "[Resume]   node " << i
+                                        << " initial range trimmed to [" << node_trims[i].start
+                                        << ", " << node_trims[i].start + node_trims[i].count
+                                        << ") (hw=" << node_trims[i].eff_hw << ")";
+                            }
+                        }
+
                         // Send WORK_ASSIGN to each remote worker with actual ranges
+                        // (resume: each is the TRIMMED initial range from node_trims).
                         uint64_t threshold_override = 0;
                         if (config_.lp1_bound > 0) {
                             threshold_override = std::min(config_.lp1_bound,
@@ -916,19 +1033,26 @@ void MPQSOrchestrator::Run() {
                         }
                         for (uint32_t w = 1; w <= comm_backend_->peerCount(); ++w) {
                             auto& range = ranges[w];
+                            uint64_t assign_start = range.start;
+                            uint64_t assign_count = range.count;
+                            if (!node_trims.empty()) {       // resume: trimmed initial range
+                                assign_start = node_trims[w].start;
+                                assign_count = node_trims[w].count;
+                            }
                             auto [buf, len] = cluster::serializeWorkAssign(
                                 f_data_, config_.sieve_batch_size, threshold_override,
                                 config_.lp1_bound,
-                                /*poly_range_start=*/range.start,
-                                /*poly_range_count=*/range.count,
+                                /*poly_range_start=*/assign_start,
+                                /*poly_range_count=*/assign_count,
                                 config_.target_relations,
                                 &a_factors_snapshot_);
                             comm_backend_->send(static_cast<uint8_t>(w),
                                 cluster::MsgType::WORK_ASSIGN, buf.data(),
                                 static_cast<uint32_t>(len));
                             LOG(LOG_INFO) << "Coordinator: WORK_ASSIGN to worker " << w
-                                          << " range=[" << range.start << ", "
-                                          << range.start + range.count << ")";
+                                          << " range=[" << assign_start << ", "
+                                          << assign_start + assign_count << ")"
+                                          << (node_trims.empty() ? "" : " (resume-trimmed)");
                         }
                     }
 
@@ -1007,6 +1131,29 @@ void MPQSOrchestrator::Run() {
                             cluster_scheduler_->recordCompletion(
                                 /*worker_id=*/0, /*rels=*/0,
                                 cluster_channel_->aValsConsumed(), time_sieve_sec);
+
+                            // S3 (M1): capture node 0's initial-range contiguous
+                            // high-water NOW — the DirectChannel a-val counter is reset
+                            // by setRange() for each subsequent overflow chunk (:1043),
+                            // so this is the only instant it still reads the initial
+                            // range's consumption. Thread A reads it atomically at the
+                            // checkpoint boundary. Until this fires it stays 0 (or its
+                            // resume offset), so a checkpoint taken mid-initial-sieve
+                            // conservatively re-sieves node 0's (remaining) initial range
+                            // on resume (never skips).
+                            // S4 resume: the local sieve consumed a-values from the TRIMMED
+                            // start (poly_range_start == eff_hw_0), so the ABSOLUTE high-water
+                            // is the offset + the consumed count (clamped to the initial range
+                            // size). Fresh run: offset 0, cap == orig_count ⇒ == aValsConsumed().
+                            {
+                                uint64_t off0 = cluster_initial_resume_offsets_.empty()
+                                    ? 0 : cluster_initial_resume_offsets_[0];
+                                uint64_t cap0 = (!cluster_initial_ranges_.empty())
+                                    ? cluster_initial_ranges_[0].second : UINT64_MAX;
+                                cluster_node0_initial_hw_.store(
+                                    std::min(off0 + cluster_channel_->aValsConsumed(), cap0),
+                                    std::memory_order_relaxed);
+                            }
 
                             // Terminate on the EXPLICIT stop signal (target reached
                             // → Thread A signalStop, or teardown), NOT on the
@@ -1184,7 +1331,108 @@ void MPQSOrchestrator::Run() {
                 f_data_.factorBase = meta.factor_base;
                 f_data_.size = meta.factor_base.size();
                 config_.N = meta.N;
+                // config_.lp1_bound is RESTORED to the sieve's true bound here on
+                // purpose (it drives the LP-fraction baseline + char-aux selection).
+                // The L-magnitude down-filter below uses the SEPARATE, explicit
+                // config_.matrix_lp1_bound override, so it survives this assignment.
                 config_.lp1_bound = meta.lp_bound;
+            }
+        }
+
+        // --- L-magnitude down-filter (matrix_only): build the matrix at an
+        //     EFFECTIVE LP bound BELOW the sieve's baked-in lp_bound, WITHOUT
+        //     re-sieving. -----------------------------------------------------
+        // A sieve-time-combined relation pairs two single-large-prime (1LP) partials
+        // that shared the SAME large prime p; the combined row stores that p in
+        // large_primes[i] (p^2 cancels in GF(2), so the row is smooth-like). Under a
+        // lower sieve bound L' < lp_bound, any partial with p > L' would have been
+        // REJECTED at sieve time, so its combine could not exist. Dropping every
+        // LP-combined row whose stored large prime > matrix_lp1_bound therefore
+        // reproduces EXACTLY the relation set a sieve at L' would have produced.
+        //   * PURE SMOOTHS (large_primes <= 1) are NEVER dropped.
+        //   * This is the 1LP variant: each combined row carries ONE stored large
+        //     prime, so "drop if EITHER prime exceeds L" reduces to that one value.
+        //   * Raw partials (preprocess path) are filtered by the same bound.
+        // Default matrix_lp1_bound == 0 -> inert (legacy behavior unchanged).
+        if (config_.mode == ExecutionMode::MATRIX_ONLY && config_.matrix_lp1_bound > 0) {
+            const uint64_t Lf = config_.matrix_lp1_bound;
+            if (Lf >= config_.lp1_bound) {
+                LOG(LOG_WARNING) << "L-filter: --matrix_lp1_bound (" << Lf
+                                 << ") >= sieve lp_bound (" << config_.lp1_bound
+                                 << ") -> no relation exceeds it; filter is a no-op.";
+            }
+
+            // (1) Filter the smooths-batch LP-combined rows (LEGACY matrix input).
+            {
+                const size_t n_before = host_relations_soa_.num_relations;
+                structures::HostRelationBatch sub;
+                sub.factor_offsets.push_back(0);
+                uint64_t fcursor = 0, lp_before = 0, lp_kept = 0, dropped = 0;
+                for (size_t i = 0; i < n_before; ++i) {
+                    const bool is_lp = host_relations_soa_.large_primes[i] > 1;
+                    if (is_lp) ++lp_before;
+                    // Drop ONLY LP-combined rows whose stored large prime exceeds Lf.
+                    // (Lf is uint64; the unsigned __int128 LHS promotes — no truncation.)
+                    if (is_lp && host_relations_soa_.large_primes[i] > Lf) {
+                        ++dropped;
+                        continue;
+                    }
+                    sub.sqrt_Q.push_back(host_relations_soa_.sqrt_Q[i]);
+                    sub.signs.push_back(host_relations_soa_.signs[i]);
+                    sub.val_2_exps.push_back(host_relations_soa_.val_2_exps[i]);
+                    sub.large_primes.push_back(host_relations_soa_.large_primes[i]);
+                    const uint64_t fb = host_relations_soa_.factor_offsets[i];
+                    const uint64_t fe = host_relations_soa_.factor_offsets[i + 1];
+                    for (uint64_t j = fb; j < fe; ++j) {
+                        sub.factor_indices.push_back(host_relations_soa_.factor_indices[j]);
+                        sub.factor_counts.push_back(host_relations_soa_.factor_counts[j]);
+                    }
+                    fcursor += (fe - fb);
+                    sub.factor_offsets.push_back(fcursor);
+                    if (is_lp) ++lp_kept;
+                }
+                sub.num_relations = sub.sqrt_Q.size();
+                sub.num_factors = fcursor;
+                const double lpf_before = n_before ? 100.0 * lp_before / n_before : 0.0;
+                const double lpf_after  = sub.num_relations
+                                        ? 100.0 * lp_kept / sub.num_relations : 0.0;
+                LOG(LOG_INFO) << "L-filter (matrix_lp1_bound=" << Lf
+                              << ", sieve lp_bound=" << config_.lp1_bound << "): smooths "
+                              << n_before << " -> " << sub.num_relations << " (dropped "
+                              << dropped << " LP-combined > L; pure smooths untouched). "
+                              << "LP fraction " << std::fixed << std::setprecision(1)
+                              << lpf_before << "% -> " << lpf_after << "%.";
+                host_relations_soa_ = std::move(sub);
+            }
+
+            // (2) Filter raw partials too (preprocess path consumes them; the legacy
+            //     path ignores them, so this is harmless there).
+            if (host_partials_soa_.num_relations > 0) {
+                const size_t n_before = host_partials_soa_.num_relations;
+                structures::HostRelationBatch sub;
+                sub.factor_offsets.push_back(0);
+                uint64_t fcursor = 0, dropped = 0;
+                for (size_t i = 0; i < n_before; ++i) {
+                    if (host_partials_soa_.large_primes[i] > Lf) { ++dropped; continue; }
+                    sub.sqrt_Q.push_back(host_partials_soa_.sqrt_Q[i]);
+                    sub.signs.push_back(host_partials_soa_.signs[i]);
+                    sub.val_2_exps.push_back(host_partials_soa_.val_2_exps[i]);
+                    sub.large_primes.push_back(host_partials_soa_.large_primes[i]);
+                    const uint64_t fb = host_partials_soa_.factor_offsets[i];
+                    const uint64_t fe = host_partials_soa_.factor_offsets[i + 1];
+                    for (uint64_t j = fb; j < fe; ++j) {
+                        sub.factor_indices.push_back(host_partials_soa_.factor_indices[j]);
+                        sub.factor_counts.push_back(host_partials_soa_.factor_counts[j]);
+                    }
+                    fcursor += (fe - fb);
+                    sub.factor_offsets.push_back(fcursor);
+                }
+                sub.num_relations = sub.sqrt_Q.size();
+                sub.num_factors = fcursor;
+                LOG(LOG_INFO) << "L-filter raw partials: " << n_before << " -> "
+                              << sub.num_relations << " (dropped " << dropped
+                              << " with large_prime > L).";
+                host_partials_soa_ = std::move(sub);
             }
         }
 
@@ -3129,6 +3377,500 @@ void MPQSOrchestrator::logBufferWarnings() {
 // Stage 2: Sieve
 // -----------------------------------------------------------------------------
 
+// === B1 split: end-of-sieve finalize (dedup + fb_size+64 deficit guard + D2H) ===
+// VERBATIM extraction of the former inline end-of-sieve sequence — pure code-move,
+// no logic change (S1 identity gate: counts + factors match the S0 baseline). The
+// destructive deduplicatePersistentBatch() is correct ONLY here (nothing accumulates
+// afterward); the mid-loop checkpoint uses the copy-only copyPersistentToHost() instead.
+void MPQSOrchestrator::finalizePersistentToHost(uint64_t& pre_dedup_count,
+                                                uint64_t& post_dedup_count,
+                                                uint64_t deficit_floor) {
+    cudaSetDevice(config_.device_id);
+
+    // Ensure LP append operations complete before dedup reads persistent batch
+    if (config_.lp1_bound > 0 && largeprime_) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    pre_dedup_count = postprocessor_->getPersistentBatch()->getCount(
+        postprocessor_->getCudaStream());
+    cudaStreamSynchronize(postprocessor_->getCudaStream());
+
+    postprocessor_->deduplicatePersistentBatch();
+
+    post_dedup_count = postprocessor_->getPersistentBatch()->getCount(
+        postprocessor_->getCudaStream());
+    cudaStreamSynchronize(postprocessor_->getCudaStream());
+
+    LOG(LOG_INFO) << "Dedup: " << pre_dedup_count << " -> " << post_dedup_count
+                  << " (" << (pre_dedup_count - post_dedup_count) << " duplicates removed)";
+
+    // =========================================================================
+    // 6b. Post-dedup deficit re-sieve
+    // =========================================================================
+    // When shc_dim inflation (Jetson polynomial exhaustion guard) or other
+    // factors cause high duplicate rates, post-dedup count may fall below
+    // FB size.  Re-sieve to collect the deficit instead of aborting.
+    {
+        const uint64_t fb_size = f_data_.factorBase.size();
+        // Resume passes an explicit floor (accounting for already-loaded relations); the
+        // normal path uses the canonical fb_size+64. A floor of 0 disables the guard cleanly.
+        const uint64_t floor = (deficit_floor == kDeficitFloorAuto) ? (fb_size + 64) : deficit_floor;
+        int resieve_attempts = 0;
+        constexpr int kMaxResieveAttempts = 3;
+
+        while (post_dedup_count < floor && resieve_attempts < kMaxResieveAttempts) {
+            ++resieve_attempts;
+            double dedup_rate = (pre_dedup_count > 0)
+                ? static_cast<double>(pre_dedup_count - post_dedup_count) / pre_dedup_count
+                : 0.0;
+            uint64_t deficit = floor + 64 - post_dedup_count;
+            // Over-collect: deficit / (1 - dedup_rate) + margin
+            uint64_t extra = static_cast<uint64_t>(
+                deficit / std::max(0.3, 1.0 - dedup_rate)) + 512;
+
+            LOG(LOG_INFO) << "Post-dedup deficit: " << deficit
+                          << " relations short (dedup=" << std::fixed << std::setprecision(1)
+                          << (dedup_rate * 100.0) << "%). Re-sieve " << resieve_attempts
+                          << "/" << kMaxResieveAttempts << " for ~" << extra << " more.";
+
+            // Dedup replaces d_persistent_batch with a tight-fit batch (cap == count).
+            // Expand it to hold the deficit + margin before the continuation loop.
+            uint64_t resieve_cap_rels = post_dedup_count + extra + 1024;
+            uint64_t est_factors_per_rel = 30;  // conservative average
+            uint64_t resieve_cap_factors = resieve_cap_rels * est_factors_per_rel;
+            postprocessor_->getPersistentBatch()->resize(
+                static_cast<size_t>(resieve_cap_rels),
+                static_cast<size_t>(resieve_cap_factors));
+
+            // Resync pinned counter + dual counter after dedup replaced the batch
+            postprocessor_->resyncPersistentDualCounter();
+            cudaStreamSynchronize(postprocessor_->getCudaStream());
+
+            uint64_t resieve_target = post_dedup_count + extra;
+
+            postprocessor_->getPersistentBatch()->setTargetCap(
+                static_cast<uint32_t>(std::min(resieve_target + 512,
+                    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))));
+
+            // Synchronous continuation loop (sync-heavy but short — only covers deficit)
+            while (*postprocessor_->h_pinned_persistent_count < resieve_target) {
+                siever_->advance_a(1);
+
+                if (config_.sieve_batch_size > 0) {
+                    auto* buf = postprocessor_->getActiveAccumulationBuffer();
+                    cudaStreamSynchronize(siever_->getCudaStream());
+
+                    siever_->setPostProcessingLinks(buf);
+                    siever_->prepareSievingBatch();
+                    siever_->runSievingBatch(config_.sieve_batch_size, 0);
+                    cudaEventRecord(buf->safe_to_read_event, siever_->getCudaStream());
+
+                    postprocessor_->processBatchBufferedCandidates();
+                    cudaStreamSynchronize(postprocessor_->getCudaStream());
+                } else {
+                    siever_->updateState();
+                    siever_->sieveFullCube();
+
+                    postprocessor_->accumulate(
+                        siever_->getRawCandidates(),
+                        siever_->getRawCandidateBufferSize(),
+                        siever_->getFactoringData().a,
+                        siever_->getDeviceA_Factors(),
+                        static_cast<uint32_t>(siever_->getFactoringData().a_factors.size()),
+                        -static_cast<int32_t>(siever_->getFactoringData().M),
+                        siever_->getCudaStream());
+                    postprocessor_->processBufferedCandidates();
+                    postprocessor_->consolidateToPersistent();
+                    cudaStreamSynchronize(postprocessor_->getCudaStream());
+                }
+
+                // LP processing if active (synchronous — deficit is small)
+                if (config_.lp1_bound > 0 && largeprime_) {
+                    largeprime_->processAndCommit(
+                        postprocessor_->getPartialBatch(),
+                        postprocessor_->getPersistentBatch()
+                    );
+                    cudaStreamWaitEvent(postprocessor_->getCudaStream(),
+                                        largeprime_->getDoneEvent(), 0);
+                    postprocessor_->resetPartialBatch();
+                }
+            }
+
+            // Re-dedup
+            if (config_.lp1_bound > 0 && largeprime_)
+                cudaDeviceSynchronize();
+
+            pre_dedup_count = postprocessor_->getPersistentBatch()->getCount(
+                postprocessor_->getCudaStream());
+            cudaStreamSynchronize(postprocessor_->getCudaStream());
+
+            postprocessor_->deduplicatePersistentBatch();
+
+            post_dedup_count = postprocessor_->getPersistentBatch()->getCount(
+                postprocessor_->getCudaStream());
+            cudaStreamSynchronize(postprocessor_->getCudaStream());
+
+            LOG(LOG_INFO) << "Re-dedup: " << pre_dedup_count << " -> "
+                          << post_dedup_count << " (" << (pre_dedup_count - post_dedup_count)
+                          << " duplicates removed)";
+        }
+
+        if (post_dedup_count < floor) {
+            LOG(LOG_ERROR_CRITICAL) << "Still insufficient after "
+                                    << kMaxResieveAttempts << " re-sieve attempts: "
+                                    << post_dedup_count << " < " << floor;
+        }
+    }
+
+    LOG(LOG_DEBUG_1) << "Downloading persistent relations to Host...";
+
+    mpqs::structures::RelationBatch* d_persistent = postprocessor_->getPersistentBatch();
+    if (d_persistent) {
+        cudaStream_t pp_stream = postprocessor_->getCudaStream();
+        d_persistent->moveToHost(host_relations_soa_, pp_stream);
+        cudaStreamSynchronize(pp_stream);
+
+        // Extract raw partial witnesses for expanded matrix path
+        if (config_.lp1_bound > 0 && largeprime_) {
+            largeprime_->moveWitnessesToHost(host_partials_soa_, pp_stream);
+            cudaStreamSynchronize(pp_stream);
+            LOG(LOG_INFO) << "Downloaded " << host_partials_soa_.num_relations
+                          << " LP witness partials for expanded matrix.";
+        }
+
+        // DIAGNOSTIC (strictly opt-in via --dump_combine_provenance): download and
+        // serialize per-combined-relation constituent provenance captured before the
+        // slab purge. ADDITIVE — does nothing unless the flag was set at LP init.
+        if (config_.dump_combine_provenance && config_.lp1_bound > 0 && largeprime_) {
+            std::vector<mpqs::lp::CombineProvenanceEntry> prov;
+            largeprime_->moveProvenanceToHost(prov, pp_stream);
+            cudaStreamSynchronize(pp_stream);
+
+            std::string prov_path = (std::filesystem::path(config_.work_dir)
+                                     / "combine_provenance.bin").string();
+            std::filesystem::create_directories(config_.work_dir);
+            std::ofstream pf(prov_path, std::ios::binary);
+            if (pf) {
+                // Header: magic "MPQSPRV1" (8B) | version u32 | record_size u32 |
+                //         N (64B little-endian limbs) | record_count u64
+                const char MAGIC[8] = {'M','P','Q','S','P','R','V','1'};
+                pf.write(MAGIC, 8);
+                uint32_t version = 1;
+                uint32_t rec_size = (uint32_t)sizeof(mpqs::lp::CombineProvenanceEntry);
+                pf.write(reinterpret_cast<const char*>(&version), sizeof(version));
+                pf.write(reinterpret_cast<const char*>(&rec_size), sizeof(rec_size));
+                pf.write(reinterpret_cast<const char*>(config_.N.limbs), 64);
+                uint64_t n = prov.size();
+                pf.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                if (n > 0)
+                    pf.write(reinterpret_cast<const char*>(prov.data()), n * rec_size);
+                LOG(LOG_INFO) << "[dump_combine_provenance] Wrote " << n
+                              << " provenance records (" << rec_size << " B each) to " << prov_path;
+            } else {
+                LOG(LOG_ERROR_CRITICAL) << "[dump_combine_provenance] Failed to open "
+                                        << prov_path << " for writing.";
+            }
+        }
+    } else {
+        LOG(LOG_ERROR_CRITICAL) << "Persistent buffer missing!";
+    }
+}
+
+// === B1 split: copy-only host snapshot (reusable mid-loop; NEVER dedups device state) ===
+void MPQSOrchestrator::copyPersistentToHost(
+    mpqs::structures::HostRelationBatch& smooths_out,
+    mpqs::structures::HostRelationBatch& partials_out) {
+    mpqs::structures::RelationBatch* d_persistent = postprocessor_->getPersistentBatch();
+    if (!d_persistent) {
+        LOG(LOG_ERROR_CRITICAL) << "copyPersistentToHost: persistent buffer missing!";
+        smooths_out.clear();
+        partials_out.clear();
+        return;
+    }
+    cudaStream_t pp_stream = postprocessor_->getCudaStream();
+
+    // Drain/sync before the copy-only D2H. When LP is active a full device sync is required
+    // so any in-flight witness-table write on lp_stream is complete before moveWitnessesToHost
+    // reads it (mirrors the end-of-sieve pre-dedup device sync). moveToHost()/moveWitnessesToHost()
+    // are copy-only (mpqs_soa.cu / largeprime.cu) — they read device->host and never clear/resize
+    // the live device batch or witness table, so the running sieve is undisturbed (B1).
+    if (config_.lp1_bound > 0 && largeprime_) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(pp_stream));
+    }
+
+    d_persistent->moveToHost(smooths_out, pp_stream);
+    CUDA_CHECK(cudaStreamSynchronize(pp_stream));
+
+    if (config_.lp1_bound > 0 && largeprime_) {
+        largeprime_->moveWitnessesToHost(partials_out, pp_stream);
+        CUDA_CHECK(cudaStreamSynchronize(pp_stream));
+    } else {
+        partials_out.clear();
+    }
+}
+
+// === Mid-sieve checkpoint emit (solo; default-off; copy-only snapshot, B1) ===
+void MPQSOrchestrator::maybeCheckpoint(uint64_t current_step, uint64_t processed_batches,
+                                       double elapsed_sieve_sec) {
+    // Default-off no-op. S1 restricts checkpointing to SOLO: the cluster coordinator's
+    // pooled-state checkpoint is S3 (written from Thread A), and workers never checkpoint
+    // (S4). Gating on SOLO keeps cluster runs byte-unchanged in S1.
+    if (config_.cluster_mode != ClusterMode::SOLO) return;
+    const bool enabled = (config_.checkpoint_interval_sec > 0 || config_.checkpoint_batches > 0);
+    if (!enabled) return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (!checkpoint_timer_started_) {
+        // Arm the timers on the first call after loop start; do NOT checkpoint at t=0.
+        last_checkpoint_time_     = now;
+        last_checkpoint_batch_    = processed_batches;
+        checkpoint_timer_started_ = true;
+        return;
+    }
+
+    bool fire = false;
+    if (config_.checkpoint_interval_sec > 0) {
+        double since = std::chrono::duration<double>(now - last_checkpoint_time_).count();
+        if (since >= static_cast<double>(config_.checkpoint_interval_sec)) fire = true;
+    }
+    if (config_.checkpoint_batches > 0) {
+        if (processed_batches - last_checkpoint_batch_ >= config_.checkpoint_batches) fire = true;
+    }
+    if (!fire) return;
+
+    const std::string ckpt_dir = config_.checkpoint_dir.empty()
+        ? (config_.work_dir + "/checkpoint") : config_.checkpoint_dir;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // 1. Copy-only snapshot of the live device state into SCRATCH host buffers (B1).
+    copyPersistentToHost(ckpt_scratch_smooths_, ckpt_scratch_partials_);
+
+    // 2. Host-side dedup of the SCRATCH smooths copy (shrinks the file only; the live device
+    //    batch is untouched). raw = pre-dedup device count (M2 target accounting in S2).
+    const uint64_t raw = ckpt_scratch_smooths_.num_relations;
+    mpqs::ckpt::dedupRelationsInPlace(ckpt_scratch_smooths_);
+    const uint64_t deduped = ckpt_scratch_smooths_.num_relations;
+
+    // 3. Metadata mirrors saveRelationsIfRequested (so the payload is a normal relations.v2).
+    mpqs::io::V2Metadata meta;
+    meta.N           = config_.N;
+    meta.factor_base = f_data_.factorBase;
+    meta.lp_bound    = config_.lp1_bound;
+    meta.sieve_bound = config_.sieve_bound;
+    if (config_.char_mode == matrix::CharMode::BRANCH && !branch_aux_primes_.empty()) {
+        meta.aux_primes = branch_aux_primes_;
+        meta.t_s        = branch_aux_t_s_;
+        meta.r          = static_cast<uint32_t>(branch_aux_primes_.size());
+    }
+
+    mpqs::ckpt::CheckpointTrailer tr;
+    tr.global_a_index          = current_step;
+    tr.target_relations        = config_.target_relations;
+    tr.loaded_smooths_raw      = raw;
+    tr.loaded_smooths_dedup    = deduped;
+    tr.loaded_partials         = ckpt_scratch_partials_.num_relations;
+    tr.lp1_bound               = config_.lp1_bound;
+    tr.sieve_bound             = config_.sieve_bound;
+    tr.N                       = config_.N;
+    tr.cluster_section_present = 0;  // solo file (S1)
+    tr.elapsed_sieve_sec       = static_cast<uint64_t>(elapsed_sieve_sec);
+
+    bool ok = mpqs::ckpt::writeCheckpointAtomic(ckpt_dir, ckpt_scratch_smooths_,
+                                                ckpt_scratch_partials_, meta, tr);
+    double ms = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * 1000.0;
+    if (ok) {
+        LOG(LOG_INFO) << "[Checkpoint] wrote sieve.ckpt @ a_index=" << current_step
+                      << " smooths=" << deduped << " partials=" << tr.loaded_partials
+                      << " (drain+copy+write " << std::fixed << std::setprecision(1) << ms << "ms)";
+    } else {
+        LOG(LOG_ERROR_CRITICAL) << "[Checkpoint] FAILED to write sieve.ckpt @ a_index=" << current_step;
+    }
+
+    // Re-arm AFTER the write so the per-checkpoint stall is not charged to the next interval
+    // (clamp: a checkpoint never starts before the previous one finished — trivially true here
+    // since the emit is synchronous in the single-threaded solo loop).
+    last_checkpoint_time_  = std::chrono::steady_clock::now();
+    last_checkpoint_batch_ = processed_batches;
+}
+
+// === S3: coordinator-only mid-sieve checkpoint WRITE (Thread A sole-mutator boundary) ===
+void MPQSOrchestrator::writeClusterCheckpoint(const std::vector<uint64_t>& initial_high_water,
+                                              double elapsed_sieve_sec) {
+    // Caller (Thread A) gates on the interval + coordinator role; defensive guards only.
+    if (!cluster_accumulator_ || !cluster_work_pool_) return;
+
+    const std::string ckpt_dir = config_.checkpoint_dir.empty()
+        ? (config_.work_dir + "/checkpoint") : config_.checkpoint_dir;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Non-consuming snapshot of the pooled deduped smooths (M3). extractFinal() is
+    // destructive and would empty the live accumulator; peek() leaves it intact so the
+    // run continues. Thread A is the sole mutator of cluster_accumulator_ /
+    // cluster_raw_partials_, so reading them here (the bottom-of-loop boundary) is
+    // host-consistent with nothing mid-flight.
+    const mpqs::structures::HostRelationBatch& smooths = cluster_accumulator_->peek();
+
+    // Metadata mirrors saveRelationsIfRequested so the payload is a normal relations.v2.
+    mpqs::io::V2Metadata meta;
+    meta.N           = config_.N;
+    meta.factor_base = f_data_.factorBase;
+    meta.lp_bound    = config_.lp1_bound;
+    meta.sieve_bound = config_.sieve_bound;
+    if (config_.char_mode == matrix::CharMode::BRANCH && !branch_aux_primes_.empty()) {
+        meta.aux_primes = branch_aux_primes_;
+        meta.t_s        = branch_aux_t_s_;
+        meta.r          = static_cast<uint32_t>(branch_aux_primes_.size());
+    }
+
+    mpqs::ckpt::CheckpointTrailer tr;
+    // Cluster progress lives in the cluster block (completedPrefixCursor + per-node
+    // high-water), NOT the solo a-index cursor — set global_a_index to a 0 sentinel.
+    tr.global_a_index          = 0;
+    tr.target_relations        = config_.target_relations;
+    // The accumulator stores already-deduped smooths, so raw == dedup here. (S4 cluster
+    // resume re-injects via addRelations, which re-dedups, so it does not need a separate
+    // pre-dedup raw count the way solo S2 does.)
+    tr.loaded_smooths_raw      = smooths.num_relations;
+    tr.loaded_smooths_dedup    = smooths.num_relations;
+    tr.loaded_partials         = cluster_raw_partials_.num_relations;
+    tr.lp1_bound               = config_.lp1_bound;
+    tr.sieve_bound             = config_.sieve_bound;
+    tr.N                       = config_.N;
+    tr.cluster_section_present = 1;  // an S3 cluster block follows the trailer
+    tr.elapsed_sieve_sec       = static_cast<uint64_t>(elapsed_sieve_sec);
+
+    mpqs::ckpt::CheckpointClusterBlock cb;
+    cb.completed_prefix_cursor = cluster_work_pool_->completedPrefixCursor();  // B2
+    cb.initial_high_water      = initial_high_water;                            // M1
+
+    bool ok = mpqs::ckpt::writeCheckpointAtomic(ckpt_dir, smooths, cluster_raw_partials_,
+                                                meta, tr, &cb);
+    double ms = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count() * 1000.0;
+    if (ok) {
+        LOG(LOG_INFO) << "[Checkpoint] wrote coordinator sieve.ckpt @ prefix="
+                      << cb.completed_prefix_cursor << " smooths=" << smooths.num_relations
+                      << " partials=" << tr.loaded_partials << " nodes="
+                      << cb.initial_high_water.size()
+                      << " (peek+write " << std::fixed << std::setprecision(1) << ms << "ms)";
+    } else {
+        LOG(LOG_ERROR_CRITICAL) << "[Checkpoint] FAILED to write coordinator sieve.ckpt @ prefix="
+                                << cb.completed_prefix_cursor;
+    }
+}
+
+// === S2 solo resume: union merge of loaded checkpoint + new sieve leg ===
+namespace {
+/// Append every relation of `src` onto `dest`, maintaining CSR validity. No dedup — the caller
+/// deduplicates the smooths union via RelationAccumulator; this is used for the raw-partial
+/// concatenation, where duplicate witnesses are idempotent downstream.
+void appendRelationsRaw(mpqs::structures::HostRelationBatch& dest,
+                        const mpqs::structures::HostRelationBatch& src) {
+    if (src.num_relations == 0) return;
+    if (dest.factor_offsets.empty()) dest.factor_offsets.push_back(0);
+    const bool src_has_char = (src.char_bits.size() == src.num_relations);
+    for (size_t i = 0; i < src.num_relations; ++i) {
+        dest.sqrt_Q.push_back(src.sqrt_Q[i]);
+        dest.signs.push_back(src.signs[i]);
+        dest.val_2_exps.push_back(src.val_2_exps[i]);
+        dest.large_primes.push_back(src.large_primes[i]);
+        dest.char_bits.push_back(src_has_char ? src.char_bits[i] : 0u);
+        uint64_t fs = src.factor_offsets[i];
+        uint64_t fe = src.factor_offsets[i + 1];
+        for (uint64_t f = fs; f < fe; ++f) {
+            dest.factor_indices.push_back(src.factor_indices[f]);
+            dest.factor_counts.push_back(src.factor_counts[f]);
+        }
+        dest.num_factors += (fe - fs);
+        dest.factor_offsets.push_back(dest.num_factors);
+        dest.num_relations++;
+    }
+}
+} // anonymous namespace
+
+void MPQSOrchestrator::finalizeResumeUnion(uint64_t& pre_dedup_count,
+                                           uint64_t& post_dedup_count) {
+    const uint64_t fb_size  = f_data_.factorBase.size();
+    const uint64_t fb_floor = fb_size + 64;
+    const uint64_t loaded_dedup = ckpt_loaded_smooths_.num_relations;
+
+    // Device new-leg deficit floor: ensure (new-leg deduped + loaded) ≥ fb_size+64. This ignores
+    // new-vs-loaded cross-duplicates; the host UNION re-assertion below catches the residual.
+    // A floor of 0 (loaded already ≥ fb_size+64, incl. the loaded≥target short-circuit) disables
+    // the device guard cleanly.
+    uint64_t device_floor = (fb_floor > loaded_dedup) ? (fb_floor - loaded_dedup) : 0;
+
+    std::unique_ptr<cluster::RelationAccumulator> acc;
+    constexpr int kMaxUnionAttempts = 3;
+    uint64_t union_count = 0;
+    int attempt = 0;
+    for (;; ++attempt) {
+        // Dedup + D2H the NEW leg into host_relations_soa_/host_partials_soa_ (resume floor, not
+        // the full fb_size+64 — the new leg is intentionally only the remaining target).
+        finalizePersistentToHost(pre_dedup_count, post_dedup_count, device_floor);
+
+        // Host UNION dedup: loaded ∪ new. RelationAccumulator rebuilds accumulated_ AND the seen_
+        // hash-set (shared computeRelationHash, byte-identical to the GPU hash) — this is the
+        // m-dedup-order pre-pass the LP final match needs. Margin 1.0 (targetReached() unused).
+        acc = std::make_unique<cluster::RelationAccumulator>(config_.target_relations, 1.0);
+        acc->addRelations(ckpt_loaded_smooths_, 0);   // source 0 = loaded checkpoint leg
+        acc->addRelations(host_relations_soa_, 1);    // source 1 = freshly-sieved new leg
+        union_count = acc->totalRelations();
+
+        if (union_count >= fb_floor || attempt >= kMaxUnionAttempts) break;
+
+        // M2 deficit-guard re-assertion (load-bearing): the host union bypasses the device guard,
+        // so re-assert fb_size+64 here. Raise the device floor and re-sieve the new leg, then
+        // re-dedup + re-union on the next iteration.
+        uint64_t deficit = fb_floor - union_count;
+        device_floor = post_dedup_count + deficit + 512;
+        LOG(LOG_WARNING) << "[Resume] union " << union_count << " < fb_size+64 (" << fb_floor
+                         << ") — re-asserting deficit guard: re-sieving new leg for ~" << deficit
+                         << " more (attempt " << (attempt + 1) << "/" << kMaxUnionAttempts << ")";
+    }
+    if (union_count < fb_floor) {
+        LOG(LOG_ERROR_CRITICAL) << "[Resume] union still short after " << kMaxUnionAttempts
+                                << " re-sieve attempts: " << union_count << " < " << fb_floor;
+    }
+
+    // Solo LP final host-match (§2.4) — AFTER the union hash-set is built (m-dedup-order). The
+    // accumulator's seen_ already holds every (loaded ∪ new) smooth, so any leg-1 full the matcher
+    // re-derives from loaded×loaded or new×new partials is dropped on addLPRelations; only genuine
+    // cross-checkpoint combines (a loaded partial × a new partial) survive and are appended.
+    // Skip cleanly when lp1_bound==0 (no-LP run — no partials exist).
+    const uint64_t fulls_before_lp = acc->totalRelations();
+    if (config_.lp1_bound > 0 &&
+        (ckpt_loaded_partials_.num_relations > 0 || host_partials_soa_.num_relations > 0)) {
+        cluster::CPULargePrimeTable lp_match(config_.lp1_bound, f_data_);
+        // Insert loaded partials first (table_ ← the loaded leg's unmatched singletons); then the
+        // new partials match against them for cross-checkpoint combines.
+        lp_match.insertAndMatch(ckpt_loaded_partials_, *acc);
+        lp_match.insertAndMatch(host_partials_soa_,    *acc);
+        LOG(LOG_INFO) << "[Resume] LP host-match: " << lp_match.totalCombines() << " raw combines, "
+                      << lp_match.totalDupDropped() << " dup-dropped; "
+                      << (acc->totalRelations() - fulls_before_lp)
+                      << " new cross-checkpoint fulls survived union dedup.";
+    }
+
+    // Final merged smooths = (loaded ∪ new) ∪ cross-checkpoint combines.
+    host_relations_soa_ = acc->extractFinal();
+
+    // v2 partials payload = new ∪ loaded raw witnesses (carried forward so the preprocess matrix
+    // path sees the full partial set; the legacy path ignores partials). No dedup needed.
+    appendRelationsRaw(host_partials_soa_, ckpt_loaded_partials_);
+
+    post_dedup_count = host_relations_soa_.num_relations;
+    LOG(LOG_INFO) << "[Resume] final merged set: " << host_relations_soa_.num_relations
+                  << " smooths (loaded " << loaded_dedup << " + new-leg union), "
+                  << host_partials_soa_.num_relations << " partials.";
+}
+
+
 void MPQSOrchestrator::SieveStage() {
 #ifdef SIEVING_DEBUG_FLAG
     JSON_IO j_io;
@@ -3142,6 +3884,47 @@ void MPQSOrchestrator::SieveStage() {
     // --- Cluster mode setup ---
     data_tap_ = config_.data_tap;  // nullptr in solo mode — all DataTap code is no-op
     const bool cluster_mode = (config_.cluster_mode != ClusterMode::SOLO);
+
+    // =========================================================================
+    // 0. Solo resume: load the last checkpoint (S2; default-off, SOLO only)
+    // =========================================================================
+    // On --resume, load sieve.ckpt (falling back to sieve.ckpt.prev). The walk is restarted
+    // from trailer.global_a_index after the siever is initialized (section 3b below); the
+    // loaded payload is union-merged with the new leg at end-of-sieve (finalizeResumeUnion).
+    // Cluster resume is S4 — gated out here (SOLO only). A missing/invalid checkpoint warns
+    // and starts a fresh run (identical to a normal run).
+    resume_active_ = false;
+    if (config_.resume && config_.cluster_mode == ClusterMode::SOLO) {
+        const std::string ckpt_dir = config_.checkpoint_dir.empty()
+            ? (config_.work_dir + "/checkpoint") : config_.checkpoint_dir;
+        mpqs::ckpt::CheckpointLoadResult lr;
+        if (mpqs::ckpt::loadLatestCheckpoint(ckpt_dir, lr)) {
+            if (lr.trailer.N != config_.N) {
+                LOG(LOG_ERROR_CRITICAL) << "[Resume] checkpoint N mismatch in " << ckpt_dir
+                                        << " — ignoring checkpoint, starting a fresh run.";
+            } else if (lr.trailer.loaded_smooths_dedup != lr.smooths.num_relations) {
+                LOG(LOG_ERROR_CRITICAL) << "[Resume] checkpoint trailer dedup count "
+                                        << lr.trailer.loaded_smooths_dedup << " != payload smooths "
+                                        << lr.smooths.num_relations
+                                        << " (corrupt) — starting a fresh run.";
+            } else {
+                ckpt_loaded_smooths_   = std::move(lr.smooths);
+                ckpt_loaded_partials_  = std::move(lr.partials);
+                resume_loaded_raw_     = lr.trailer.loaded_smooths_raw;
+                resume_global_a_index_ = lr.trailer.global_a_index;
+                resume_active_         = true;
+                LOG(LOG_INFO) << "[Resume] loaded checkpoint from " << ckpt_dir
+                              << ": smooths=" << ckpt_loaded_smooths_.num_relations
+                              << " partials=" << ckpt_loaded_partials_.num_relations
+                              << " loaded_raw=" << resume_loaded_raw_
+                              << " a_index=" << resume_global_a_index_
+                              << " (target=" << config_.target_relations << ").";
+            }
+        } else {
+            LOG(LOG_WARNING) << "[Resume] --resume set but no valid checkpoint in " << ckpt_dir
+                             << " — starting a fresh run.";
+        }
+    }
 
     // =========================================================================
     // 1. Initialize Siever
@@ -3389,11 +4172,15 @@ void MPQSOrchestrator::SieveStage() {
     // =========================================================================
     // WORKER: every chunk (initial WORK_ASSIGN + overflow CHUNK_ASSIGN) arrives
     //   with poly_range_start > 0, so the siever always jumps.
-    // COORDINATOR: its initial bounded sieve keeps poly_range_start == 0 (no
-    //   jump → starts at a_index 0); only its self-assigned OVERFLOW chunks (Fix
+    // COORDINATOR: its initial bounded sieve normally keeps poly_range_start == 0
+    //   (no jump → starts at a_index 0); only its self-assigned OVERFLOW chunks (Fix
     //   A, set on Thread B before re-entering SieveStage) carry poly_range_start
     //   > 0 and must jump to the chunk's absolute a-index, exactly as a worker
-    //   does — keeping node-0's chunks disjoint from every worker's.
+    //   does — keeping node-0's chunks disjoint from every worker's. S4 RESUME also
+    //   sets poly_range_start == eff_hw_0 (> 0) for the coordinator's initial sieve so
+    //   it jumps to its trimmed initial-range start, identical to a worker's trimmed
+    //   range — this gate already covers it (the condition is poly_range_start > 0,
+    //   not "coordinator vs worker").
     // SOLO: never sets poly_range_start (stays 0) → never jumps.
     // Hence gating on != SOLO is correct for all three modes.
     if (config_.poly_range_start > 0 && siever_ &&
@@ -3403,13 +4190,43 @@ void MPQSOrchestrator::SieveStage() {
         LOG(LOG_INFO) << "Siever: jumped to a_index=" << config_.poly_range_start;
     }
 
+    // S2 solo resume: restart the polynomial walk from the saved a-index (mutually exclusive
+    // with the cluster jump above — solo never sets poly_range_start). Tolerates the M1
+    // cursor-lead (the trailer cursor may lead the saved payload by up to one accumulation
+    // buffer): we sieve forward from global_a_index and the end-of-sieve union-dedup absorbs
+    // any overlap; effective_target is derived from the RAW loaded count, not this a-index.
+    if (resume_active_ && siever_) {
+        siever_->saveSnapshot();
+        siever_->resetAndAdvanceTo(resume_global_a_index_);
+        LOG(LOG_INFO) << "[Resume] siever jumped to a_index=" << resume_global_a_index_;
+    }
+
     // =========================================================================
     // 4. Prepare Buffers & Telemetry State
     // =========================================================================
 
     host_relations_soa_.clear();
     auto t_sieve_loop_start = clock::now();
-    uint32_t current_step = 0;
+    // u64: this is the persisted checkpoint cursor (a-values consumed). RSA-140 scale
+    // exceeds 2^32, so it must not wrap. resetAndAdvanceTo/poly_range_start are already u64.
+    // On resume, seed it from the trailer so the cursor / logs / mid-sieve re-checkpoints stay
+    // continuous with the killed run.
+    uint64_t current_step = resume_active_ ? resume_global_a_index_ : 0;
+
+    // M2 — RAW target accounting (S2). On resume the device persistent batch starts EMPTY; the
+    // loop stop-tests, the yield predictor, and the device cap all count only NEW device relations,
+    // so reduce the target by the RAW (pre-dedup) loaded count from the trailer. A deduped count
+    // would under-shoot. `effective_target` == config_.target_relations when not resuming, so the
+    // default-off / no-resume identity is preserved everywhere it substitutes below.
+    uint64_t effective_target = config_.target_relations;
+    if (resume_active_) {
+        effective_target = (config_.target_relations > resume_loaded_raw_)
+            ? (config_.target_relations - resume_loaded_raw_) : 0;
+        LOG(LOG_INFO) << "[Resume] effective_target=" << effective_target
+                      << " (config target " << config_.target_relations
+                      << " - loaded_raw " << resume_loaded_raw_ << ")"
+                      << (effective_target == 0 ? " — loaded >= target: short-circuit (finalize only)" : "");
+    }
 
     LOG_SET_STAGE(LOG_STAGE_SIEVE_SIEVING, "Sieve");
     LOG(LOG_INFO) << "Init complete. Target: " << config_.target_relations;
@@ -3484,18 +4301,18 @@ void MPQSOrchestrator::SieveStage() {
         // Use dedup_safety_factor for oversieve margin (matches cluster mode accumulator).
         // dedup_safety_factor=1.05 → 5% margin (default), 1.70 → 70% oversieve, etc.
         uint32_t dedup_margin = std::max(256u,
-            (uint32_t)(config_.target_relations * (config_.dedup_safety_factor - 1.0)));
-        uint32_t relation_cap = config_.target_relations + dedup_margin;
+            (uint32_t)(effective_target * (config_.dedup_safety_factor - 1.0)));
+        uint32_t relation_cap = effective_target + dedup_margin;
         postprocessor_->getPersistentBatch()->setTargetCap(relation_cap);
         LOG(LOG_DEBUG_1) << "Relation cap: " << relation_cap
-                        << " (target=" << config_.target_relations
+                        << " (target=" << effective_target
                         << ", margin=" << dedup_margin << ")";
 
         const bool has_lp_stats = (largeprime_ != nullptr);
         postprocessor_->setPredictionParams(
-            config_.target_relations,
+            effective_target,
             has_lp_stats ? largeprime_->getTelemetry() : nullptr);
-        LOG(LOG_DEBUG_1) << "Params set: target=" << config_.target_relations
+        LOG(LOG_DEBUG_1) << "Params set: target=" << effective_target
                          << ", lp_stats=" << (has_lp_stats ? "yes" : "no");
 
         // === CUDA Graph staging (if enabled) ===
@@ -3517,8 +4334,8 @@ void MPQSOrchestrator::SieveStage() {
             use_graph = false;
         }
         // Guard: small target — graph capture overhead exceeds benefit
-        if (use_graph && config_.target_relations < graph_N * 50) {
-            LOG(LOG_DEBUG_1) << "Target too small (" << config_.target_relations
+        if (use_graph && effective_target < graph_N * 50) {
+            LOG(LOG_DEBUG_1) << "Target too small (" << effective_target
                              << " relations) — skipping graph capture";
             use_graph = false;
         }
@@ -3634,7 +4451,7 @@ void MPQSOrchestrator::SieveStage() {
                 bool lp_graph_pending = false;  // LP async state for graph path
 
                 // --- Graph Replay Loop ---
-                while (*postprocessor_->h_pinned_persistent_count < config_.target_relations &&
+                while (*postprocessor_->h_pinned_persistent_count < effective_target &&
                        !(postprocessor_->h_prediction_result &&
                          postprocessor_->h_prediction_result->should_terminate) &&
                        !truncation_limit_reached(*postprocessor_->h_pinned_persistent_count, processed_batches) &&
@@ -3644,8 +4461,8 @@ void MPQSOrchestrator::SieveStage() {
                     // (keeps graph running to ~98.5% vs old 90%, saving ~10s at RSA-100 scale)
                     {
                         uint32_t current_rels = *postprocessor_->h_pinned_persistent_count;
-                        uint32_t remaining = (config_.target_relations > current_rels)
-                            ? (config_.target_relations - current_rels) : 0;
+                        uint32_t remaining = (effective_target > current_rels)
+                            ? (effective_target - current_rels) : 0;
                         uint32_t graph_yield = (graph_replay_count > 0)
                             ? (current_rels / static_cast<uint32_t>(graph_replay_count))
                             : (graph_N * 600u);  // bootstrap estimate
@@ -3781,6 +4598,12 @@ void MPQSOrchestrator::SieveStage() {
                     current_step += graph_N * batch_size;
                     graph_replay_count++;
 
+                    // Mid-sieve checkpoint (m-graphloop): emit AFTER the current_step advance,
+                    // never at the :~3731 per-replay sync (else each resume re-sieves a whole
+                    // graph replay). No-op unless solo + checkpointing enabled.
+                    maybeCheckpoint(current_step, static_cast<uint64_t>(processed_batches),
+                                    std::chrono::duration<double>(clock::now() - t_sieve_loop_start).count());
+
                     // === Telemetry (pinned counters, no GPU sync) ===
                     uint32_t current_telemetry = *postprocessor_->h_pinned_accumulation_counter;
                     uint32_t current_rel_telemetry = *postprocessor_->h_pinned_persistent_count;
@@ -3823,7 +4646,7 @@ void MPQSOrchestrator::SieveStage() {
                         warned_accum_contention_ = true;
                     }
 
-                    if (processed_batches % 10 == 0 || current_rel_telemetry >= config_.target_relations) {
+                    if (processed_batches % 10 == 0 || current_rel_telemetry >= effective_target) {
                         LOG(LOG_DEBUG_1) << "Batch " << processed_batches
                                          << " yielded " << current_telemetry << " candidates. "
                                          << "Total Full Relations: " << current_rel_telemetry;
@@ -3839,7 +4662,7 @@ void MPQSOrchestrator::SieveStage() {
                         }
 
                         logSieveProgress(progress_tracker,
-                                         current_rel_telemetry, config_.target_relations,
+                                         current_rel_telemetry, effective_target,
                                          elapsed_sec,
                                          config_.lp1_bound > 0, witnesses,
                                          global_lp_full_relations);
@@ -3878,12 +4701,12 @@ void MPQSOrchestrator::SieveStage() {
             );
         }
 
-        if (!graph_ran || *postprocessor_->h_pinned_persistent_count < config_.target_relations) {
+        if (!graph_ran || *postprocessor_->h_pinned_persistent_count < effective_target) {
         // =============================================================
         // STANDARD BATCH LOOP (primary dispatch, or graph fallback for final ~10%)
         // =============================================================
 
-        while (*postprocessor_->h_pinned_persistent_count < config_.target_relations &&
+        while (*postprocessor_->h_pinned_persistent_count < effective_target &&
                !(postprocessor_->h_prediction_result &&
                  postprocessor_->h_prediction_result->should_terminate) &&
                !truncation_limit_reached(*postprocessor_->h_pinned_persistent_count, processed_batches) &&
@@ -4067,7 +4890,7 @@ void MPQSOrchestrator::SieveStage() {
                 warned_accum_contention_ = true;
             }
 
-            if (processed_batches > 0 && (processed_batches % 10 == 0 || current_rel_telemetry >= config_.target_relations)) {
+            if (processed_batches > 0 && (processed_batches % 10 == 0 || current_rel_telemetry >= effective_target)) {
                 LOG(LOG_DEBUG_1) << "Batch " << processed_batches
                                  << " yielded " << current_telemetry << " candidates. "
                                  << "Total Full Relations: " << current_rel_telemetry;
@@ -4088,14 +4911,14 @@ void MPQSOrchestrator::SieveStage() {
                 }
 
                 logSieveProgress(progress_tracker,
-                                 current_rel_telemetry, config_.target_relations,
+                                 current_rel_telemetry, effective_target,
                                  elapsed_sec,
                                  config_.lp1_bound > 0, witnesses,
                                  global_lp_full_relations);
 
                 // --- Adaptive LP interval calibration ---
                 if (config_.lp1_bound > 0 && largeprime_ && !interval_calibrated_) {
-                    double progress = static_cast<double>(current_rel_telemetry) / config_.target_relations;
+                    double progress = static_cast<double>(current_rel_telemetry) / effective_target;
                     if (progress >= 0.05 && progress_tracker.hasETA()) {
                         double total_est_sec = progress_tracker.current_eta_sec + elapsed_sec;
                         double interval_sec  = total_est_sec / N_LP_INTERVALS;
@@ -4112,7 +4935,7 @@ void MPQSOrchestrator::SieveStage() {
 
                 // Recalibrate once at ~20% progress for more accurate ETA
                 if (config_.lp1_bound > 0 && largeprime_ && interval_calibrated_ && !interval_recalibrated_) {
-                    double progress = static_cast<double>(current_rel_telemetry) / config_.target_relations;
+                    double progress = static_cast<double>(current_rel_telemetry) / effective_target;
                     if (progress >= 0.20 && progress_tracker.hasETA()) {
                         double total_est_sec = progress_tracker.current_eta_sec + elapsed_sec;
                         double interval_sec  = total_est_sec / N_LP_INTERVALS;
@@ -4130,6 +4953,11 @@ void MPQSOrchestrator::SieveStage() {
             processed_batches++;
             total_batches_processed_++;
             current_step += config_.sieve_batch_size;
+
+            // Mid-sieve checkpoint: emit at the bottom-of-loop boundary (the previous batch
+            // is fully postprocessed/accumulated on device). No-op unless solo + enabled.
+            maybeCheckpoint(current_step, static_cast<uint64_t>(processed_batches),
+                            std::chrono::duration<double>(clock::now() - t_sieve_loop_start).count());
         }
         } // end standard batch loop
 
@@ -4188,7 +5016,7 @@ void MPQSOrchestrator::SieveStage() {
         // === OVERSHOOT & PREDICTION TELEMETRY ===
         {
             uint32_t post_flush_count = *postprocessor_->h_pinned_persistent_count;
-            int32_t overshoot = static_cast<int32_t>(post_flush_count) - static_cast<int32_t>(config_.target_relations);
+            int32_t overshoot = static_cast<int32_t>(post_flush_count) - static_cast<int32_t>(effective_target);
             LOG(LOG_DEBUG_1) << "Post-flush relations: " << post_flush_count
                             << " | overshoot: " << overshoot
                             << " (cap=" << relation_cap << ")";
@@ -4262,7 +5090,7 @@ void MPQSOrchestrator::SieveStage() {
                     config_.meta_O_enabled,
                     config_.meta_O,
                     config_.sas_snapshot_enabled,
-                    current_step,
+                    static_cast<uint32_t>(current_step),  // debug snapshot step (matches small u32 config)
                     j_io
                 );
             } else {
@@ -4349,7 +5177,7 @@ void MPQSOrchestrator::SieveStage() {
 
                     // LP-path: progress sampling deferred to async LP telemetry block (post-LP)
                     uint64_t total_count = postprocessor_->getPersistentCount();
-                    if (total_count >= config_.target_relations ||
+                    if (total_count >= effective_target ||
                         truncation_limit_reached(total_count, total_batches_processed_)) break;
                 } else {
                     total_batches_processed_++;
@@ -4357,16 +5185,16 @@ void MPQSOrchestrator::SieveStage() {
                     // Fallback monitoring for disabled LP Variant
                     uint64_t total_count = postprocessor_->getPersistentCount();
 
-                    if ((total_count - progress_tracker.last_logged_count) > 200 || total_count >= config_.target_relations) {
+                    if ((total_count - progress_tracker.last_logged_count) > 200 || total_count >= effective_target) {
                         auto t_now = clock::now();
                         double elapsed_sec = std::chrono::duration<double>(t_now - t_sieve_loop_start).count();
 
                         logSieveProgress(progress_tracker,
-                                         total_count, config_.target_relations,
+                                         total_count, effective_target,
                                          elapsed_sec,
                                          false, 0, 0);
                     }
-                    if (total_count >= config_.target_relations) break;
+                    if (total_count >= effective_target) break;
                 }
             }
 
@@ -4410,16 +5238,16 @@ void MPQSOrchestrator::SieveStage() {
                                      << " Full Relations, +" << stats->last_batch_new_witnesses << " New Witnesses.";
 
                     // --- LOG_INFO: User-facing Progress (shared function) ---
-                    if ((total_count - progress_tracker.last_logged_count) > 1000 || total_count >= config_.target_relations) {
+                    if ((total_count - progress_tracker.last_logged_count) > 1000 || total_count >= effective_target) {
                         logSieveProgress(progress_tracker,
-                                         total_count, config_.target_relations,
+                                         total_count, effective_target,
                                          elapsed_sec,
                                          true, stats->total_witnesses,
                                          global_lp_full_relations);
                     }
 
                     // Mathematical Guarantee: Pipeline fulfilled target
-                    if (total_count >= config_.target_relations ||
+                    if (total_count >= effective_target ||
                         truncation_limit_reached(total_count, total_batches_processed_)) break;
                 }
             }
@@ -4435,6 +5263,14 @@ void MPQSOrchestrator::SieveStage() {
             }
 
             logBufferWarnings();
+
+            // Mid-sieve checkpoint (legacy/synchronous path): emit at the bottom-of-loop
+            // boundary, before advancing the polynomial. current_step is the a-index here
+            // too (advance_a(1) ↔ current_step++), so resume is well-defined. The default
+            // --RSA100 --sieve_only run (sieve_batch_size==0) takes THIS path, so the emit
+            // is needed here as well as in the batch/graph loops. No-op unless solo + enabled.
+            maybeCheckpoint(current_step, total_batches_processed_,
+                            std::chrono::duration<double>(clock::now() - t_sieve_loop_start).count());
 
             siever_->advance_a(1);
         } // end while
@@ -4507,193 +5343,13 @@ void MPQSOrchestrator::SieveStage() {
     uint64_t post_dedup_count = 0;
 
     if (!cluster_mode) {
-    cudaSetDevice(config_.device_id);
-
-    // Ensure LP append operations complete before dedup reads persistent batch
-    if (config_.lp1_bound > 0 && largeprime_) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    pre_dedup_count = postprocessor_->getPersistentBatch()->getCount(
-        postprocessor_->getCudaStream());
-    cudaStreamSynchronize(postprocessor_->getCudaStream());
-
-    postprocessor_->deduplicatePersistentBatch();
-
-    post_dedup_count = postprocessor_->getPersistentBatch()->getCount(
-        postprocessor_->getCudaStream());
-    cudaStreamSynchronize(postprocessor_->getCudaStream());
-
-    LOG(LOG_INFO) << "Dedup: " << pre_dedup_count << " -> " << post_dedup_count
-                  << " (" << (pre_dedup_count - post_dedup_count) << " duplicates removed)";
-
-    // =========================================================================
-    // 6b. Post-dedup deficit re-sieve
-    // =========================================================================
-    // When shc_dim inflation (Jetson polynomial exhaustion guard) or other
-    // factors cause high duplicate rates, post-dedup count may fall below
-    // FB size.  Re-sieve to collect the deficit instead of aborting.
-    {
-        const uint64_t fb_size = f_data_.factorBase.size();
-        int resieve_attempts = 0;
-        constexpr int kMaxResieveAttempts = 3;
-
-        while (post_dedup_count < fb_size + 64 && resieve_attempts < kMaxResieveAttempts) {
-            ++resieve_attempts;
-            double dedup_rate = (pre_dedup_count > 0)
-                ? static_cast<double>(pre_dedup_count - post_dedup_count) / pre_dedup_count
-                : 0.0;
-            uint64_t deficit = fb_size + 128 - post_dedup_count;
-            // Over-collect: deficit / (1 - dedup_rate) + margin
-            uint64_t extra = static_cast<uint64_t>(
-                deficit / std::max(0.3, 1.0 - dedup_rate)) + 512;
-
-            LOG(LOG_INFO) << "Post-dedup deficit: " << deficit
-                          << " relations short (dedup=" << std::fixed << std::setprecision(1)
-                          << (dedup_rate * 100.0) << "%). Re-sieve " << resieve_attempts
-                          << "/" << kMaxResieveAttempts << " for ~" << extra << " more.";
-
-            // Dedup replaces d_persistent_batch with a tight-fit batch (cap == count).
-            // Expand it to hold the deficit + margin before the continuation loop.
-            uint64_t resieve_cap_rels = post_dedup_count + extra + 1024;
-            uint64_t est_factors_per_rel = 30;  // conservative average
-            uint64_t resieve_cap_factors = resieve_cap_rels * est_factors_per_rel;
-            postprocessor_->getPersistentBatch()->resize(
-                static_cast<size_t>(resieve_cap_rels),
-                static_cast<size_t>(resieve_cap_factors));
-
-            // Resync pinned counter + dual counter after dedup replaced the batch
-            postprocessor_->resyncPersistentDualCounter();
-            cudaStreamSynchronize(postprocessor_->getCudaStream());
-
-            uint64_t resieve_target = post_dedup_count + extra;
-
-            postprocessor_->getPersistentBatch()->setTargetCap(
-                static_cast<uint32_t>(std::min(resieve_target + 512,
-                    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))));
-
-            // Synchronous continuation loop (sync-heavy but short — only covers deficit)
-            while (*postprocessor_->h_pinned_persistent_count < resieve_target) {
-                siever_->advance_a(1);
-
-                if (config_.sieve_batch_size > 0) {
-                    auto* buf = postprocessor_->getActiveAccumulationBuffer();
-                    cudaStreamSynchronize(siever_->getCudaStream());
-
-                    siever_->setPostProcessingLinks(buf);
-                    siever_->prepareSievingBatch();
-                    siever_->runSievingBatch(config_.sieve_batch_size, 0);
-                    cudaEventRecord(buf->safe_to_read_event, siever_->getCudaStream());
-
-                    postprocessor_->processBatchBufferedCandidates();
-                    cudaStreamSynchronize(postprocessor_->getCudaStream());
-                } else {
-                    siever_->updateState();
-                    siever_->sieveFullCube();
-
-                    postprocessor_->accumulate(
-                        siever_->getRawCandidates(),
-                        siever_->getRawCandidateBufferSize(),
-                        siever_->getFactoringData().a,
-                        siever_->getDeviceA_Factors(),
-                        static_cast<uint32_t>(siever_->getFactoringData().a_factors.size()),
-                        -static_cast<int32_t>(siever_->getFactoringData().M),
-                        siever_->getCudaStream());
-                    postprocessor_->processBufferedCandidates();
-                    postprocessor_->consolidateToPersistent();
-                    cudaStreamSynchronize(postprocessor_->getCudaStream());
-                }
-
-                // LP processing if active (synchronous — deficit is small)
-                if (config_.lp1_bound > 0 && largeprime_) {
-                    largeprime_->processAndCommit(
-                        postprocessor_->getPartialBatch(),
-                        postprocessor_->getPersistentBatch()
-                    );
-                    cudaStreamWaitEvent(postprocessor_->getCudaStream(),
-                                        largeprime_->getDoneEvent(), 0);
-                    postprocessor_->resetPartialBatch();
-                }
-            }
-
-            // Re-dedup
-            if (config_.lp1_bound > 0 && largeprime_)
-                cudaDeviceSynchronize();
-
-            pre_dedup_count = postprocessor_->getPersistentBatch()->getCount(
-                postprocessor_->getCudaStream());
-            cudaStreamSynchronize(postprocessor_->getCudaStream());
-
-            postprocessor_->deduplicatePersistentBatch();
-
-            post_dedup_count = postprocessor_->getPersistentBatch()->getCount(
-                postprocessor_->getCudaStream());
-            cudaStreamSynchronize(postprocessor_->getCudaStream());
-
-            LOG(LOG_INFO) << "Re-dedup: " << pre_dedup_count << " -> "
-                          << post_dedup_count << " (" << (pre_dedup_count - post_dedup_count)
-                          << " duplicates removed)";
+        if (resume_active_) {
+            // S2 solo resume: device-dedup the new leg, union-merge with the loaded checkpoint,
+            // re-assert fb_size+64 on the union, then the solo LP final host-match.
+            finalizeResumeUnion(pre_dedup_count, post_dedup_count);
+        } else {
+            finalizePersistentToHost(pre_dedup_count, post_dedup_count);
         }
-
-        if (post_dedup_count < fb_size + 64) {
-            LOG(LOG_ERROR_CRITICAL) << "Still insufficient after "
-                                    << kMaxResieveAttempts << " re-sieve attempts: "
-                                    << post_dedup_count << " < " << (fb_size + 64);
-        }
-    }
-
-    LOG(LOG_DEBUG_1) << "Downloading persistent relations to Host...";
-
-    mpqs::structures::RelationBatch* d_persistent = postprocessor_->getPersistentBatch();
-    if (d_persistent) {
-        cudaStream_t pp_stream = postprocessor_->getCudaStream();
-        d_persistent->moveToHost(host_relations_soa_, pp_stream);
-        cudaStreamSynchronize(pp_stream);
-
-        // Extract raw partial witnesses for expanded matrix path
-        if (config_.lp1_bound > 0 && largeprime_) {
-            largeprime_->moveWitnessesToHost(host_partials_soa_, pp_stream);
-            cudaStreamSynchronize(pp_stream);
-            LOG(LOG_INFO) << "Downloaded " << host_partials_soa_.num_relations
-                          << " LP witness partials for expanded matrix.";
-        }
-
-        // DIAGNOSTIC (strictly opt-in via --dump_combine_provenance): download and
-        // serialize per-combined-relation constituent provenance captured before the
-        // slab purge. ADDITIVE — does nothing unless the flag was set at LP init.
-        if (config_.dump_combine_provenance && config_.lp1_bound > 0 && largeprime_) {
-            std::vector<mpqs::lp::CombineProvenanceEntry> prov;
-            largeprime_->moveProvenanceToHost(prov, pp_stream);
-            cudaStreamSynchronize(pp_stream);
-
-            std::string prov_path = (std::filesystem::path(config_.work_dir)
-                                     / "combine_provenance.bin").string();
-            std::filesystem::create_directories(config_.work_dir);
-            std::ofstream pf(prov_path, std::ios::binary);
-            if (pf) {
-                // Header: magic "MPQSPRV1" (8B) | version u32 | record_size u32 |
-                //         N (64B little-endian limbs) | record_count u64
-                const char MAGIC[8] = {'M','P','Q','S','P','R','V','1'};
-                pf.write(MAGIC, 8);
-                uint32_t version = 1;
-                uint32_t rec_size = (uint32_t)sizeof(mpqs::lp::CombineProvenanceEntry);
-                pf.write(reinterpret_cast<const char*>(&version), sizeof(version));
-                pf.write(reinterpret_cast<const char*>(&rec_size), sizeof(rec_size));
-                pf.write(reinterpret_cast<const char*>(config_.N.limbs), 64);
-                uint64_t n = prov.size();
-                pf.write(reinterpret_cast<const char*>(&n), sizeof(n));
-                if (n > 0)
-                    pf.write(reinterpret_cast<const char*>(prov.data()), n * rec_size);
-                LOG(LOG_INFO) << "[dump_combine_provenance] Wrote " << n
-                              << " provenance records (" << rec_size << " B each) to " << prov_path;
-            } else {
-                LOG(LOG_ERROR_CRITICAL) << "[dump_combine_provenance] Failed to open "
-                                        << prov_path << " for writing.";
-            }
-        }
-    } else {
-        LOG(LOG_ERROR_CRITICAL) << "Persistent buffer missing!";
-    }
     } else {
         // Cluster mode: drain final extraction and signal completion
         if (data_tap_ && extract_pending) {
@@ -5866,6 +6522,34 @@ void MPQSOrchestrator::networkLoop() {
     cluster_raw_partials_ = structures::HostRelationBatch{};
     cluster_raw_partials_.factor_offsets.push_back(0);  // CSR sentinel
 
+    // S4: coordinator RESUME re-injection (default-off). Runs ONCE at Thread A start,
+    // BEFORE any worker/local batch is processed, so the loaded pool is the baseline the
+    // resumed run tops up. Order (m-dedup-order): smooths via addRelations rebuild
+    // accumulated_ + the seen_ dedup set FIRST; then the loaded partials re-feed
+    // insertAndMatch — its re-emitted leg-1 combines (loaded×loaded, ALREADY persisted in
+    // the loaded smooths) are dropped by the now-populated seen_, while table_ is rebuilt so
+    // NEW partials from the resumed leg match against the loaded UNMATCHED partials (genuine
+    // cross-checkpoint combines). The same loaded partials also seed cluster_raw_partials_
+    // for the expanded-matrix path — done here, AFTER the reset above, so the sentinel/CSR
+    // stays valid (doing it pre-Thread-A would be wiped by the reset). The live pooled count
+    // then includes the loaded smooths, so the target test (targetReached) works unchanged —
+    // no separate effective-target reduction is needed on the cluster path (unlike solo S2).
+    if (cluster_resume_active_) {
+        const uint64_t n_sm = cluster_resume_smooths_.num_relations;
+        const uint64_t n_pt = cluster_resume_partials_.num_relations;
+        cluster_accumulator_->addRelations(cluster_resume_smooths_, /*source_id=*/0);
+        if (cluster_cpu_lp_)
+            cluster_cpu_lp_->insertAndMatch(cluster_resume_partials_, *cluster_accumulator_);
+        bufferClusterPartials(cluster_resume_partials_);
+        LOG(LOG_INFO) << "[Resume] re-injected pooled state: " << n_sm
+                      << " smooths (accumulator now " << cluster_accumulator_->totalRelations()
+                      << "), " << n_pt
+                      << " partials re-matched into the LP table + raw-partial buffer.";
+        // Free the staged payload; the live cluster structures own the data now.
+        cluster_resume_smooths_  = structures::HostRelationBatch{};
+        cluster_resume_partials_ = structures::HostRelationBatch{};
+    }
+
     uint32_t workers_flushed = 0;
     uint32_t total_workers = comm_backend_ ? comm_backend_->peerCount() : 0;
     bool all_workers_flushed = (total_workers == 0);  // M1: no workers to flush
@@ -5943,6 +6627,24 @@ void MPQSOrchestrator::networkLoop() {
         node_telemetry[w].node_id = static_cast<uint8_t>(w);
         node_telemetry[w].gpu_name = std::string(info.gpu_name);
     }
+
+    // --- S3: coordinator checkpoint state (Thread-A-local; default-off no-op) ---
+    // Cluster checkpoints fire on the WALL-CLOCK interval only (checkpoint_batches is a
+    // solo-loop notion — Thread A has no sieve-batch counter). worker_initial_hw[node_id]
+    // is the per-node initial-range contiguous high-water (M1): index 0 = coordinator (set
+    // from cluster_node0_initial_hw_ at write time), 1..N = workers (captured on each
+    // worker's first CHUNK_COMPLETE below). All accessed only by Thread A — no locking.
+    const bool ckpt_enabled = (config_.checkpoint_interval_sec > 0);
+    auto last_ckpt_time     = std::chrono::steady_clock::now();
+    bool ckpt_timer_armed   = false;
+    std::vector<uint64_t> worker_initial_hw(node_telemetry.size(), 0);
+    // S4 resume: seed each node's high-water with the offset it was trimmed by, so a node
+    // that hasn't reported its (trimmed) initial CHUNK_COMPLETE before the next checkpoint
+    // re-reports that offset (a further resubmission re-issues the same trimmed range —
+    // re-sieve, never skip). Fresh run: cluster_initial_resume_offsets_ empty ⇒ all 0 (identity).
+    for (size_t i = 0; i < worker_initial_hw.size()
+                       && i < cluster_initial_resume_offsets_.size(); ++i)
+        worker_initial_hw[i] = cluster_initial_resume_offsets_[i];
 
     // --- Aggregate progress tracking (Feature 2) ---
     SieveProgressTracker cluster_progress_tracker;
@@ -6302,6 +7004,31 @@ void MPQSOrchestrator::networkLoop() {
                                                                cc.a_values_consumed);
                         }
 
+                        // S3 (M1): capture this worker's INITIAL-range contiguous
+                        // high-water on its FIRST CHUNK_COMPLETE. wt.current_chunk_id ==
+                        // kInitialChunk (still its pre-completion value here) means the
+                        // worker is reporting its initial WORK_ASSIGN range, which it
+                        // sieves IN-ORDER ⇒ a_values_consumed is a hole-free high-water.
+                        // After this the worker only ever holds overflow pool chunks
+                        // (captured by completedPrefixCursor), so the initial range is
+                        // recorded exactly once and never via an aliased pool chunk_id.
+                        // Clamp to the range size (lag-conservative: under-report ⇒
+                        // re-sieve on resume, never skip).
+                        if (wt.current_chunk_id == kInitialChunk &&
+                            msg.sender_id < worker_initial_hw.size()) {
+                            uint64_t cap = (msg.sender_id < cluster_initial_ranges_.size())
+                                ? cluster_initial_ranges_[msg.sender_id].second
+                                : cc.a_values_consumed;
+                            // S4 resume: cc.a_values_consumed is relative to this worker's
+                            // CURRENT (trimmed) initial assignment, so add the offset it was
+                            // trimmed by to recover the ABSOLUTE high-water. Fresh run: offset
+                            // 0 ⇒ unchanged. Clamp to the initial range size (lag-conservative).
+                            uint64_t off = (msg.sender_id < cluster_initial_resume_offsets_.size())
+                                ? cluster_initial_resume_offsets_[msg.sender_id] : 0;
+                            worker_initial_hw[msg.sender_id] =
+                                std::min<uint64_t>(off + cc.a_values_consumed, cap);
+                        }
+
                         wt.total_rels += cc.relations_found;
                         wt.current_chunk_id = UINT32_MAX;
 
@@ -6648,6 +7375,33 @@ void MPQSOrchestrator::networkLoop() {
             auto final_batch = cluster_accumulator_->extractFinal();
             cluster_handoff_->deliver(std::move(final_batch));
             break;
+        }
+
+        // S3: coordinator checkpoint emit at the Thread-A sole-mutator boundary. By here
+        // every batch popped/received this iteration has been deduped into
+        // cluster_accumulator_, the LP table updated, and raw partials buffered — so a
+        // snapshot is host-consistent with nothing mid-flight. Default-off no-op; fires
+        // only on the wall-clock interval. The atomic writer keeps the prior sieve.ckpt
+        // intact if the coordinator is SIGKILLed mid-write.
+        if (ckpt_enabled && cluster_accumulator_ && cluster_work_pool_) {
+            auto ck_now = std::chrono::steady_clock::now();
+            if (!ckpt_timer_armed) {
+                last_ckpt_time   = ck_now;   // arm on first reach; never checkpoint at t=0
+                ckpt_timer_armed = true;
+            } else if (std::chrono::duration<double>(ck_now - last_ckpt_time).count()
+                       >= static_cast<double>(config_.checkpoint_interval_sec)) {
+                // Fill node 0's initial-range high-water (workers 1..N were captured on
+                // their CHUNK_COMPLETE). Clamp to node 0's initial range size.
+                if (!worker_initial_hw.empty()) {
+                    uint64_t hw0  = cluster_node0_initial_hw_.load(std::memory_order_relaxed);
+                    uint64_t cap0 = (!cluster_initial_ranges_.empty())
+                                  ? cluster_initial_ranges_[0].second : hw0;
+                    worker_initial_hw[0] = std::min(hw0, cap0);
+                }
+                double elapsed = std::chrono::duration<double>(ck_now - sieve_start).count();
+                writeClusterCheckpoint(worker_initial_hw, elapsed);
+                last_ckpt_time = std::chrono::steady_clock::now();  // re-arm after the write
+            }
         }
 
         // 5. Brief sleep to avoid busy-wait

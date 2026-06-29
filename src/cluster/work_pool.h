@@ -112,6 +112,30 @@ public:
         return end_;
     }
 
+    /// Completed contiguous-prefix cursor (S3 coordinator checkpoint, B2).
+    ///
+    /// Returns the largest cursor C such that EVERY a-index in [a_start, C) has been
+    /// fully sieved (checked out AND completed). Computed as
+    ///   min( next_, min start over in_flight_ ∪ returned_ ).
+    /// Rationale: chunks are handed out in increasing order from next_; anything below
+    /// every in-flight/returned start AND below next_ has been completed and erased from
+    /// in_flight_. An in-flight or returned chunk is, by definition, NOT yet completed —
+    /// so its start bounds the completed prefix from above.
+    ///
+    /// This is deliberately NOT nextCursor(): nextCursor() == next_ silently drops the
+    /// in_flight_ ∪ returned_ chunks (which live only in coordinator RAM and are lost on
+    /// a kill). Resuming at next_ would SKIP those a-values entirely, and dedup cannot
+    /// recover a-values that are never sieved → under-collection + premature overflow
+    /// drain, re-introducing the a-value pool exhaustion fixed in 4d20d7b. Resume must
+    /// restore the completed prefix. Thread-safe.
+    uint64_t completedPrefixCursor() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        uint64_t c = next_;
+        for (const auto& cw : in_flight_) c = std::min(c, cw.unit.start);
+        for (const auto& wu : returned_)  c = std::min(c, wu.start);
+        return c;
+    }
+
     /// Restore pool cursor from coordinator checkpoint. Only valid at startup
     /// before any requestWork/checkoutWork calls. Asserts clean state.
     void setCursor(uint64_t cursor) {

@@ -23,6 +23,10 @@ sparse GF(2) preprocessor and a Block Wiedemann linear algebra solver.
 - Single-node and multi-node cluster execution with TCP transport, async network
   data tap, and dynamic work distribution.
 - CUDA graph batch unrolling for low-launch-overhead steady-state sieving.
+- Periodic mid-sieve checkpointing (`--checkpoint_interval`, `--checkpoint_batches`,
+  `--checkpoint_dir`, `--resume`): writes atomic `sieve.ckpt` snapshots; a killed or
+  wall-clock-expired run resumes from the last checkpoint instead of re-sieving from
+  zero. Default-off; coordinator-only in cluster mode.
 - Validated on consumer NVIDIA GPUs from Turing (CC 7.5) through Blackwell
   (CC 12.0), including Jetson Orin (CC 8.7).
 

@@ -97,6 +97,18 @@ Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline, ma
 | `sqrt_legacy` | `bool` | false | If true, use CPU `Perform()` loop; default uses GPU batched path |
 | `sqrt_diagnostic` | `bool` | false | If true, log extra sqrt diagnostics: per-solution nontrivial-GCD rate (`k/n`) per Block-Wiedemann solution, HalveExponents validity, solution diversity (at `LOG_DEBUG_1`). CLI: `--sqrt_diagnostic` |
 
+### Checkpoint Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `checkpoint_interval_sec` | `uint32_t` | 0 (OFF) | Wall-seconds between mid-sieve checkpoints. 0 = disabled (complete no-op). CLI: `--checkpoint_interval <T>` |
+| `checkpoint_batches` | `uint32_t` | 0 (OFF) | Alternative interval in sieve batches; fires first if both set. 0 = disabled. CLI: `--checkpoint_batches <N>` |
+| `checkpoint_dir` | `string` | `""` → `work_dir/checkpoint` | Directory for checkpoint files. On the cluster: set to a run-stable (non-jobid) scratch path. CLI: `--checkpoint_dir <path>` |
+| `resume` | `bool` | false | If true and a valid `sieve.ckpt` exists in `checkpoint_dir`, load it and continue; else start fresh with a warning. CLI: `--resume` |
+
+`checkpoint_interval_sec == 0 && !resume` ⇒ every new code path is skipped and all outputs
+are identical to a pre-feature run. The feature is never auto-enabled.
+
 ### Cluster Fields
 
 | Field | Type | Default | Description |
@@ -319,6 +331,95 @@ File path: `{work_dir}/relations.soa`. BW checkpoints: `{work_dir}/bw*`.
 | `AUTOTUNE_ONLY` | Tuning + Autotune | None (prints results, returns) |
 
 Note: `LINALG_ONLY` always runs `TuningStage` to reconstruct the factor base needed for matrix column indexing.
+
+## Sieve Checkpointing
+
+### Overview
+
+Mid-sieve relation checkpointing enables a killed or wall-clock-expired sieve to resume
+from disk instead of re-sieving from zero. Default-off: `checkpoint_interval_sec == 0 &&
+!resume` is a complete no-op with identical outputs. See the [Checkpoint Fields](#checkpoint-fields)
+table for all four CLI flags.
+
+### Checkpoint Artifact (`sieve.ckpt`)
+
+`<checkpoint_dir>/sieve.ckpt` layout:
+
+```
+[ serialize_v2 payload ]   -- smooths (HostRelationBatch) + partials; verbatim v2 format
+[ progress trailer ]       -- magic "MPQS_CKPT", ckpt_schema_version, global_a_index (u64),
+                           --   target_relations, loaded_smooths_raw, loaded_smooths_dedup,
+                           --   loaded_partials, lp1_bound, sieve_bound, N (64B),
+                           --   cluster_section_present (u8), elapsed_sieve_sec
+[ cluster block ]          -- (when cluster_section_present=1): completedPrefixCursor (u64)
+                           --   + per-node initial-range high-water array (count + values)
+[ fixed EOF footer ]       -- magic "MPQS_CKFT", trailer_offset (u64), trailer_len (u64),
+                           --   ckpt_schema_version (u32)
+```
+
+The footer magic at EOF is the completeness sentinel: a torn write never has it.
+Write protocol: unlink stale `.tmp` → `serialize_v2` to `.tmp` (intra-FS) → append
+trailer+cluster block+footer → `fsync` → rename live to `.prev` → rename `.tmp` to live →
+`fsync` directory. One prior generation is retained as `sieve.ckpt.prev`. Completely distinct
+from the matrix-handoff `relations.v2` (format and write path unchanged).
+
+### Solo Resume Flow
+
+On `--resume` at `SieveStage` entry with a valid `sieve.ckpt`:
+
+1. Load `sieve.ckpt`; validate footer magic, trailer `N == config N`, and
+   `loaded_smooths_dedup == host_relations_soa_.num_relations`.
+2. `saveSnapshot()` + `resetAndAdvanceTo(trailer.global_a_index)` — continue the polynomial
+   walk from the first un-sieved a-index.
+3. **Effective target:** `max(0, target_relations − loaded_smooths_raw)` — applied to all
+   three termination paths (pinned-count stop test, yield-prediction `should_terminate`, and
+   device target cap `setTargetCap`).
+4. Sieve the new leg; device `deduplicatePersistentBatch()` runs at end-of-sieve for the new
+   leg only (B1: never mid-loop).
+5. **End-of-sieve union dedup:** host-merge `loaded ∪ (device-deduped new)` via the shared
+   `computeRelationHash`; re-assert `fb_size+64` on the union (trigger more sieving if short).
+6. **Final host LP re-match:** over `loaded_partials ∪ new-un-combined-partials` via the shared
+   `cpu_lp` combiner, after the union hash-set is built; skipped cleanly if `lp1_bound == 0`.
+7. Write `relations.v2` normally. The resumed output is as valid as a single uninterrupted run.
+
+`--resume` with no checkpoint present → warn and start fresh (identical to a normal run).
+`loaded >= target` short-circuit: skip the sieve loop but still run the union-merge + LP
+re-match + `relations.v2` write.
+
+### Cluster Resume Flow
+
+Coordinator-only (workers are stateless; they reconnect and request work as usual).
+All restore steps happen **before Thread A starts and before any `requestWork`/`checkoutWork`**
+(the `setCursor` startup-only contract).
+
+1. Load + validate `sieve.ckpt` (cluster block must be present; topology guard checks
+   `node_count` match and overflow-pool prefix bounds; reject → start fresh).
+2. Re-inject smooths via `RelationAccumulator::addRelations` (rebuilds `accumulated_` and
+   the `seen_` dedup set).
+3. Re-feed partials via `CPULargePrimeTable::insertAndMatch` (rebuilds `table_`, re-emits
+   deduped combines) + buffer into `cluster_raw_partials_`.
+4. `WorkPool::setCursor(completedPrefixCursor)` — restores the overflow pool to the completed
+   contiguous prefix (NOT `nextCursor()`, which would drop in-flight/returned chunks and
+   re-introduce the `4d20d7b` pool exhaustion).
+5. Re-issue each node's initial `WORK_ASSIGN` trimmed to
+   `[orig_start + hw_node, orig_count − hw_node)` from the per-node initial-range high-water
+   array. Fully-complete nodes re-sieve the last hypercube H (dedup-safe boundary guard).
+6. Thread A proceeds; the cluster sieves only the remaining a-space (overflow tail above the
+   prefix + trimmed initial tails) and tops up to target.
+
+### Production sbatch Wiring
+
+- **Run-stable `CKPT_DIR`:** keyed on `RUN_TAG` (NOT `SLURM_JOB_ID`), so a resubmitted job
+  with a fresh jobid finds the prior run's `sieve.ckpt` and auto-resumes.
+  `CKPT_DIR="$RUN_BASE/cuda-mpqs/${RUN_TAG}_ckpt"`.
+- **Resume detection:** `if [ -s "$CKPT_DIR/sieve.ckpt" ]; then COORD_RESUME="--resume"; fi`
+  before the Phase-1 `srun`.
+- **Coordinator-only flags:** `--checkpoint_dir "$CKPT_DIR" --checkpoint_interval 1800
+  $COORD_RESUME` passed to rank 0 only; workers are unchanged.
+- `relations.v2` (the Phase-2 `--matrix_only` handoff) is written only at sieve completion,
+  unchanged. `sieve.ckpt` is an internal resume artifact only.
+- See `tools/cluster/rsa140_a100_4node_pc2.sbatch` (production) and
+  `tools/cluster/rsa130_a100_2node_resume_smoke_pc2.sbatch` (2-node resume smoke, ~20 min).
 
 ## Internal State
 

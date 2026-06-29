@@ -99,6 +99,17 @@ bool deserialize_v1(const std::string& path,
 // ---------------------------------------------------------------------------
 // v2 serialization — two-batch layout with pipeline metadata
 // ---------------------------------------------------------------------------
+//
+// TRAILING-BYTE TOLERANCE INVARIANT (contractual — see test `checkpoint_io`):
+//   `deserialize_v2` reads section-by-section and returns `f.good()` WITHOUT checking
+//   EOF, so any bytes appended AFTER the last section it reads are IGNORED. The mid-sieve
+//   checkpoint (`src/common/sieve_checkpoint.cpp`) relies on this: it appends a progress
+//   trailer + a fixed EOF footer after the v2 payload, invisibly to this reader and to
+//   ordinary `relations.v2` consumers.
+//   ⇒ DO NOT add a future *unconditional* trailing section to serialize_v2 — a new
+//     always-present section would consume the checkpoint trailer's bytes and corrupt
+//     both the checkpoint and old-file back-compat. Any new section MUST be flag-guarded
+//     (like FLAG_HAS_CHAR_BITS) and skipped when its flag is clear.
 
 bool serialize_v2(const std::string& path,
                   const structures::HostRelationBatch& full_smooths,

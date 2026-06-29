@@ -64,11 +64,17 @@ constexpr float EPSILON = 0.02f;
 /// @param f_data    Factoring data with factor base populated
 /// @param device_id CUDA device ordinal
 /// @param thorough  If true, also search strongly-convergent params
+/// @param non_sieve_bytes  OOM-guard (S2): postprocessing/LP footprint + CUDA-context
+///                  reserve. When > 0, the optimizer skips/clamps any candidate (and
+///                  gates its own seed eval) whose COMPLETE footprint exceeds the 0.80
+///                  budget of free VRAM. 0 (default) => candidate footprint guard
+///                  inactive (the bucket-only isValid gate still applies).
 /// @return Optimal params and verified timing
 KernelParamResult optimizeKernelLaunchParams(
     mpqs::sieve::DeviceSievingController& siever,
     const mpqs::sieve::factoringData& f_data,
     int device_id,
-    bool thorough = false);
+    bool thorough = false,
+    uint64_t non_sieve_bytes = 0);
 
 } // namespace mpqs::autotune

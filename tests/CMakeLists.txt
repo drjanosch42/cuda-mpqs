@@ -192,6 +192,68 @@ target_link_libraries(test_packed_char_device_parity PRIVATE
     mpqs_matrix mpqs_sieve mpqs_common cudampqs_build_flags)
 add_test(NAME packed_char_device_parity COMMAND test_packed_char_device_parity)
 
+# Autotune OOM-guard regression test (plan decision §6.5). Exercises the guard's
+# pure-host decision logic (sieve_memory_model.h estimator + 0.80 budget +
+# KernelLaunchValidator::fitsTotalFootprint + the seed-reduction loop) — NO sieve
+# kernels are launched, so it cannot OOM and is deterministic. Asserts (a) at pinned
+# M=131072 the guard reports 0 seed clamps / 0 candidate skips (no regression; audit
+# m3) and (b) a synthetic over-budget config fires the guard with a feasible survivor.
+# Skips cleanly (exit 0) when no CUDA device is present. Links mpqs_autotune
+# (KernelLaunchValidator + buildSieveConstants) which transitively provides mpqs_sieve
+# (sieve_memory_model.h) and mpqs_common.
+add_executable(test_oom_guard
+    ${CMAKE_SOURCE_DIR}/tools/autotune/test_oom_guard.cu)
+set_target_properties(test_oom_guard PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(test_oom_guard PRIVATE
+    mpqs_autotune mpqs_sieve mpqs_common cudampqs_build_flags)
+add_test(NAME oom_guard COMMAND test_oom_guard)
+
+# Mid-sieve checkpoint I/O contract (S1): (A) m-trailer-test — deserialize_v2 ignores
+# appended trailing bytes; (B) writeCheckpointAtomic/readCheckpoint round-trip; (C) .prev
+# retention + torn-footer rejection + loadLatestCheckpoint fallback. CPU-only host test
+# (no kernels). Links mpqs_common (relation_io + sieve_checkpoint + uint512).
+add_executable(test_checkpoint_io
+    ${CMAKE_SOURCE_DIR}/tools/sqrt_failure/test_checkpoint_io.cu)
+set_target_properties(test_checkpoint_io PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(test_checkpoint_io PRIVATE mpqs_common cudampqs_build_flags)
+add_test(NAME checkpoint_io COMMAND test_checkpoint_io)
+
+# WorkPool completed-prefix cursor (S3, B2): completedPrefixCursor() returns the COMPLETED
+# contiguous prefix = min(next_, min start over in_flight_ ∪ returned_), NOT nextCursor().
+# Compiles work_pool.cpp directly (no CUDA kernels, no cluster-library link). CPU-only host test.
+add_executable(test_work_pool_cursor
+    ${CMAKE_SOURCE_DIR}/tools/sqrt_failure/test_work_pool_cursor.cu
+    ${CMAKE_SOURCE_DIR}/src/cluster/work_pool.cpp)
+set_target_properties(test_work_pool_cursor PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_include_directories(test_work_pool_cursor PRIVATE ${CMAKE_SOURCE_DIR}/src/cluster)
+target_link_libraries(test_work_pool_cursor PRIVATE cudampqs_build_flags)
+add_test(NAME work_pool_cursor COMMAND test_work_pool_cursor)
+
+# Cluster coordinator RESUME (S4): (A) computeResumeTrim — per-node initial-range trim incl.
+# the count==0 -> re-sieve-last-hypercube guard + the eff_hw+count==orig_count invariant;
+# (B) clusterResumeTopologyOk — N2 node-count/overflow-geometry guard; (C) re-inject ordering
+# (addRelations rebuilds seen_ before partial combines, m-dedup-order). CPU-only host test.
+# Helpers are header-inline (sieve_checkpoint.h); RelationAccumulator is header-only
+# (accumulator.h, needs src/cluster on the include path); links mpqs_common for uint512/SoA/hash.
+add_executable(test_cluster_resume
+    ${CMAKE_SOURCE_DIR}/tools/sqrt_failure/test_cluster_resume.cu)
+set_target_properties(test_cluster_resume PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_include_directories(test_cluster_resume PRIVATE ${CMAKE_SOURCE_DIR}/src/cluster)
+target_link_libraries(test_cluster_resume PRIVATE mpqs_common cudampqs_build_flags)
+add_test(NAME cluster_resume COMMAND test_cluster_resume)
+
 # Optional Sqrt specific benchmark (EXCLUDE_FROM_ALL: uses AoS Relation API, needs M2 update for SoA)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sqrt_benchmark.cpp")
     add_executable(bench_sqrt EXCLUDE_FROM_ALL sqrt_benchmark.cpp

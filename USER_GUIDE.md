@@ -201,6 +201,15 @@ All buffer size flags accept an optional `K` or `M` suffix for base-1024 scaling
 | `--sieve_gms_blocks <N>` | uint32 | Auto (64) | Number of CUDA blocks for the globalMetaSieve kernel. | Yes |
 | `--sieve_hc_dim <N>` | uint32 | Auto | Hypercube dimension for polynomial construction (number of prime factors in the `a` coefficient). Currently hidden from `--help` output but functional. | Yes |
 
+### Checkpoint / Resume Options
+
+| Flag | Type | Default | Description | Pinned |
+|------|------|---------|-------------|--------|
+| `--checkpoint_interval <T>` | uint32 | `0` (disabled) | Wall-seconds between sieve checkpoints. `0` = disabled. On each interval the sieve writes an atomic `sieve.ckpt` snapshot to `--checkpoint_dir`. | No |
+| `--checkpoint_batches <N>` | uint32 | `0` (disabled) | Alternative checkpoint interval in sieve batches. Fires first if both this and `--checkpoint_interval` are set. | No |
+| `--checkpoint_dir <path>` | string | `<work_dir>/checkpoint` | Directory for `sieve.ckpt` and its prior-generation backup (`sieve.ckpt.prev`). In cluster mode this should be a run-stable path (keyed on a run tag, NOT the SLURM job ID). | No |
+| `--resume` | boolean | `false` | If a valid `sieve.ckpt` exists in `--checkpoint_dir`, resume the sieve from that checkpoint; otherwise start fresh (a warning is logged). Coordinator-only in cluster mode — workers are stateless and reconnect normally. | No |
+
 **Batch vs. Legacy sieving:**
 - **Legacy** (`--sieve_batch_size 0`, default): Single-step loop. The CPU drives each sieve step sequentially. Simpler, well-tested. LP processing happens every 10 steps.
 - **Batch** (`--sieve_batch_size N`): Double-buffered GPU pipeline. Sieving and postprocessing overlap via CUDA events. Higher throughput on modern GPUs. LP processing is periodic (adaptive interval).

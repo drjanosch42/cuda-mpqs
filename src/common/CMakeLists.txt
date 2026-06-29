@@ -19,6 +19,7 @@ set(COMMON_SOURCES
     uint128_helper.cuh
     mpqs_soa.cu
     relation_io.cpp
+    sieve_checkpoint.cpp
 )
 
 add_library(mpqs_common ${COMMON_SOURCES})

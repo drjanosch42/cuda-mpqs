@@ -148,7 +148,9 @@ __device__ __forceinline__ int align_up_to_hit(int x, int bound, int p) {
  * Result roots are in [0, p-1].
  */
 __device__ __forceinline__
-void rootsFromPolyId(uint32_t id, int shc_dim, primeDataSIQS& primeData, uint32_t& result1, uint32_t& result2);
+void rootsFromPolyId(uint32_t id, int shc_dim, const primeDataSIQS& primeData,
+                     const uint32_t* __restrict__ bvalues, uint32_t primeIndex, uint32_t fb_size,
+                     uint32_t& result1, uint32_t& result2);
 
 /**
  * @brief Reconstructs coefficient 'b' from Poly ID.
@@ -162,7 +164,9 @@ void bFromPolyId(uint32_t id, int shc_dim, mpqs::uint512* B_values, mpqs::uint51
  * Uses modSum to handle signed updates (+/- B_val) on unsigned roots.
  */
 __device__ __forceinline__
-void advanceRoots(uint32_t id1, uint32_t id2, primeDataSIQS& primeData, uint32_t& root1, uint32_t& root2);
+void advanceRoots(uint32_t id1, uint32_t id2, const primeDataSIQS& primeData,
+                  const uint32_t* __restrict__ bvalues, uint32_t primeIndex, uint32_t fb_size,
+                  uint32_t& root1, uint32_t& root2);
 
 /**
  * @brief Updates coefficient 'b' when moving between adjacent Gray codes.

@@ -4,6 +4,7 @@
 // See LICENSE at the repository root for licensing terms, including the NVIDIA CUDA Toolkit exception.
 #include "kernel_launch_validator.h"
 #include "orchestrator.h"
+#include "sieve_memory_model.h"   // single source-of-truth sieve memory model
 #include <bit>       // std::countl_zero (C++20)
 #include <algorithm> // std::min
 #include <cstring>   // memset
@@ -93,10 +94,15 @@ std::string KernelLaunchValidator::diagnose(const Params8& p) const {
              + " > " + std::to_string(dev_.maxSharedMemPerBlock);
     }
     if (!checkGlobalMem(p)) {
-        uint64_t mem = static_cast<uint64_t>(p[P_SUB_CUBE_SIZE])
-                     * p[P_NUM_INTERVALS] * sc_.globalBucketSize * sizeof(uint64_t);
+        // Routed through the single source-of-truth memory model (sieve_memory_model.h);
+        // byte-identical message to the prior hand-rolled formula.
+        uint64_t mem = mpqs::sieve::bucketEntriesBytes(
+            p[P_SUB_CUBE_SIZE], p[P_NUM_INTERVALS], sc_.globalBucketSize);
+        uint64_t budget = mpqs::sieve::sieveBucketBudget(
+            dev_.totalGlobalMem, 0,
+            mpqs::sieve::kSieveBudgetNum, mpqs::sieve::kSieveBudgetDen);
         return "global memory overflow: " + std::to_string(mem)
-             + " > " + std::to_string(3 * dev_.totalGlobalMem / 4);
+             + " > " + std::to_string(budget);
     }
     if (!checkDeviceLimits(p)) {
         if (p[P_META_BLOCK_DIM] > dev_.maxThreadsPerBlock)
@@ -211,11 +217,42 @@ bool KernelLaunchValidator::checkSharedMem(const Params8& p) const {
 // ---------------------------------------------------------------------------
 
 bool KernelLaunchValidator::checkGlobalMem(const Params8& p) const {
-    uint64_t mem = static_cast<uint64_t>(p[P_SUB_CUBE_SIZE])
-                 * p[P_NUM_INTERVALS]
-                 * sc_.globalBucketSize
-                 * sizeof(uint64_t);
-    return mem <= 3 * dev_.totalGlobalMem / 4;
+    // Routed through the single source-of-truth memory model (sieve_memory_model.h).
+    // bucketEntriesBytes() == the prior hand-rolled dev_globalBucketEntries term on
+    // this candidate's geometry (subCubeSize=p[0] polys, numIntervals=p[1] blocks); the
+    // budget sieveBucketBudget(totalGlobalMem,0,4,5) == (4*totalGlobalMem)/5 == 0.80*VRAM
+    // (S2; the operative kSieveBudget flipped from 3/4 to 4/5). This is the bucket-only
+    // gate; the autotune total-footprint OOM guard adds persistent+scratch+pp/LP+reserve.
+    uint64_t mem = mpqs::sieve::bucketEntriesBytes(
+        p[P_SUB_CUBE_SIZE], p[P_NUM_INTERVALS], sc_.globalBucketSize);
+    return mem <= mpqs::sieve::sieveBucketBudget(
+        dev_.totalGlobalMem, 0,
+        mpqs::sieve::kSieveBudgetNum, mpqs::sieve::kSieveBudgetDen);
+}
+
+// ---------------------------------------------------------------------------
+// Total-footprint OOM guard (S2). Additive to checkGlobalMem; never looser.
+// ---------------------------------------------------------------------------
+
+bool KernelLaunchValidator::fitsTotalFootprint(const Params8& p,
+                                               uint64_t fb_size,
+                                               uint64_t free_vram,
+                                               uint64_t non_sieve_bytes,
+                                               uint64_t* est_total_out) const {
+    // Candidate geometry mirrors loadPartialCustomConfig: num_polys=p[0],
+    // num_sievingBlocks=p[1], num_threadBlocks=p[6] (sasGridDim), maxRel=64.
+    constexpr uint32_t kMaxRelationsPerBlock = 64;
+    mpqs::sieve::SieveDeviceFootprint fp = mpqs::sieve::estimateSieveFootprint(
+        p[P_SUB_CUBE_SIZE], p[P_NUM_INTERVALS],
+        sc_.globalBucketSize, sc_.sievingBlockSize,
+        p[P_SAS_GRID_DIM], kMaxRelationsPerBlock,
+        fb_size, sc_.shc_dim);
+    uint64_t total = fp.total() + non_sieve_bytes;
+    if (est_total_out) *est_total_out = total;
+    // Operative budget: kSieveBudget fraction (0.80) of free VRAM, integer-exact.
+    uint64_t budget = mpqs::sieve::sieveBucketBudget(
+        free_vram, 0, mpqs::sieve::kSieveBudgetNum, mpqs::sieve::kSieveBudgetDen);
+    return total <= budget;
 }
 
 // ---------------------------------------------------------------------------
