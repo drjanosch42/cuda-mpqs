@@ -85,7 +85,7 @@ std::string KernelLaunchValidator::diagnose(const Params8& p) const {
     }
     if (!checkSharedMem(p)) {
         size_t sharedMem_meta = static_cast<size_t>(p[P_BLOCKS_PER_CYC] * p[P_POLY_BLOCK_SIZE]) * sizeof(int);
-        size_t sharedMem_sas  = static_cast<size_t>(sc_.sievingBlockSize) * sizeof(uint8_t)
+        size_t sharedMem_sas  = static_cast<size_t>(sc_.sievingBlockSize) * sc_.accumulatorBytes
                               + 3u * sc_.bigPrimeStartIndex * sizeof(int);
         if (sharedMem_meta > dev_.maxSharedMemPerBlock)
             return "shared memory overflow (meta): " + std::to_string(sharedMem_meta)
@@ -204,7 +204,9 @@ bool KernelLaunchValidator::checkArithmeticConstraints(const Params8& p) const {
 bool KernelLaunchValidator::checkSharedMem(const Params8& p) const {
     size_t sharedMem_meta = static_cast<size_t>(p[P_BLOCKS_PER_CYC] * p[P_POLY_BLOCK_SIZE])
                           * sizeof(int);
-    size_t sharedMem_sas  = static_cast<size_t>(sc_.sievingBlockSize) * sizeof(uint8_t)
+    // accumulatorBytes = 1 (uint8/narrow) reproduces the pre-S2 sizeof(uint8_t) exactly;
+    // 2 (uint16/wide) matches the wide sieveAndScanBatchKernelWide blockEntries width.
+    size_t sharedMem_sas  = static_cast<size_t>(sc_.sievingBlockSize) * sc_.accumulatorBytes
                           + 3u * sc_.bigPrimeStartIndex * sizeof(int);
     return sharedMem_meta <= dev_.maxSharedMemPerBlock
         && sharedMem_sas  <= dev_.maxSharedMemPerBlock;
@@ -329,18 +331,30 @@ std::vector<Params8> enumerateValidConfigs(const KernelLaunchValidator& v) {
 // ---------------------------------------------------------------------------
 
 SieveConstants buildSieveConstants(uint32_t shc_dim, uint32_t M,
-                                   size_t maxSharedMemPerBlock) {
+                                   size_t maxSharedMemPerBlock,
+                                   bool use_wide, bool use_u8sat) {
     // Largest power of 2 <= x
     auto pow2leq = [](uint32_t x) -> uint32_t {
         return (x < 1) ? 0 : 1u << (31 - std::countl_zero(x));
     };
 
     SieveConstants sc;
-    sc.shc_dim            = shc_dim;
-    sc.M                  = M;
-    sc.sievingBlockSize   = std::min(M, pow2leq(3 * static_cast<uint32_t>(maxSharedMemPerBlock) / 4));
+    sc.shc_dim = shc_dim;
+    sc.M       = M;
+    // Sieving-block size from the smem budget. accumBytes = 2 (uint16 wide) halves the
+    // block; 1 (narrow OR Option A saturating-uint8 wide) restores it. Mirror
+    // loadPartialCustomConfig exactly:  SB*(accumBytes + 12/32) <= (3/4)*maxShared =>
+    // SB <= 24*maxShared/(32*accumBytes+12) (76 for uint16, 44 for u8sat). Narrow keeps
+    // the pre-S2 3*maxShared/4.
+    const uint32_t maxSh     = static_cast<uint32_t>(maxSharedMemPerBlock);
+    const uint32_t accumB    = use_wide ? (use_u8sat ? 1u : 2u) : 1u;
+    const uint32_t wide_den  = 32u * accumB + 12u;   // 76 (uint16) or 44 (u8sat)
+    sc.sievingBlockSize   = use_wide
+        ? std::min(M, pow2leq((3u * maxSh * 32u) / (4u * wide_den)))
+        : std::min(M, pow2leq(3u * maxSh / 4u));
     sc.globalBucketSize   = sc.sievingBlockSize / 2;
-    sc.bigPrimeStartIndex = sc.sievingBlockSize / 32;
+    sc.bigPrimeStartIndex = sc.sievingBlockSize / 32;   // tracks the wide SB
+    sc.accumulatorBytes   = accumB;
     return sc;
 }
 
@@ -352,14 +366,15 @@ PreflightResult preflightKernelLaunch(
     const Params8& params,
     uint32_t shc_dim,
     uint32_t M,
-    int device_id) {
+    int device_id,
+    bool use_wide, bool use_u8sat) {
 
     // 1. Query device properties and build SieveConstants
     cudaDeviceProp prop;
     std::memset(&prop, 0, sizeof(prop));
     cudaGetDeviceProperties(&prop, device_id);
 
-    SieveConstants sc = buildSieveConstants(shc_dim, M, prop.sharedMemPerBlock);
+    SieveConstants sc = buildSieveConstants(shc_dim, M, prop.sharedMemPerBlock, use_wide, use_u8sat);
 
     // 2. Validate
     KernelLaunchValidator validator(device_id, sc);

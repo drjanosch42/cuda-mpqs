@@ -7,6 +7,42 @@ The format is based on
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning 2.0.0](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Stage-boundary checkpointing for the Block Wiedemann solver
+  (**experimental — not yet validated end-to-end**): save and load of the
+  Stage 1 Krylov S-sequence, the Stage 2 lingen Pi polynomial, and the
+  Stage 3 solution artifacts at stage boundaries, controlled by new
+  per-stage save/load fields in `BWSolverConfig`. A checkpoint set is
+  integrity-tagged with an FNV-1a hash (`_ckpt_tag.bin`); on any mismatch
+  the stage is recomputed rather than loading stale data. Resume is
+  stage-granular: a run restarts from the last *completed* stage, not
+  mid-stage. GF(2) results are unchanged when checkpointing is off.
+
+## [1.0.1] - 2026-07-13
+
+### Fixed
+- SpMM autotuner: guard against a uint32 overflow of the Delta-16
+  escape-expanded stream length in `gpu_convert_csr_to_delta16`
+  (`cuda_spmm/src/device_format_convert.cu`). When the autotuner pads a
+  matrix to square and `n_cols > 65535`, the Delta-16 escape path accumulates
+  the per-row expanded stream length in uint32 (`total_deltas` and the
+  `d_delta_offsets` inclusive scan). For very large matrices (e.g. ~1.7e7 rows
+  with a ~1.6e7 max column index, ~7.1e8 NNZ — the RSA-155 512-bit quadratic
+  sieve matrix) this exceeds 2^32, wraps, under-allocates the stream buffer,
+  and the encode kernel writes out of bounds — an illegal memory access that
+  poisons the CUDA context (surfacing at `gpu_autotuner.cu:666` and cascading
+  through the legacy fallback at `device_csr.cu:80` / `autotuner.cpp:267`). The
+  per-row sizes are now summed in uint64 before the uint32 scan; if the total
+  exceeds `UINT32_MAX`, Delta-16 is rejected for that slice via
+  `std::runtime_error`, which the whole-range autotune try/catch already
+  handles by dropping Delta-16 and falling back to a valid kernel (e.g.
+  Warp-CSR) with the context intact. No effect for `n_cols <= 65535` (fast
+  path) or per-block slices (`n_rows <= 65536`); the GF(2) SpMM result is
+  unchanged. Validated on RTX 5070 Ti and H100: the autotuner clears the
+  previously-crashing site and selects Warp-CSR.
+
 ## [1.0.0] - 2026-05-19
 
 Initial public release of the CUDA-accelerated Block Wiedemann solver over

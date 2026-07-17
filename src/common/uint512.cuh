@@ -957,4 +957,125 @@ public:
 
 };
 
+// =============================================================================
+// Wide-intermediate helpers for 512-bit N (RSA-155, N >= 2^511)
+// =============================================================================
+//
+// uint512 wraps silently at 2^512. Three SIQS transients have an INTERMEDIATE
+// that exceeds 2^512 only when N >= 2^511 (RSA-155), even though their final
+// result fits in 512 bits. These helpers carry the intermediate in a wider
+// accumulator and reduce back to uint512. They are STRICT no-ops for N < 2^511
+// (RSA-150 and every smaller size): there the intermediate already fits in
+// 512 bits, so the wider math produces bit-for-bit identical low-512 results.
+// They deliberately do NOT widen the uint512 type itself — only these sites.
+
+/**
+ * @brief Computes Q = |s^2 - N| and its sign, where s = |ax+b|.
+ *
+ * In SIQS the polynomial value is Q(x) = (ax+b)^2 - N. The factor s = |ax+b| is
+ * held in a uint512 and is < 2^257 for a 512-bit N, but its SQUARE reaches ~2N
+ * (~2^513 for N ~ 2^512), overflowing the 512-bit product s.mult(s). The TRUE
+ * value |Q| = |s^2 - N| satisfies |Q| < N < 2^512 in the sieve regime
+ * (x in [-M,M], a ~ sqrt(2N)/M => (ax+b)^2 < 2N), so only the intermediate
+ * square overflows. We form s^2 in a 1024-bit accumulator, subtract N
+ * (zero-extended), and return the low 512 bits.
+ *
+ * sign is set to +1 when s^2 >= N and -1 when s^2 < N, matching the legacy
+ *   "Q=s; Q.mult(Q); if (Q<N){sign=-1; Q=N-Q;} else {sign=+1; Q-=N;}"
+ * branch exactly.
+ *
+ * STRICT NO-OP for N < 2^511: there s^2 < 2N < 2^512, so the 1024-bit square has
+ * all-zero high limbs and the |. - N| difference fits in 512 bits; the returned
+ * Q and sign are bit-for-bit identical to the legacy truncating path. RSA-150 and
+ * below are therefore unaffected by construction.
+ */
+__host__ __device__ inline uint512 abs_square_minus_N(const uint512& s,
+                                                      const uint512& N,
+                                                      int8_t& sign) {
+    // 1. Full 1024-bit square  p = s * s  (32 limbs, little-endian).
+    uint32_t p[32];
+    #if defined(__NVCC__) && defined(__CUDA_ARCH__)
+        #pragma unroll
+    #endif
+    for (int i = 0; i < 32; i++) p[i] = 0;
+    for (int i = 0; i < 16; i++) {
+        if (s.limbs[i] == 0) continue;
+        uint64_t carry = 0;
+        for (int j = 0; j < 16; j++) {
+            uint64_t term = (uint64_t)s.limbs[i] * s.limbs[j] + p[i + j] + carry;
+            p[i + j] = (uint32_t)term;
+            carry = term >> 32;
+        }
+        p[i + 16] += (uint32_t)carry;
+    }
+
+    // 2. Compare p (1024-bit) against N (zero-extended). Any non-zero high limb
+    //    [16..31] forces p > N immediately (N < 2^512). Otherwise compare the
+    //    low 512 bits limb-by-limb.
+    bool p_ge_N = true;       // default covers the p == N case (-> sign +1, Q = 0)
+    bool decided = false;
+    #if defined(__NVCC__) && defined(__CUDA_ARCH__)
+        #pragma unroll
+    #endif
+    for (int j = 31; j >= 16; j--) {
+        if (p[j] != 0) { p_ge_N = true; decided = true; break; }
+    }
+    if (!decided) {
+        for (int j = 15; j >= 0; j--) {
+            if (p[j] != N.limbs[j]) { p_ge_N = (p[j] > N.limbs[j]); break; }
+        }
+    }
+
+    // 3. Magnitude |p - N|, returning the low 512 bits (the true magnitude fits
+    //    there: |s^2 - N| < N < 2^512 in the sieve regime).
+    uint512 Q;
+    if (p_ge_N) {
+        sign = 1;                                  // s^2 >= N : Q = s^2 - N
+        uint32_t borrow = 0;
+        for (int i = 0; i < 16; i++) {
+            uint64_t ai = p[i];
+            uint64_t bi = (uint64_t)N.limbs[i] + borrow;
+            Q.limbs[i] = (uint32_t)(ai - bi);
+            borrow = (ai < bi) ? 1u : 0u;
+        }
+    } else {
+        sign = -1;                                 // s^2 < N : Q = N - s^2
+        uint32_t borrow = 0;
+        for (int i = 0; i < 16; i++) {
+            uint64_t ai = N.limbs[i];
+            uint64_t bi = (uint64_t)p[i] + borrow;
+            Q.limbs[i] = (uint32_t)(ai - bi);
+            borrow = (ai < bi) ? 1u : 0u;
+        }
+    }
+    return Q;
+}
+
+/**
+ * @brief Computes floor(sqrt(2N)) for any N < 2^512 (used for a_target = sqrt(2N)/M).
+ *
+ * The legacy code formed twoN = N<<1 then twoN.sqrt(). For N >= 2^511 the left
+ * shift drops bit 511, so 2N (~2^513) is truncated mod 2^512 and a_target is
+ * garbage. Since a_target is only a polynomial-SIZING target (never a correctness
+ * input), for N >= 2^511 we use sqrt(2N) = sqrt(2)*sqrt(N) with floor(sqrt(N))
+ * (N < 2^512, exact) scaled by a Q32 fixed-point sqrt(2): the result < 2^257 fits.
+ *
+ * STRICT NO-OP for N < 2^511: 2N < 2^512 there, so the original exact (N<<1).sqrt()
+ * path runs unchanged — RSA-150 and below get bit-for-bit identical a_target.
+ */
+__host__ __device__ inline uint512 isqrt_2N(const uint512& N) {
+    if (!N.msb_is_set()) {
+        // N < 2^511: 2N fits in 512 bits — exact, identical to the legacy path.
+        uint512 twoN = N;
+        twoN.lshift(1);
+        return twoN.sqrt();
+    }
+    // N >= 2^511 (RSA-155): 2N overflows uint512. a_target is only a target, so a
+    // ~2^-32 relative error is immaterial. SQRT2_Q32 = round(sqrt(2) * 2^32).
+    uint512 r = N.sqrt();                  // floor(sqrt(N)) < 2^256, exact
+    r.mul_uint64_inplace(6074001001ULL);   // r * sqrt(2) * 2^32  (< 2^289, no carry)
+    r.rshift(32);
+    return r;
+}
+
 } // namespace mpqs

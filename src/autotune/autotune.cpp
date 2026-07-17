@@ -167,8 +167,17 @@ bool AutotuneController::run() {
             bool skip_stage1 = false;
             if (iter > 0 && best_kernel_timing_us_ > 0.0f
                 && F_at_last_stage1_ > 0 && M_at_last_stage1_ > 0) {
-                double F_change = relChange(pipeline_config_.fb_bound, F_at_last_stage1_);
-                double M_change = relChange(pipeline_config_.sieve_bound, M_at_last_stage1_);
+                // Gate on f_data_.F / f_data_.M — the F/M Stage 1 actually consumes
+                // (runStage1_KernelParams does siever->initiate(f_data_)). The config
+                // fields pipeline_config_.fb_bound / .sieve_bound read 0 whenever
+                // determineParams() auto-selected F/M into f_data_ only (DEBUG_1 logs
+                // "F=0 M=0 L=0"), which zeroed F_at_last_stage1_ below and made this
+                // gate's "> 0" clauses fail — so the skip never fired and Stage 1
+                // re-ran every iteration (the 2nd run, with less budget, applied a
+                // noisier/worse winner). Comparing the same non-zero source on both
+                // sides makes the skip fire only when the tuned geometry is unchanged.
+                double F_change = relChange(f_data_.F, F_at_last_stage1_);
+                double M_change = relChange(f_data_.M, M_at_last_stage1_);
                 if (F_change < 0.10 && M_change < 0.10) {
                     skip_stage1 = true;
                     LOG(LOG_DEBUG_1) << "Stage 1: Skipped (F/M unchanged)";
@@ -178,8 +187,13 @@ bool AutotuneController::run() {
             }
             if (!skip_stage1) {
                 runStage1_KernelParams();
-                F_at_last_stage1_ = pipeline_config_.fb_bound;
-                M_at_last_stage1_ = pipeline_config_.sieve_bound;
+                // Record the F/M Stage 1 ran on from f_data_ (authoritative, non-zero
+                // after TuningStage) rather than pipeline_config_, which can be 0 — see
+                // the skip-gate comment above. A legitimate F/M re-tune (Stage 3 changed
+                // F via regenerateFactorBase, which updates f_data_.F) still re-runs
+                // Stage 1 because the gate then sees a real change.
+                F_at_last_stage1_ = f_data_.F;
+                M_at_last_stage1_ = f_data_.M;
             }
         }
 
@@ -386,6 +400,9 @@ void AutotuneController::runStage1_KernelParams() {
     // 1. Create ephemeral DeviceSievingController for mini-benchmarking
     auto siever = std::make_unique<mpqs::sieve::DeviceSievingController>(
         pipeline_config_.device_id);
+    siever->setAccumulatorMode(pipeline_config_.sieve_accumulator_mode);  // S1: honour CLI override in autotune probe path
+    siever->setWideAccumMode(pipeline_config_.sieve_wide_accum_mode);     // Option A: wide-accumulator width override
+    siever->setAutotuneProbePolys(pipeline_config_.autotune_probe_polys);  // wide-probe sample size (0 = auto-scale by N)
     siever->initiate(f_data_);
 
     // ----- OOM-guard seed budget (S2, design §2.4(A)). -------------------------------
@@ -514,9 +531,18 @@ void AutotuneController::runStage1_KernelParams() {
     //    of free VRAM (OOM-guard S2, design §2.4(B)).
     const uint64_t guard_non_sieve_bytes =
         computePostprocessingLpBytes() + memory_costs::CUDA_CONTEXT_RESERVE_BYTES;
+    // S3/S4 (wide): hand the optimizer the remaining Stage-1 wall-clock budget so its wide
+    // survivors/sec probe can shrink the per-candidate window when time is tight (while always
+    // reserving the mandatory loadStandardConfig-wide floor eval). Ignored on the narrow path
+    // (probe_budget_sec > 0 only engages when isWideAccumulator()), so narrow is unchanged.
+    const double probe_budget_sec = std::max(0.0, atcfg_.timeout_sec - elapsed());
     auto kp_result = optimizeKernelLaunchParams(
         *siever, f_data_, pipeline_config_.device_id, atcfg_.thorough,
-        guard_non_sieve_bytes);
+        guard_non_sieve_bytes, probe_budget_sec);
+
+    // S2: capture the resolved accumulator width before teardown so the winner preflight
+    // (below) validates with the SAME geometry the optimizer used (wide winner => wide check).
+    const bool stage1_wide = siever->isWideAccumulator();
 
     // 3. Tear down siever — reset unique_ptr so destructor runs exactly once
     //    (clearSievingBuffers() + destructor = double-free, same as TruncatedSieveRun bug)
@@ -526,13 +552,77 @@ void AutotuneController::runStage1_KernelParams() {
     cudaDeviceSynchronize();
     cudaGetLastError();
 
+    // WIDE no-signal guard (S4 robustness). On the wide path `timing_us` is a survivors/sec
+    // RATE, so a measured 0.0f means the autotune got NO signal (0 survivors/s across every
+    // candidate — e.g. LP off / too-tight threshold at this scale, so no full smooths survived).
+    // The apply/floor-gate block below is entered only on `timing_us > 0.0f`, so without this
+    // guard a zero-rate wide run would SILENTLY skip both the "beats floor" and the "floor not
+    // beaten -> keeping loadStandardConfig" logging, leave `useParams` at its default false, and
+    // revert to loadStandardConfig with NO diagnostic — the operator could not tell autotune got
+    // no signal. Make it explicit: warn and keep loadStandardConfig (useParams=false), mirroring
+    // the floor-gate fallback's Stage-1 bookkeeping. NARROW is untouched: objective_is_rate==false
+    // there and `timing_us` is a µs timing (never 0 in practice, lower-is-better), so this branch
+    // is never taken and the pre-existing `> 0.0f` semantics below are byte-for-byte preserved.
+    if (kp_result.objective_is_rate && !(kp_result.timing_us > 0.0f)) {
+        LOG(LOG_WARNING) << "wide autotune: no signal (0 survivors/s across all candidates - "
+                            "likely LP off / too-tight threshold at this scale) -> keeping "
+                            "loadStandardConfig";
+        pipeline_config_.useParams = false;
+        // Mirror the floor-gate fallback: record the (non-positive) Stage-1 rate. Used only as a
+        // ">0 Stage 1 decided" flag for the multi-iteration skip-gate (line ~168); at 0 the gate
+        // does not fire, so a later iteration may legitimately retry to obtain signal — the honest
+        // behaviour when this run measured none. useParams stays false, so nothing is applied.
+        best_kernel_timing_us_ = kp_result.timing_us;
+        result_.stages[1].notes = "wide no-signal: keeping loadStandardConfig";
+        result_.stages[1].ran = true;
+        result_.stages[1].time_sec = duration(Clock::now() - t0);
+        return;
+    }
+
     // 4. Defense in depth: verify the winning config passes preflight
     //    before applying to the pipeline. Should never fail (optimizer uses
     //    isValid() internally), but guards against validator/optimizer bugs.
     if (kp_result.timing_us > 0.0f) {
+        // S4 FLOOR GATE (WIDE only). If the coordinate-descent winner did NOT beat the
+        // loadStandardConfig-wide floor by the margin, keep loadStandardConfig verbatim
+        // (useParams=false → SieveStage calls loadStandardConfig()) — provable parity with the
+        // shipping wide default, so the wide-autotune regression cannot recur. NARROW:
+        // objective_is_rate==false and beats_floor==true, so this branch is never taken and the
+        // apply path below is byte-for-byte the pre-S4 behaviour.
+        if (kp_result.objective_is_rate && !kp_result.beats_floor) {
+            LOG(LOG_INFO) << "wide autotune: floor not beaten (winner "
+                          << kp_result.timing_us << " survivors/s vs floor "
+                          << kp_result.floor_score
+                          << " survivors/s) -> keeping loadStandardConfig";
+            pipeline_config_.useParams = false;
+            // Defensive parity with the apply path (line ~586): record a positive Stage-1
+            // result so the multi-iteration loop's "skip Stage 1 when F/M unchanged" gate
+            // (line ~168) is not *additionally* blocked on the fallback by `best_kernel_timing_us_
+            // == 0`. Without this, the floor-gate fallback would introduce a NEW second-iteration
+            // re-run (vs the apply path's single run) in any config where fb_bound is set > 0
+            // during the loop. (When fb_bound is 0 during the loop — as in RSA-100 --autotune_only,
+            // DEBUG_1 "F=0 M=0 L=0" — the gate's separate `F_at_last_stage1_ > 0` clause already
+            // blocks the skip pre-existingly, so the re-run persists regardless; that is an
+            // orthogonal, benign, pre-existing autotune-loop matter, not the floor gate's doing.)
+            // This is a survivors/sec RATE, but the field is used only as a >0 "Stage 1 decided"
+            // flag (no getter / history read) and useParams stays false, so the rejected winner is
+            // never applied. WIDE-only branch.
+            best_kernel_timing_us_ = kp_result.timing_us;
+            result_.stages[1].notes = "wide floor not beaten: keeping loadStandardConfig";
+            result_.stages[1].ran = true;
+            result_.stages[1].time_sec = duration(Clock::now() - t0);
+            return;
+        }
+        if (kp_result.objective_is_rate && kp_result.floor_score > 0.0f) {
+            const double beat_pct =
+                100.0 * ((double)kp_result.timing_us / (double)kp_result.floor_score - 1.0);
+            LOG(LOG_INFO) << "wide autotune: winner beats floor by " << beat_pct
+                          << "% (" << kp_result.timing_us << " vs " << kp_result.floor_score
+                          << " survivors/s) -> applying";
+        }
         auto pf = preflightKernelLaunch(kp_result.params,
             static_cast<uint32_t>(f_data_.a_factors.size()), f_data_.M,
-            pipeline_config_.device_id);
+            pipeline_config_.device_id, stage1_wide);
         if (!pf.feasible) {
             LOG(LOG_WARNING) << "Stage 1 winner failed preflight: "
                           << pf.reason

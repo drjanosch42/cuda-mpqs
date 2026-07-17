@@ -345,19 +345,17 @@ void validate_relation(const HostRelationBatch& batch, size_t i,
                        uint64_t lp_bound,
                        bool is_smooths_batch,
                        BatchResults& R) {
-    // --- recompute Q = sqrt_Q^2 - N, with sign ---
+    // --- recompute Q = |sqrt_Q^2 - N|, with sign ---
+    // sqrt_Q = |ax+b|; its SQUARE reaches ~2N (~2^513 for N >= 2^511, RSA-155) and
+    // overflows a plain 512-bit sq.mult(sq) — the exact truncation this tool exists
+    // to catch. Route through mpqs::abs_square_minus_N (1024-bit local accumulator),
+    // matching the production sieve (postprocessing.cu) and the in-pipeline validator
+    // (mpqs_soa.cu debug_validate_soa_kernel). It returns |s^2 - N| and sets
+    // sign = +1 when s^2 >= N (Q = s^2 - N) else -1 (Q = N - s^2), identical to the
+    // old branch below 2^511 (STRICT NO-OP there) and correct at N >= 2^511.
     const uint512& sq = batch.sqrt_Q[i];
-    uint512 sq2 = sq; sq2.mult(sq);     // (ax+b)^2
-
     int8_t computed_sign;
-    uint512 absQ;
-    if (sq2 < N) {
-        computed_sign = -1;
-        absQ = N; absQ.sub(sq2);        // N - (ax+b)^2
-    } else {
-        computed_sign = 1;
-        absQ = sq2; absQ.sub(N);        // (ax+b)^2 - N
-    }
+    uint512 absQ = mpqs::abs_square_minus_N(sq, N, computed_sign);
 
     // recorded sign byte: postprocessing stores int8 sign_of_Q (+1 / -1) into a
     // uint8 field. Compare as signed.

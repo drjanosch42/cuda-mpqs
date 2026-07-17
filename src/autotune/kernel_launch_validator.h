@@ -30,9 +30,10 @@ struct DeviceLimits {
 struct SieveConstants {
     uint32_t shc_dim;            ///< Hypercube dimension (f_data.a_factors.size())
     uint32_t M;                  ///< Sieve interval radius (f_data.M)
-    uint32_t sievingBlockSize;   ///< pow2leq(3 * maxSharedMem / 4), typically 32768
+    uint32_t sievingBlockSize;   ///< narrow: pow2leq(3*maxShared/4); wide: pow2leq(3*maxShared*32/(4*76))
     uint32_t globalBucketSize;   ///< sievingBlockSize / 2
-    uint32_t bigPrimeStartIndex; ///< Cutoff index for small/large primes, hardcoded 1024
+    uint32_t bigPrimeStartIndex; ///< sievingBlockSize / 32
+    uint32_t accumulatorBytes = 1; ///< sieve-accumulator width in bytes: 1 = uint8 (narrow), 2 = uint16 (wide)
 };
 
 /// Ordered 8-parameter tuple for kernel launch configuration.
@@ -120,11 +121,15 @@ std::vector<Params8> enumerateValidConfigs(const KernelLaunchValidator& v);
 
 /// Preflight check from raw Params8 + factoringData dimensions + device.
 /// Builds SieveConstants, creates validator, returns structured result.
+/// use_wide selects the uint16 (wide) sieve geometry (SB, accumulator byte width);
+/// default false = the pre-S2 uint8 (narrow) behaviour, byte-identical for all callers.
 PreflightResult preflightKernelLaunch(
     const Params8& params,
     uint32_t shc_dim,
     uint32_t M,
-    int device_id);
+    int device_id,
+    bool use_wide = false,
+    bool use_u8sat = false);   // Option A: saturating-uint8 wide accumulator geometry
 
 /// Convenience overload: extracts Params8 from MPQSConfig::params[8].
 /// Short-circuits with {true, ""} when config.useParams == false.
@@ -138,10 +143,17 @@ PreflightResult preflightKernelLaunch(
 /// Build SieveConstants from factoringData dimensions + device properties.
 ///   shc_dim            = f_data.a_factors.size()
 ///   M                  = f_data.M
-///   sievingBlockSize   = pow2leq(3 * maxSharedMemPerBlock / 4)
+///   sievingBlockSize   = min(M, pow2leq(3*maxSharedMemPerBlock/4))            [narrow, uint8]
+///                        min(M, pow2leq(3*maxSharedMemPerBlock*32/(4*76)))    [wide,   uint16]
 ///   globalBucketSize   = sievingBlockSize / 2
-///   bigPrimeStartIndex = 1024
+///   bigPrimeStartIndex = sievingBlockSize / 32
+///   accumulatorBytes   = use_wide ? (use_u8sat ? 1 : 2) : 1
+/// use_wide mirrors DeviceSievingController::loadPartialCustomConfig's wide geometry so the
+/// standalone validator/preflight rank the config as it will actually run on the wide kernel.
+/// use_u8sat (Option A) selects the saturating-uint8 wide accumulator (SB restored, den=44).
+/// Defaults false = byte-identical to the pre-S2 narrow build for every existing caller.
 SieveConstants buildSieveConstants(uint32_t shc_dim, uint32_t M,
-                                   size_t maxSharedMemPerBlock);
+                                   size_t maxSharedMemPerBlock,
+                                   bool use_wide = false, bool use_u8sat = false);
 
 } // namespace mpqs::autotune

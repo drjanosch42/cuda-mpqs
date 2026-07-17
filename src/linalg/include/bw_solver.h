@@ -296,6 +296,10 @@ struct BWSolverConfig {
     /// Saves the resulting polynomial Pi to disk.
     bool stage2_save_checkpoints = false;
 
+    /// @brief Load Checkpoints.
+    /// If true and a valid Pi checkpoint exists, loads it and skips Stage 2 compute.
+    bool stage2_load_checkpoints = false;
+
     // --- File Suffixes (Stage 2) ---
     std::string stage2_suffix_S = "_S.bin";   // Input file suffix
     std::string stage2_suffix_Pi = "_Pi.bin"; // Output file suffix
@@ -349,6 +353,15 @@ struct BWSolverConfig {
     /// @brief Save Solutions.
     /// Saves reconstructed kernel vectors to disk.
     bool stage3_save_solutions = false;
+
+    /// @brief Save Checkpoints.
+    /// Like stage3_save_solutions but also emits the _sol_meta.bin count file so the
+    /// solution set can be reloaded on resume. Enabled by the resume checkpoint wiring.
+    bool stage3_save_checkpoints = false;
+
+    /// @brief Load Checkpoints.
+    /// If true and a complete solution checkpoint exists, loads it and skips Stage 3.
+    bool stage3_load_checkpoints = false;
 
     // --- File Suffixes (Stage 3) ---
     std::string stage3_suffix_Y = "_Y.bin";
@@ -543,6 +556,13 @@ struct BWStage1Config {
     /// If true, saves generated data (X, Y, S) to disk.
     bool save_checkpoints = true;
 
+    /// @brief Vectors-Only Mode (resume-from-generator).
+    /// If true, RunStage1 regenerates the deterministic projection/starting blocks X and
+    /// Z (Y) — which Stage 3 still requires — then returns before the expensive Krylov
+    /// sequence loop. Used when a Stage 2 generator (Pi) checkpoint will be loaded, making
+    /// the sequence S unnecessary. Result-neutral: X/Z depend only on the seed.
+    bool vectors_only = false;
+
     // -------------------------------------------------------------------------
     // File Naming Conventions
     // -------------------------------------------------------------------------
@@ -687,6 +707,10 @@ struct BWStage2Config {
     /// If true, saves the resulting polynomial \f$ \pi(x) \f$ to disk.
     bool save_checkpoints = true;
 
+    /// @brief Load Checkpoints Flag.
+    /// If true and a valid Pi checkpoint exists, loads it and skips the Stage 2 compute.
+    bool load_checkpoints = false;
+
     /// @brief Filename suffix for the input sequence S.
     /// Full path: checkpoint_prefix + suffix_S
     std::string suffix_S = "_S.bin";
@@ -806,8 +830,12 @@ struct BWStage3Config {
     std::string checkpoint_prefix = "";
 
     /// @brief Save Solutions Flag.
-    /// If true, saves the reconstructed kernel vectors to disk.
+    /// If true, saves the reconstructed kernel vectors to disk (+ _sol_meta.bin count).
     bool save_solutions = false;
+
+    /// @brief Load Checkpoints Flag.
+    /// If true and a complete solution checkpoint exists, loads it and skips Stage 3.
+    bool load_checkpoints = false;
 
     /// @brief Filename suffix for input starting block Y (Z).
     std::string suffix_Y = "_Y.bin";
@@ -869,7 +897,15 @@ private:
     void UpdateStage1Config();
     void UpdateStage2Config();
     void UpdateStage3Config();
-    void UpdateAllConfigs();  
+    void UpdateAllConfigs();
+
+    // --- Checkpoint integrity tag ---
+    // Cheap hash of the identifying run parameters (nrows, m, n, seed). Stamped once per
+    // checkpoint set and verified before any stage load so stale cross-run checkpoints
+    // are recomputed rather than loaded.
+    uint64_t compute_ckpt_tag() const;
+    // True iff a tag file exists AND matches the current run's parameters.
+    bool checkpoint_tag_matches() const;
   
     const HostMatrix& A_host_;
     io::BWIOSystem io_;

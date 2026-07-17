@@ -21,12 +21,18 @@ namespace mpqs::cluster {
 static_assert(std::endian::native == std::endian::little,
               "MPQS cluster protocol assumes little-endian byte order");
 
-/// Wire protocol magic bytes ("MQ")
-static constexpr uint16_t kProtocolMagic = 0x4D51;
+/// Wire protocol magic bytes ("MR"). Bumped 0x4D51 ("MQ") -> 0x4D52 with the
+/// v2 WORK_ASSIGN layout (FB hash instead of FB arrays) so a stale binary mixed
+/// with a new one fails fast at the frame magic check (tcp_transport recvMsg)
+/// instead of mis-parsing WORK_ASSIGN. All frames share the magic, enforcing
+/// all-or-nothing build lockstep across the cluster.
+static constexpr uint16_t kProtocolMagic = 0x4D52;
 
 /// Protocol version — defined for future handshake use but not currently
-/// transmitted in FrameHeader (version negotiation is deferred).
-static constexpr uint8_t kProtocolVersion = 1;
+/// transmitted in FrameHeader (version negotiation is deferred; cross-version
+/// rejection is enforced via kProtocolMagic above).
+/// v2: WORK_ASSIGN ships a 64-bit FB hash; workers regenerate the FB locally.
+static constexpr uint8_t kProtocolVersion = 2;
 
 /// Frame header: 11 bytes on the wire.
 /// Layout: [magic:2B][msg_type:1B][seq_no:4B][payload_len:4B]
@@ -47,7 +53,7 @@ enum class MsgType : uint8_t {
     HELLO_ACK       = 0x02,  ///< Coordinator -> Worker: accepted + worker_id
 
     // Work distribution
-    WORK_ASSIGN     = 0x10,  ///< Coordinator -> Worker: N + factor base + params + poly range
+    WORK_ASSIGN     = 0x10,  ///< Coordinator -> Worker: N + params + poly range + FB hash (worker regenerates + verifies)
     WORK_MORE       = 0x11,  ///< Coordinator -> Worker: additional poly range (Stage 2)
     WORK_REQUEST    = 0x12,  ///< Worker -> Coordinator: request more work (Stage 2)
 

@@ -139,6 +139,25 @@ uint64_t deserializeRelationBatch(const uint8_t* data, size_t len,
 // Work Assign
 // =============================================================================
 
+uint64_t computeFactorBaseHash(const mpqs::sieve::factoringData& fdata) {
+    // Canonical FB fingerprint: FNV-1a 64-bit over fb_size, then factorBase[]
+    // bytes, then rootN[] bytes (see serialization.h). Both sides of the wire
+    // call THIS function — the coordinator when serializing WORK_ASSIGN, the
+    // worker after regenerating the FB from (N, F) — so the definitions cannot
+    // drift. Raw-byte hashing is safe on this homogeneous little-endian cluster
+    // (static_assert above).
+    uint64_t h = 1469598103934665603ULL;              // FNV-1a offset basis
+    auto mix = [&h](const void* p, size_t n) {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+    };
+    uint32_t sz = static_cast<uint32_t>(fdata.factorBase.size());
+    mix(&sz, sizeof(sz));
+    mix(fdata.factorBase.data(), fdata.factorBase.size() * sizeof(uint32_t));
+    mix(fdata.rootN.data(),      fdata.rootN.size()      * sizeof(uint32_t));
+    return h;
+}
+
 std::pair<std::vector<uint8_t>, size_t>
 serializeWorkAssign(const mpqs::sieve::factoringData& fdata,
                     uint32_t sieve_batch_size,
@@ -154,7 +173,8 @@ serializeWorkAssign(const mpqs::sieve::factoringData& fdata,
     //             + 1(shc_dim) + 3(pad) + 8(threshold) + 8(lp1_bound)
     //             + 8(start) + 8(count) + 8(target)
     //             = 124 bytes
-    // Plus: fb_size*4 (factorBase) + fb_size*4 (rootN)
+    // Plus: 8 (fb_hash — replaces the former fb_size*8 factorBase/rootN blob,
+    //       keeping the payload F-independent and far under the 64 MiB frame cap)
     // Plus (M3, optional): 4(dim) + dim*4(a_factors) + 4(lowerHalfStart) + 4(upperHalfStart)
     size_t snapshot_size = 0;
     if (snapshot) {
@@ -162,7 +182,7 @@ serializeWorkAssign(const mpqs::sieve::factoringData& fdata,
                       + snapshot->shc_dim * sizeof(uint32_t)         // a_factors
                       + 2 * sizeof(uint32_t);                        // lowerHalfStart + upperHalfStart
     }
-    size_t total = 124 + fb_size * 8 + snapshot_size;
+    size_t total = 124 + 8 + snapshot_size;
 
     std::vector<uint8_t> buf(total);
     size_t offset = 0;
@@ -184,10 +204,10 @@ serializeWorkAssign(const mpqs::sieve::factoringData& fdata,
     writeBytes(buf, offset, &poly_range_count, 8);
     writeBytes(buf, offset, &target_relations, 8);
 
-    if (fb_size > 0) {
-        writeBytes(buf, offset, fdata.factorBase.data(), fb_size * sizeof(uint32_t));
-        writeBytes(buf, offset, fdata.rootN.data(), fb_size * sizeof(uint32_t));
-    }
+    // FB hash instead of the FB arrays: the worker regenerates the FB from
+    // (N, F) — deterministic — and verifies against this hash before sieving.
+    uint64_t fb_hash = computeFactorBaseHash(fdata);
+    writeBytes(buf, offset, &fb_hash, 8);
 
     // AFactorsSnapshot extension (M3) — appended after all existing fields
     if (snapshot) {
@@ -211,8 +231,9 @@ bool deserializeWorkAssign(const uint8_t* data, size_t len,
                            uint64_t& poly_range_start,
                            uint64_t& poly_range_count,
                            uint64_t& target_relations,
+                           uint64_t& fb_hash_out,
                            mpqs::sieve::AFactorsSnapshot* snapshot_out) {
-    if (len < 124) return false;
+    if (len < 132) return false;  // 124-byte fixed header + 8-byte fb_hash
 
     SafeReader r{data, len};
     uint32_t fb_size = 0;
@@ -236,14 +257,11 @@ bool deserializeWorkAssign(const uint8_t* data, size_t len,
     if (!r.ok) return false;
 
     fdata.size = fb_size;
-    fdata.factorBase.resize(fb_size);
-    fdata.rootN.resize(fb_size);
 
-    if (fb_size > 0) {
-        r.readBytes(fdata.factorBase.data(), fb_size * sizeof(uint32_t));
-        r.readBytes(fdata.rootN.data(), fb_size * sizeof(uint32_t));
-        if (!r.ok) return false;
-    }
+    // FB arrays are NOT on the wire. Read the coordinator's FB hash; the caller
+    // regenerates factorBase/rootN from (N, F) and verifies against it.
+    r.readBytes(&fb_hash_out, 8);
+    if (!r.ok) return false;
 
     // AFactorsSnapshot extension (M3) — optional, backward compatible.
     // A short buffer (M2-era sender without snapshot) is silently accepted.

@@ -8,6 +8,7 @@
 #include "sieve_memory_model.h"   // single source-of-truth sieve memory model
 #include <bit>
 #include <algorithm>
+#include <chrono>   // S3 wide-probe wall-clock measurement window
 #include <iostream>
 #include <vector>
 #include <map>
@@ -41,6 +42,11 @@ DeviceSievingController::DeviceSievingController(int device, cudaStream_t stream
     size_t max_shared_bytes = g_info.maxSharedMemPerBlock;
     cudaFuncSetAttribute((const void*)sieveAndScanKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_bytes);
     cudaFuncSetAttribute((const void*)sieveAndScanBatchKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_bytes);
+    // RSA-155 dual-path: opt-in max dynamic shared for the wide (uint16) batch kernel.
+    // Must run in the ctor (before any cuda-graph stream capture) — the S5 wide launch relies on it.
+    cudaFuncSetAttribute((const void*)sieveAndScanBatchKernelWide, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_bytes);
+    // Option A: same opt-in for the saturating-uint8 wide kernel (larger SB => larger smem).
+    cudaFuncSetAttribute((const void*)sieveAndScanBatchKernelWideU8Sat, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_bytes);
 }
 
 DeviceSievingController::DeviceSievingController(int device)
@@ -50,6 +56,11 @@ DeviceSievingController::DeviceSievingController(int device)
     size_t max_shared_bytes = g_info.maxSharedMemPerBlock;
     cudaFuncSetAttribute((const void*)sieveAndScanKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_bytes);
     cudaFuncSetAttribute((const void*)sieveAndScanBatchKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_bytes);
+    // RSA-155 dual-path: opt-in max dynamic shared for the wide (uint16) batch kernel.
+    // Must run in the ctor (before any cuda-graph stream capture) — the S5 wide launch relies on it.
+    cudaFuncSetAttribute((const void*)sieveAndScanBatchKernelWide, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_bytes);
+    // Option A: same opt-in for the saturating-uint8 wide kernel (larger SB => larger smem).
+    cudaFuncSetAttribute((const void*)sieveAndScanBatchKernelWideU8Sat, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_bytes);
 }
 
 DeviceSievingController::~DeviceSievingController()
@@ -70,6 +81,9 @@ DeviceSievingController::~DeviceSievingController()
     if (dev_pointers.dev_job_B_flat) cudaFree(dev_pointers.dev_job_B_flat);
     if (dev_pointers.dev_job_factor_indices) cudaFree(dev_pointers.dev_job_factor_indices);
     if (h_pinned_factor_indices_) { cudaFreeHost(h_pinned_factor_indices_); h_pinned_factor_indices_ = nullptr; }
+    // S2 wide-probe scratch (owned by this controller; dev_pp_* in dev_pointers only alias it).
+    if (dev_probe_pp_accum_)   { cudaFree(dev_probe_pp_accum_);   dev_probe_pp_accum_ = nullptr; }
+    if (dev_probe_pp_counter_) { cudaFree(dev_probe_pp_counter_); dev_probe_pp_counter_ = nullptr; }
 }
 
 void DeviceSievingController::initiate(factoringData& f_data)
@@ -81,7 +95,100 @@ void DeviceSievingController::initiate(factoringData& f_data)
     fs_params.M = f_data.M;
     // Safe intermediate calculation using long long
     fs_params.approxPolyRoot = (uint32_t)((((int64_t)f_data.M) * 10000) / 14142);
+
+    // --- S1: dual-path sieve accumulator dispatch predicate (COMPUTE + LOG ONLY) ---
+    // Decide whether the (future) uint16 wide accumulator path would be needed for this
+    // (a, M). At S1 this is INERT: nothing downstream reads use_wide_accumulator_ yet, so
+    // sieve output is byte-identical to the pre-S1 baseline. Wiring lands in S2+.
+    //
+    // Guard: f_data.a MUST be finalized before the predicate (caller order recalc_a ->
+    // initiate). Defensive tripwire; if it ever fires, a future caller reordered and the
+    // predicate + config sizing must move to the first point where 'a' is final.
+    if (f_data.a.is_zero()) {
+        LOG(LOG_ERROR_CRITICAL) << "Sieve predicate: f_data.a not populated before initiate()";
+        // (production escalates; do not silently pick u8)
+    }
+    uint32_t log2_a  = (uint32_t)f_data.a.msb();                // == device current_a.msb()/p_data.log2_a
+    uint32_t ilog2_M = 31u - __builtin_clz((uint32_t)f_data.M); // M is pow2 in every validated config (logging/cross-check only)
+    // EXACT-EVAL form (mirrors kernel.cu:834-837). Evaluate approxPolyVal at the three
+    // worst-case indices gi in {-M, 0, M-1} using the device's own arithmetic and
+    // log2(0)=0 convention, then take the max.
+    auto host_ilog2 = [](int v) -> int { return (v <= 0) ? 0 : (31 - __builtin_clz((uint32_t)v)); };
+    int32_t  M    = (int32_t)f_data.M;
+    uint32_t apr  = fs_params.approxPolyRoot;                   // = M*10000/14142 (set above)
+    int APV_max = 0;
+    for (int32_t gi : { -M, 0, M - 1 }) {
+        // exact analog of kernel.cu:834-835 (unsigned-safe absolute distances)
+        uint32_t dist_minus = (gi >= (int)apr)  ? (uint32_t)(gi - (int)apr)  : (uint32_t)((int)apr - gi);
+        uint32_t dist_plus  = (gi >= -(int)apr) ? (uint32_t)(gi + (int)apr)  : (uint32_t)(-(int)apr - gi);
+        int apv = (int)log2_a + host_ilog2((int)dist_minus) + host_ilog2((int)dist_plus);  // == kernel.cu:837
+        APV_max = std::max(APV_max, apv);
+    }
+    // (Cross-check only:) closed form log2_a + 2*ilog2(M) - 1 agrees to +/-1.
+    const int WIDE_MARGIN = 4;                                  // safe window [1,4]; 5 is UNSAFE (RSA-140@1M 251+5=256)
+    bool predicate_wide = (APV_max + WIDE_MARGIN) >= 256;
+    use_wide_accumulator_ = (accumulator_mode_ == 2) ? true
+                          : (accumulator_mode_ == 1) ? false
+                          : predicate_wide;
+    LOG(LOG_INFO) << "Sieve accumulator: log2_a=" << log2_a << " ilog2_M=" << ilog2_M
+                  << " APV_max=" << APV_max << " margin=" << WIDE_MARGIN
+                  << " mode=" << accumulator_mode_
+                  << " => use_wide=" << use_wide_accumulator_;
+    // --- end S1 predicate ---
+
     fs_params.threshold = 31 - std::countl_zero((uint32_t)f_data.F);
+
+    // --- Option A (wide saturating-uint8 accumulator) width dispatch ---------
+    // Only meaningful in the wide regime. The saturating-uint8 accumulator is
+    // bit-for-bit equivalent to the uint16 wide path in candidate selection iff
+    // the per-block MAX threshold target APV_max - threshold <= 254 (equivalence
+    // lemma, 2026-07-10 wide-smem-reduction assessment, §3). When it
+    // holds, u8sat restores SB to the 1-byte width; when it fails (larger M /
+    // smaller F pushing the target toward 255) we fall back to uint16 — never to
+    // the wrap bug. Gate is checked even under a force (mode 1) so a forced-u8sat
+    // never silently reintroduces the RSA-155 smooth-loss pathology.
+    //
+    // HARDENED GATE (post-review F1, 2026-07-10 wide-u8sat prototype review):
+    // APV_max is a 3-point sample {-M,0,M-1} of approxPolyVal and a single
+    // f_data.a.msb(), NOT a proven per-location / per-poly upper bound. The reviewer's
+    // brute force over all gi found two independent latent slop sources, each <=1 count:
+    //   (S1) non-power-of-2 M can undercount the true interior max by up to 1
+    //        (power-of-2 M — every validated/probe config — undercounts 0);
+    //   (S2) the batch holds many polynomials whose a.msb() may differ from the sampled
+    //        f_data.a.msb() by +/-1 (the use_wide predicate absorbs this with WIDE_MARGIN=4;
+    //        this gate had no analogous margin).
+    // A single undercount at the exact boundary would let u8sat clamp a candidate uint16
+    // keeps (a few false-negative relations — not the wrap catastrophe, but it breaks the
+    // "bit-for-bit identical" guarantee). We therefore require a 2-count safety margin:
+    // max_target <= 252 (== 254 - 2), covering S1+S2 for ANY M (pow2 or not). This is a
+    // no-op at every production/probe point (RSA-155 max_target=249, RSA-150=239 — both
+    // still u8sat with room to spare) and only matters if a future F<=25M descent + non-pow2
+    // M pushes the margin toward 0, where it degrades gracefully to uint16. The same
+    // hardened threshold applies to a forced --wide_accum u8sat (mode 1).
+    static constexpr int kU8SatGateMaxTarget = 252;   // 254 - 2 (S1 non-pow2 + S2 a.msb slop)
+    wide_u8sat_selected_ = false;
+    if (use_wide_accumulator_) {
+        const int max_target = APV_max - (int)fs_params.threshold;
+        const bool gate_ok   = (max_target <= kU8SatGateMaxTarget);
+        if (wide_accum_mode_ == 2) {
+            wide_u8sat_selected_ = false;                 // force uint16
+        } else if (wide_accum_mode_ == 1) {               // force u8sat (gate-honoured)
+            wide_u8sat_selected_ = gate_ok;
+            if (!gate_ok)
+                LOG(LOG_WARNING) << "Wide accumulator: --wide_accum u8sat requested but "
+                                    "hardened exactness gate fails (max_target=" << max_target
+                                 << " > " << kU8SatGateMaxTarget
+                                 << "); falling back to uint16 to avoid overflow.";
+        } else {                                          // auto
+            wide_u8sat_selected_ = gate_ok;
+        }
+        LOG(LOG_INFO) << "Wide accumulator width: APV_max=" << APV_max
+                      << " threshold=" << fs_params.threshold
+                      << " max_target=" << max_target
+                      << " gate(<=" << kU8SatGateMaxTarget << ")=" << (gate_ok ? 1 : 0)
+                      << " wide_accum_mode=" << wide_accum_mode_
+                      << " => " << (wide_u8sat_selected_ ? "u8sat" : "uint16");
+    }
     // Note: updateState() is NOT called here — it must run after loadData()
     // has allocated device memory (dev_a_factors, dev_B_values). The
     // orchestrator calls updateState() explicitly after loadData().
@@ -91,6 +198,49 @@ void DeviceSievingController::setThresholdOverride(uint64_t threshold_bound)
 {
     if (threshold_bound > 0)
         fs_params.threshold = 63 - std::countl_zero(threshold_bound);
+}
+
+bool DeviceSievingController::getBucketOverflowStats(BucketOverflowStats& out) const
+{
+    // WIDE-ONLY: the narrow (uint8, <=RSA-140) production path carries all validated
+    // records and must not take an extra DtoH sync at the stats cadence. The overflow
+    // mechanism is a wide-path concern anyway (narrow buckets are globalBucketSize>=32768,
+    // healthy). Both wide legs (u16 + u8sat) report it.
+    if (!use_wide_accumulator_) return false;
+    if (dev_pointers.dev_globalBucketCounts == nullptr) return false;
+
+    const uint64_t total = (uint64_t)gs_conf.num_polysPerSieveCall
+                         * (uint64_t)gs_conf.num_sievingBlocksPerSieveCall;
+    if (total == 0) return false;
+
+    // Pure read of the EXISTING per-bucket counts buffer (bit 31 = overflowed, set at
+    // kernel.cu globalMetaSieveBatchKernel; masked off by the GATHER dump). Confined to
+    // the siever stream so it cannot perturb work on other streams; read-only, so it
+    // cannot alter any device sieving result. Snapshots the most-recently-populated
+    // buckets (a representative batch — the overflow tax is ~F/M-invariant per the
+    // root-cause analysis).
+    std::vector<uint32_t> h(total);
+    cudaError_t e = cudaMemcpyAsync(h.data(), dev_pointers.dev_globalBucketCounts,
+                                    total * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+    if (e != cudaSuccess) return false;
+    e = cudaStreamSynchronize(stream);
+    if (e != cudaSuccess) return false;
+
+    uint64_t overflowed = 0;
+    uint32_t max_fill   = 0;
+    for (uint64_t i = 0; i < total; ++i) {
+        const uint32_t c = h[i];
+        if (c & 0x80000000u) ++overflowed;
+        const uint32_t fill = c & 0x00FFFFFFu;   // clamped fill level (min(head, globalBucketSize))
+        if (fill > max_fill) max_fill = fill;
+    }
+
+    out.total_buckets      = total;
+    out.overflowed_buckets = overflowed;
+    out.global_bucket_size = gs_conf.globalBucketSize;
+    out.max_fill           = max_fill;
+    out.fraction           = (double)overflowed / (double)total;
+    return true;
 }
 
 void DeviceSievingController::allocateBatchBuffers() {
@@ -318,6 +468,17 @@ JSON_IO j_io){
 
 void DeviceSievingController::sieveFullCube()
 {
+    // [S4 non-batch guard — PRODUCTION: escalate] sieveFullCube drives the legacy (non-batch)
+    // sieveAndScanKernel via sieveStep()->sieveAndScan(), which has no uint16 fork (S4b deferred).
+    // The wide accumulator is only available on the batch sieve path, so escalate rather than
+    // silently run the overflow-prone uint8 non-batch kernel. Guard the ENTRY point (not the
+    // shared sieveStep(), which sieveMini() also uses — MUST-FIX 4).
+    if (use_wide_accumulator_) {
+        LOG(LOG_ERROR_CRITICAL) << "[S4] wide accumulator requires the batch sieve; rerun with "
+                                   "--sieve_batch_size >= 1 (non-batch sieveFullCube has no uint16 path)";
+        throw std::runtime_error(
+            "wide accumulator requires the batch sieve; rerun with --sieve_batch_size >= 1");
+    }
     ds_params.newCube = true;
     for(uint32_t sievingBlockBatch = 0; sievingBlockBatch < gs_conf.num_sievingBlockBatches; sievingBlockBatch++){
         for(uint32_t subCube = 0; subCube < gs_conf.num_subCubes; subCube++){
@@ -337,6 +498,17 @@ void DeviceSievingController::sieveStep()
 }
 
 float DeviceSievingController::sieveMini(uint32_t num_subcubes) {
+    // [S4 non-batch guard — PROBE: skip] sieveMini() (the probe/autotune entry, also reached via
+    // evaluateConfig) drives the legacy non-batch sieveAndScanKernel via sieveStep(), which has no
+    // uint16 fork (S4b deferred). Skip this infeasible probe (return the -1.0f sentinel) rather than
+    // aborting the whole candidate sweep (MINOR-5). Guard the ENTRY, not the shared sieveStep().
+    if (use_wide_accumulator_) {
+        // S2 (wide-autotune foundation): the wide accumulator has NO non-batch kernel, so
+        // instead of skipping the probe (the old -1.0f sentinel that made the optimizer bail
+        // with "0 configs tested") drive the REAL batch-wide pipeline. num_subcubes carries
+        // through as the repeat count.
+        return sieveMiniBatch(num_subcubes);
+    }
     // 0 means full cube
     if (num_subcubes == 0) num_subcubes = gs_conf.num_subCubes;
 
@@ -373,6 +545,234 @@ float DeviceSievingController::sieveMini(uint32_t num_subcubes) {
     ds_params.subCube    = saved_subCube;
 
     return ms * 1000.0f; // microseconds
+}
+
+// ---------------------------------------------------------------------------
+// S2 (wide-autotune foundation): batch-wide probe.
+// ---------------------------------------------------------------------------
+
+void DeviceSievingController::ensureProbeBatchSetup() {
+    if (probe_batch_ready_) return;
+
+    // Probe SAMPLE size = number of DISTINCT polynomials staged once here. Every candidate
+    // (Phase-1 seed, all Phase-2 configs, the verify pass, and the floor probe) re-sieves this
+    // SAME staged batch (A/B fidelity), so it is the actual sample the survivors/sec objective
+    // sees — a longer measurement window only re-times it more precisely, it never enlarges it.
+    //
+    // Per-poly sieve-survivor density falls steeply with N (the sieve-log threshold tightens),
+    // so the old fixed 8-poly sample — signal-rich at RSA-100 — becomes ~65-90% likely to hold
+    // ZERO survivors at RSA-150/155, starving the harness (measured 0 survivors/s for every
+    // candidate incl. the floor → NO_SIGNAL; report rsa150_a100_at_eff_v2_analysis_2026_07_10.md
+    // §4). Fix: scale the DISTINCT sample with N so E[survivors] stays comfortably nonzero —
+    // one doubling per ~16 bits of N above 400, off the 8-poly RSA-100 baseline, capped at 1024.
+    // At the measured RSA-150 density (~0.015-0.10 survivors/poly), 512 polys give
+    // E[survivors] ≈ 8-50 (P(empty) < 0.1%); RSA-155 (lower density) gets 1024. Smaller N keeps
+    // the old fast, survivor-rich 8-poly probe unchanged (preserving the validated RSA-100 wide
+    // autotune behavior). Staging cost is trivial (≤1024 × shc × 64 B ≈ 2 MB) and the per-chunk
+    // survivor count stays far below probe_pp_capacity_ (density × sample ≪ 2^18) at every scale.
+    // CLI --autotune_probe_polys overrides the auto-scale (0 = auto) for A/B testing on any N.
+    // nbits is the true BIT-LENGTH: uint512::msb() returns the top-set-bit INDEX (bit_length-1),
+    // so +1 — else RSA-150 (496b) would stage 256 not 512 and RSA-155 (512b) 512 not 1024.
+    const uint32_t nbits = static_cast<uint32_t>(f_data.N.msb()) + 1u;  // bit-length of N
+    if (autotune_probe_polys_override_ > 0u) {
+        probe_batch_size_ = autotune_probe_polys_override_;
+    } else {
+        probe_batch_size_ = 8u;
+        if (nbits > 400u) {
+            const uint32_t steps = std::min((nbits - 400u) / 16u, 7u); // 8<<7 = 1024 cap
+            probe_batch_size_ = 8u << steps;
+        }
+    }
+    LOG(LOG_INFO) << "[Autotune][wide-probe] staged sample = " << probe_batch_size_
+                  << " distinct polynomials (N=" << nbits << "b, override="
+                  << autotune_probe_polys_override_ << ")";
+    setSievingBatchSize(probe_batch_size_);   // init/gs/gms/ss batch_size
+
+    const uint32_t shc = fs_params.shc_dim;
+
+    // Batch-context job arrays (a, flattened B, factor indices). loadData() /
+    // loadSievingDataParamTest() (the autotune path) never allocate these, so stage
+    // them here. Free-before-realloc keeps ensureProbeBatchSetup() idempotent and avoids
+    // the dev_job_* triple-ownership leak shared with allocateBatchBuffers()/clearSievingBuffers().
+    if (dev_pointers.dev_job_a_array)        { cudaFree(dev_pointers.dev_job_a_array);        dev_pointers.dev_job_a_array = nullptr; }
+    if (dev_pointers.dev_job_B_flat)         { cudaFree(dev_pointers.dev_job_B_flat);         dev_pointers.dev_job_B_flat = nullptr; }
+    if (dev_pointers.dev_job_factor_indices) { cudaFree(dev_pointers.dev_job_factor_indices); dev_pointers.dev_job_factor_indices = nullptr; }
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_job_a_array,        (size_t)probe_batch_size_ * sizeof(mpqs::uint512)));
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_job_B_flat,         (size_t)probe_batch_size_ * shc * sizeof(mpqs::uint512)));
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_job_factor_indices, (size_t)probe_batch_size_ * shc * sizeof(uint32_t)));
+
+    // Pinned host factor-index staging buffer used by prepareSievingBatch()'s launcher.
+    if (h_pinned_factor_indices_) { cudaFreeHost(h_pinned_factor_indices_); h_pinned_factor_indices_ = nullptr; }
+    pinned_factor_indices_capacity_ = (size_t)probe_batch_size_ * shc;
+    SIEVE_CUDA_CHECK(cudaMallocHost(&h_pinned_factor_indices_, pinned_factor_indices_capacity_ * sizeof(uint32_t)));
+
+    // Postprocessing scratch. compactCandidatesBatchKernel atomicAdds dev_pp_counter
+    // UNCONDITIONALLY (→ NULL-deref on the first survivor if it is null) and writes a
+    // DenseCandidate only while pos < pp_max_capacity, so a non-null counter AND a bounded
+    // output buffer are both mandatory. A fixed, scale-independent capacity keeps the probe
+    // memory-safe at any N/M — overflow past capacity is dropped by the kernel's guard.
+    probe_pp_capacity_ = 1u << 18;   // 262144 DenseCandidates (~88 MB @ 336 B/entry)
+    if (dev_probe_pp_accum_)   { cudaFree(dev_probe_pp_accum_);   dev_probe_pp_accum_ = nullptr; }
+    if (dev_probe_pp_counter_) { cudaFree(dev_probe_pp_counter_); dev_probe_pp_counter_ = nullptr; }
+    SIEVE_CUDA_CHECK(cudaMalloc(&dev_probe_pp_accum_, (size_t)probe_pp_capacity_ * sizeof(mpqs::sieve::DenseCandidate)));
+    SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_probe_pp_counter_, sizeof(uint32_t)));
+    dev_pointers.dev_pp_accumulation_buffer = dev_probe_pp_accum_;
+    dev_pointers.dev_pp_counter             = dev_probe_pp_counter_;
+    dev_pointers.pp_max_capacity            = probe_pp_capacity_;
+
+    // Stage ONE batch of polynomials; every candidate re-sieves these SAME polynomials so
+    // the search is apples-to-apples (A/B fidelity). Advances only this ephemeral siever's
+    // f_data copy — never production's.
+    prepareSievingBatch();
+
+    probe_batch_ready_ = true;
+}
+
+float DeviceSievingController::sieveMiniBatch(uint32_t /*repeats — ignored, see below*/) {
+    // S3 (scale-representative harness). Replace the old fixed-repeat cudaEvent µs timing with
+    // a wall-clock survivors/sec RATE measured through the REAL batch pipeline. Rationale
+    // (residual-diagnosis §5(b)): isolated-kernel µs mis-ranks occupancy on wide (the halved
+    // wide SB shifts the sieve↔postproc↔bucket balance); the production-bound signal is
+    // candidate survivors/sec through runSievingBatch (sieve + compact). Auto-scaling the
+    // measurement by WALL TIME (not by a fixed batch/subcube count) keeps every candidate
+    // representative at any N/M — larger M ⇒ fewer polys/call ⇒ a fixed batch count would be
+    // unrepresentative. CUDA-graph is OFF (per-candidate recapture JIT is prohibitive and the
+    // graph is only a param-invariant launch-latency amortizer, so its omission cannot change
+    // the ranking); the batch stays double-buffered in the sense that runSievingBatch keeps the
+    // sieve→compact pipeline in one stream and the host enqueues a small chunk ahead of each
+    // sync to keep the GPU saturated.
+
+    // Idempotent setup (job arrays + pinned + pp scratch + one staged batch).
+    ensureProbeBatchSetup();
+    // loadPartialCustomConfig()/loadStandardConfig() zeroed init_conf.batch_size for THIS
+    // candidate; re-assert the probe batch size on init/gs/gms/ss before any batch launch.
+    setSievingBatchSize(probe_batch_size_);
+
+    // The batch kernels sieve from ds_params.startIndex = -M (production sets this in
+    // updateState()); assert it here and restore afterwards.
+    int32_t saved_startIndex = ds_params.startIndex;
+    ds_params.startIndex = -((int32_t)f_data.M);
+
+    using clk = std::chrono::steady_clock;
+    auto secs = [](clk::duration d) {
+        return std::chrono::duration<double>(d).count();
+    };
+
+    // Chunk of runSievingBatch calls enqueued between host syncs. Enough polys in flight
+    // (~32) to hide launch latency / keep the GPU saturated (like the double-buffered
+    // production overlap), but no more: a large probe sample already saturates one batch, so
+    // re-sieving it 4× per chunk (the old fixed value) would just multiply wall time without
+    // adding distinct samples. Scale inversely with the sample size — 4 at the 8-poly baseline
+    // (byte-identical to the prior harness, preserving validated RSA-100 wide behavior), down
+    // to 1 for samples ≥ 32. Kept small enough that one chunk's survivors stay below pp
+    // capacity, so the compact kernel does full per-survivor work and the reset-per-chunk keeps
+    // the counter well below dev_probe_pp_counter_'s uint32 range.
+    const int SYNC_CHUNK = std::max(1, static_cast<int>(32u / probe_batch_size_));
+
+    // ---- Warm-up prefix (JIT, clock ramp, cache/TLB fill) — discarded from the score. ----
+    {
+        auto w0 = clk::now();
+        do {
+            for (int c = 0; c < SYNC_CHUNK; ++c) runSievingBatch((int)probe_batch_size_, 0);
+            cudaStreamSynchronize(stream);
+        } while (secs(clk::now() - w0) < probe_warmup_sec_);
+    }
+
+    // ---- Measurement window: sum survivors over probe_window_sec_ of wall clock. ----
+    // Reset the compact fill counter per chunk and host-sum the chunk deltas, so the counter
+    // stays bounded (< capacity ⇒ no dropped-write bias) while the TOTAL survivor count is
+    // exact even when it far exceeds pp capacity across the whole window.
+    uint64_t total_survivors = 0;
+    auto m0 = clk::now();
+    double elapsed = 0.0;
+    do {
+        cudaMemsetAsync(dev_probe_pp_counter_, 0, sizeof(uint32_t), stream);
+        for (int c = 0; c < SYNC_CHUNK; ++c) runSievingBatch((int)probe_batch_size_, 0);
+        uint32_t chunk_survivors = 0;
+        cudaMemcpyAsync(&chunk_survivors, dev_probe_pp_counter_, sizeof(uint32_t),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        total_survivors += chunk_survivors;
+        elapsed = secs(clk::now() - m0);
+    } while (elapsed < probe_window_sec_);
+
+    ds_params.startIndex = saved_startIndex;
+
+    if (elapsed <= 0.0) return -1.0f;
+    // survivors per second — HIGHER is better (the wide objective is a rate).
+    return static_cast<float>(static_cast<double>(total_survivors) / elapsed);
+}
+
+// ---------------------------------------------------------------------------
+// S4 (floor gate): time loadStandardConfig-wide under the SAME S3 window harness.
+// ---------------------------------------------------------------------------
+
+float DeviceSievingController::sieveMiniStandardWide() {
+    // Wide-only. The narrow path has its own µs objective and never needs a rate floor.
+    if (!use_wide_accumulator_) return -1.0f;
+
+    // Load the EXACT geometry that ships when autotune is OFF (useParams==false): the
+    // standard wide config (SB cap, bigPrimeStart=SB/32, num_polys≤512, A1 SCATTER grid).
+    // This is the acceptance floor the search winner must beat — measured the same way.
+    loadStandardConfig();
+    if (!validateConfigs()) {
+        LOG(LOG_WARNING) << "[Autotune][floor] loadStandardConfig-wide failed validateConfigs(); "
+                            "floor unavailable (winner applied on positive rate)";
+        return -1.0f;
+    }
+
+    // Resize the sieve scratch (bucket/counts/candidates/index) to the standard config.
+    // loadSievingDataParamTest touches ONLY those buffers — it does NOT reallocate the staged
+    // job arrays (dev_job_*) or the probe pp scratch (dev_pp_*), so the batch staged in
+    // ensureProbeBatchSetup() and the survivor counter both survive for the floor window.
+    loadSievingDataParamTest(f_data.factorBase, f_data.rootN, f_data.a_factors,
+                             fs_params.shc_dim, gs_conf, ss_conf, dev_pointers);
+
+    return sieveMiniBatch(0);  // repeats ignored; uses the current probe window (set by caller)
+}
+
+// ---------------------------------------------------------------------------
+// S5 (wide autotune search-space seeding): occupancy-optimal GATHER blockDim.
+// ---------------------------------------------------------------------------
+
+uint32_t DeviceSievingController::wideGatherOccupancyBlockDim(
+    const uint32_t* candidates, uint32_t count) const {
+    // Wide-only. The narrow autotune seeds/searches with its own (unchanged) blockDim.
+    if (!use_wide_accumulator_ || candidates == nullptr || count == 0) return 0;
+
+    // Wide GATHER shared memory — the SAME footprint validateConfigs()'s wide-feasibility guard
+    // uses: the realized sieveAndScanBatchKernelWide launch shares ss_conf.sharedMemReq
+    // (blockEntries at uint16 width + 3*bigPrime buckets) PLUS the per-block B_values
+    // (shc_dim*sizeof(uint512)). It is INDEPENDENT of blockDim (blockEntries is sized per
+    // sieving-block, every work loop strides by blockDim.x), so compute it once. ss_conf reflects
+    // loadStandardConfig-wide at autotune-Stage-1 entry (the caller's state), which is the exact
+    // geometry the seed will run at (loadStandardConfig-wide and loadPartialCustomConfig-wide
+    // derive the identical wide sievingBlockSize from the opt-in smem budget).
+    const size_t wideSieveSmem =
+        ss_conf.sharedMemReq + (size_t)fs_params.shc_dim * sizeof(mpqs::uint512);
+    if (wideSieveSmem > g_info.maxSharedMemPerBlock) return 0;  // infeasible → caller keeps its seed
+
+    uint32_t best_bd = 0;
+    uint64_t best_threads = 0;  // resident threads/SM = blocks_per_SM * blockDim (the occupancy knee)
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t bd = candidates[i];
+        if (bd == 0) continue;
+        int blocks_per_sm = 0;
+        // Option A: query the kernel actually dispatched at this width.
+        const void* wideKern = wide_u8sat_selected_
+            ? (const void*)sieveAndScanBatchKernelWideU8Sat
+            : (const void*)sieveAndScanBatchKernelWide;
+        const cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, wideKern,
+            (int)bd, wideSieveSmem);
+        if (err != cudaSuccess || blocks_per_sm < 1) continue;
+        const uint64_t threads = (uint64_t)blocks_per_sm * bd;
+        // Strictly-greater keeps the SMALLEST blockDim among ties (fewer threads to schedule
+        // for identical residency); the wide kernel is smem-bound, so the max typically lands
+        // at the largest feasible blockDim (H100 1/SM → 1024; A100 2/SM → 1024 = 100%).
+        if (threads > best_threads) { best_threads = threads; best_bd = bd; }
+    }
+    return best_bd;  // 0 if the API failed for every candidate → caller keeps its seed
 }
 
 float DeviceSievingController::evaluateConfig(const Params8& params,
@@ -529,7 +929,9 @@ void DeviceSievingController::runSievingBatch(int num_steps, int start_batch_ind
 	&ss_conf,
 	num_steps,
 	start_batch_index,
-	stream
+	stream,
+	use_wide_accumulator_,  // S4: dispatch the wide (uint16) batch kernel when predicate/override selected it
+	wide_u8sat_selected_    // Option A: within the wide path, dispatch the saturating-uint8 kernel
     );
 }
 
@@ -785,23 +1187,77 @@ void DeviceSievingController::loadStandardConfig()
     init_conf.batch_size = 0; // this may be changed a posteriori via setSievingBatchSize(uint32_t batch_size)
 
     /* generalSievingConfig */
-    gs_conf.sievingBlockSize = pow2leq((3*g_info.maxSharedMemPerBlock)/4);
+    if (use_wide_accumulator_) {
+        // RSA-155 dual-path (S3), test-coverage path. The wide-SB budget reserves a CONSERVATIVE
+        // 1024-entry bigPrime floor: solve  sizeof(uint16)*SB + 3*1024*sizeof(int) <= (3/4)*maxShared.
+        // bigPrimeStartIndex itself is now set to SB/32 below (mirroring the tuned custom-path
+        // geometry in loadPartialCustomConfig) rather than the fixed 1024. Since SB was sized under
+        // the 1024-floor budget (2*SB <= 3/4*maxShared - 12288 => SB <= 3/8*maxShared - 6144), the
+        // realized sieveAndScan shared-mem 2*SB + 3*(SB/32)*4 = 2.375*SB stays <= ~0.89*maxShared
+        // < maxShared, so the config remains feasible (validateConfigs LEQ + wide-feasibility guard
+        // both pass). Keeping the budget calc at the 1024 floor is conservative (SB is never larger
+        // than the true SB/32 budget would allow), so no shared-mem overflow is possible.
+        // Option A: accumElemBytes() is 1 for the saturating-uint8 wide accumulator
+        // (SB doubles vs uint16, restoring toward narrow's SB) and 2 for uint16.
+        gs_conf.sievingBlockSize = pow2leq(
+            (uint32_t)(((3u * g_info.maxSharedMemPerBlock) / 4u - 3u * 1024u * sizeof(int)) / accumElemBytes()));
+    } else {
+        gs_conf.sievingBlockSize = pow2leq((3*g_info.maxSharedMemPerBlock)/4);
+    }
     gs_conf.log2_sievingBlockSize = log2(gs_conf.sievingBlockSize);
 
     gs_conf.num_polysPerSieveCall = std::min(32768u,(1u << fs_params.shc_dim)/2); // Explicit unsigned
-    gs_conf.globalBucketSize = gs_conf.sievingBlockSize/2;
+    // globalBucketSize: legacy SB/2 unless the --bucket_size_factor ablation knob is set
+    // (default 0.0 => SB/2 EXACTLY, byte-identical). Set BEFORE reduceNumPolysToBudget below,
+    // so a larger bucket is charged against the VRAM budget (num_polys degrades, no OOM). See
+    // the 2026-07-10 A100 uint16 degenerate-baseline root-cause analysis.
+    gs_conf.globalBucketSize = computeGlobalBucketSize(gs_conf.sievingBlockSize);
+    if (bucket_size_factor_override_ > 0.0) {
+        LOG(LOG_WARNING) << "[bucket_size_factor] override active: globalBucketSize="
+            << gs_conf.globalBucketSize << " (factor=" << bucket_size_factor_override_
+            << " x SB=" << gs_conf.sievingBlockSize << "; legacy SB/2="
+            << (gs_conf.sievingBlockSize/2) << ")";
+    }
 
-    gs_conf.bigPrimeStartIndex = 1024;
+    // WIDE geometry fix: mirror the tuned custom-path bigPrime split (SB/32) instead of the fixed
+    // 1024 floor. The un-tuned standard wide default otherwise loads a slow bigPrime geometry that
+    // diverges from loadPartialCustomConfig (~:1065, SB/32) — one component of the ~70x wide
+    // throughput deficit vs the autotuned narrow path. GATED on use_wide_accumulator_: the narrow
+    // (uint8) path — which carries ALL validated records — keeps exactly 1024, byte-for-byte.
+    gs_conf.bigPrimeStartIndex = use_wide_accumulator_ ? (gs_conf.sievingBlockSize / 32) : 1024;
     gs_conf.midPrimeStartIndex = 32;
     gs_conf.maxRelationsPerBlock = 64;
 
     /* globalMetaSieveConfig */
     gms_conf.num_threadsPerBlock = 256;
-    gms_conf.num_threadBlocks = 64;
+    // A1 GPU-occupancy fix (WIDE/uint16 path only). The SCATTER kernel
+    // globalMetaSieveBatchKernel is memory-latency-bound (long-scoreboard stalls
+    // dominate and rise with M); the legacy hardcoded 64-block grid leaves SMs idle
+    // on large-SM GPUs (e.g. only 64/108 SMs busy on an A100 -> 12.5% occupancy),
+    // starving the machine of the resident warps needed to hide that latency. Mirror
+    // init_conf's SM-aware grid (2*pow2geq(SM)) so every SM gets a block. GATED on
+    // use_wide_accumulator_: the narrow (uint8, <=RSA-140) path -- which carries ALL
+    // validated records -- keeps the exact prior value (64), so it is byte-for-byte
+    // unchanged; only the wide (uint16, RSA-150/155) path gets the SM-aware grid.
+    gms_conf.num_threadBlocks = use_wide_accumulator_
+        ? 2 * pow2geq(g_info.multiProcessorCount)
+        : 64;
 
     gms_conf.maxActiveBucketsTotal = 2 << 15; //first, we choose how many active buckets per thread block we want
 
     gs_conf.num_sievingBlocksPerSieveCall = (2*fs_params.M)/gs_conf.sievingBlockSize; //next, we choose the sievingBlocksPerCall to cover the whole sieving interval
+    if (use_wide_accumulator_) {
+        // RSA-155 dual-path (S3): wide SB halved, so num_sievingBlocksPerSieveCall (= 2M/SB, just
+        // above) auto-doubles and full [-M,M) coverage is preserved (C1 is not an issue on this
+        // derived path). Assert the invariant (holds because M and SB are both powers of two, so
+        // SB divides 2M).
+        const uint64_t coverage = (uint64_t)gs_conf.num_sievingBlocksPerSieveCall * gs_conf.sievingBlockSize;
+        if (coverage != 2ull * fs_params.M) {
+            LOG(LOG_ERROR_CRITICAL) << "[C1] WIDE standard-config interval coverage != 2M: intervals("
+                << gs_conf.num_sievingBlocksPerSieveCall << ")*SB(" << gs_conf.sievingBlockSize
+                << ")=" << coverage << " != 2M(" << (2ull * fs_params.M) << ")";
+        }
+    }
     // Reduce polys sieved until the global bucket buffer fits with headroom.
     //
     // The bucket buffer (dev_globalBucketEntries, kernel.cu:593) is
@@ -844,6 +1300,16 @@ void DeviceSievingController::loadStandardConfig()
     // validated production path (--autotune_stage1 / pinned params / AutoApply history) calls
     // loadPartialCustomConfig(), which sets num_polysPerSieveCall directly from the tuned
     // tuple (e.g. 512) and never runs this loop.
+    //
+    // WIDE geometry fix: cap the wide default poly-count seed at 512 (the tuned custom-path value)
+    // BEFORE the budget reduction. The un-capped seed min(32768, 2^(shc_dim-1)) drives ~4096-8192
+    // polys/call at RSA-155 M, inflating bucket-buffer write traffic ~8-16x — the dominant share of
+    // the ~70x wide throughput deficit. reduceNumPolysToBudget (and the seed-clamp below) only ever
+    // LOWER num_polys, so a 512 seed is kept or further reduced; num_subCubes (=total/num_polys)
+    // absorbs the change so total polys sieved is unaffected. GATED on use_wide_accumulator_: the
+    // narrow (uint8) path keeps its full min(32768, 2^(shc_dim-1)) seed, byte-for-byte unchanged.
+    if (use_wide_accumulator_)
+        gs_conf.num_polysPerSieveCall = std::min(gs_conf.num_polysPerSieveCall, 512u);
     gs_conf.num_polysPerSieveCall = reduceNumPolysToBudget(
         gs_conf.num_polysPerSieveCall,
         gs_conf.num_sievingBlocksPerSieveCall,
@@ -893,6 +1359,22 @@ void DeviceSievingController::loadStandardConfig()
             last_seed_clamp_.budget           = max_total_sieve_bytes_;
         }
     }
+    // S9 (WIDE/uint16 path only): clamp the SCATTER grid to the settled poly count.
+    // gms_conf.num_threadBlocks was seeded SM-aware (2*pow2geq(SMs) = 512 on H100 /
+    // 256 on A100) at ~:1242, but reduceNumPolysToBudget (and the autotune seed-clamp
+    // just above) can VRAM-force num_polysPerSieveCall BELOW that grid at large bf*M
+    // (e.g. F=200M/M=16M/bf1.0 on H100: bf*M=16.8e6 > the 9.76e6 np=512 retention bound
+    // -> np degrades 512->256). Without this clamp num_polys < num_threadBlocks makes
+    // num_polyBlocksPerThreadBlock = (np/num_threadBlocks)/polyBlockSize underflow to 0
+    // (POW2_CHECK fail) and LEQ_CHECK(num_threadBlocks <= np) abort config validation --
+    // a spurious floor, not an OOM. Clamping the grid to np keeps every SM-derived block
+    // that still has a poly to process and lets the pow2/product/LEQ checks pass (both
+    // operands are powers of two, so the min is a power of two). Must sit AFTER the two
+    // np reductions and BEFORE the polyBlockSize loop / num_polyBlocksPerThreadBlock
+    // derivation below. GATED on use_wide_accumulator_: the narrow (uint8, <=RSA-140)
+    // path keeps its exact grid (64) and is byte-for-byte unchanged.
+    if (use_wide_accumulator_)
+        gms_conf.num_threadBlocks = std::min(gms_conf.num_threadBlocks, gs_conf.num_polysPerSieveCall);
     gs_conf.num_subCubes = std::min(32768u,(1u << fs_params.shc_dim)/2)/gs_conf.num_polysPerSieveCall;
     //set activeBlocks to the max (that is how many subintervals are considered at once)
     gms_conf.num_activeBlocksPerCycle = 1 << std::countr_zero(gs_conf.num_sievingBlocksPerSieveCall);
@@ -907,6 +1389,7 @@ void DeviceSievingController::loadStandardConfig()
     gms_conf.log2_polyBlockSize = log2(gms_conf.polyBlockSize);
     gms_conf.num_polyBlocksPerThreadBlock = (gs_conf.num_polysPerSieveCall/gms_conf.num_threadBlocks)/gms_conf.polyBlockSize;
     gms_conf.log2_num_polyBlocksPerThreadBlock = log2(gms_conf.num_polyBlocksPerThreadBlock);
+    applyMetaCycleCap();  // A2: optional SCATTER cycle cap (no-op when meta_cycle_cap_ == 0)
     gms_conf.num_metaSieveCycles = gs_conf.num_sievingBlocksPerSieveCall/gms_conf.num_activeBlocksPerCycle;
     gms_conf.num_activeBucketsPerThreadBlock = gms_conf.num_activeBlocksPerCycle*gms_conf.polyBlockSize;
     gms_conf.sharedMemReq = gms_conf.num_activeBucketsPerThreadBlock * sizeof(int);
@@ -914,7 +1397,9 @@ void DeviceSievingController::loadStandardConfig()
     /* sieveAndScanConfig */
     ss_conf.num_threadsPerBlock = 256;
     ss_conf.num_threadBlocks = std::min(256u, gs_conf.num_polysPerSieveCall);
-    ss_conf.sharedMemReq = gs_conf.sievingBlockSize * sizeof(uint8_t) + 3 * gs_conf.bigPrimeStartIndex * sizeof(int);
+    // Width-aware: the wide (uint16) accumulator path sizes blockEntries at sizeof(uint16_t).
+    ss_conf.sharedMemReq = gs_conf.sievingBlockSize * accumElemBytes() + 3 * gs_conf.bigPrimeStartIndex * sizeof(int);
+    applyGatherBlockDimOverride();  // A/B knob: override ss_conf.num_threadsPerBlock (no-op when 0)
 
     /* processRelationsConfig */
     pr_conf.num_threadsPerBlock = 256;
@@ -944,11 +1429,45 @@ void DeviceSievingController::loadPartialCustomConfig(uint32_t totalPolys, uint3
     init_conf.batch_size = 0; // this may be changed a posteriori via setSievingBatchSize(uint32_t batch_size)
 
     /* generalSievingConfig */
-    gs_conf.sievingBlockSize = std::min(fs_params.M, pow2leq((3*g_info.maxSharedMemPerBlock)/4));
+    if (use_wide_accumulator_) {
+        // RSA-155 dual-path (S3): the uint16 accumulator doubles the per-position byte cost, so
+        // the shared-memory budget admits a HALVED sieving block (H100 131072->65536, RTX ~16384).
+        // Solve  accumBytes*SB + 3*(SB/32)*sizeof(int) <= (3/4)*maxShared
+        //   => SB*(accumBytes + 12/32) = SB*((32*accumBytes+12)/32) <= (3/4)*maxShared
+        //   => SB <= 24*maxShared/(32*accumBytes+12).
+        // Denominator: 76 for uint16 (32*2+12), 44 for the saturating-uint8 path (32*1+12)
+        // — Option A DOUBLES the wide SB toward narrow's. Integer-safe (multiply-before-divide).
+        // bigPrimeStartIndex = SB/32 (below) auto-tracks the wide SB.
+        const uint32_t wide_sb_den = (uint32_t)(32u * accumElemBytes() + 12u);
+        gs_conf.sievingBlockSize = std::min(fs_params.M,
+            pow2leq((3u * g_info.maxSharedMemPerBlock * 32u) / (4u * wide_sb_den)));
+    } else {
+        gs_conf.sievingBlockSize = std::min(fs_params.M, pow2leq((3*g_info.maxSharedMemPerBlock)/4));
+    }
     gs_conf.log2_sievingBlockSize = log2(gs_conf.sievingBlockSize);
 
     gs_conf.num_polysPerSieveCall = totalPolys; // Explicit unsigned
-    gs_conf.globalBucketSize = gs_conf.sievingBlockSize/2;
+    // WIDE geometry fix (S1): mirror the loadStandardConfig num_polys<=512 clamp (~:964-965) on
+    // the CUSTOM apply path. Without it an autotune/pinned tuple could set num_polysPerSieveCall
+    // directly from totalPolys (e.g. 1024) and re-inflate the wide bucket-write traffic the 27f810e
+    // geometry fix removed (~8-16x at RSA-155 M). num_subCubes (=.../num_polysPerSieveCall, below)
+    // absorbs the change so total polys sieved is unaffected. GATED on use_wide_accumulator_ via
+    // the shared clampWideNumPolys() helper: the narrow (uint8) path keeps totalPolys verbatim,
+    // byte-for-byte unchanged (helper is a NO-OP when wide==false). Host-unit-tested (test
+    // wide_num_polys_clamp) against the same helper.
+    gs_conf.num_polysPerSieveCall =
+        clampWideNumPolys(gs_conf.num_polysPerSieveCall, use_wide_accumulator_);
+    // globalBucketSize: legacy SB/2 unless the --bucket_size_factor ablation knob is set
+    // (default 0.0 => SB/2 EXACTLY, byte-identical). On this custom/tuned path there is no
+    // reduceNumPolysToBudget loop, so an over-large factor is caught by validateConfigs
+    // (LEQ_CHECK on bucketEntriesBytes) with a LOG_ERROR_CRITICAL rather than silently OOMing.
+    gs_conf.globalBucketSize = computeGlobalBucketSize(gs_conf.sievingBlockSize);
+    if (bucket_size_factor_override_ > 0.0) {
+        LOG(LOG_WARNING) << "[bucket_size_factor] override active (custom cfg): globalBucketSize="
+            << gs_conf.globalBucketSize << " (factor=" << bucket_size_factor_override_
+            << " x SB=" << gs_conf.sievingBlockSize << "; legacy SB/2="
+            << (gs_conf.sievingBlockSize/2) << ")";
+    }
 
     gs_conf.bigPrimeStartIndex = gs_conf.sievingBlockSize/32;
     gs_conf.midPrimeStartIndex = 32;
@@ -960,7 +1479,18 @@ void DeviceSievingController::loadPartialCustomConfig(uint32_t totalPolys, uint3
 
     gms_conf.maxActiveBucketsTotal = 2 << 15; //first, we choose how many active buckets per thread block we want
 
-    gs_conf.num_sievingBlocksPerSieveCall = totalIntervals; //next, we choose the sievingBlocksPerCall to cover the whole sieving interval
+    if (use_wide_accumulator_) {
+        // [C1 - CRITICAL] Wide SB = uint8 SB / 2, so reusing the fixed tuple's totalIntervals
+        // would cover only [-M,0) — half the interval, ~50% SILENT yield loss (a naive
+        // nonzero-smooths gate still passes on the sieved half). Override to preserve full
+        // [-M,M): intervals = 2M/wideSB (doubles vs the uint8 tuple value). num_metaSieveCycles
+        // (below) then doubles automatically; the existing validateConfigs EQUAL_CHECK
+        // (num_metaSieveCycles*num_activeBlocksPerCycle == num_sievingBlocksPerSieveCall)
+        // enforces exact divisibility.
+        gs_conf.num_sievingBlocksPerSieveCall = (2u * fs_params.M) / gs_conf.sievingBlockSize;
+    } else {
+        gs_conf.num_sievingBlocksPerSieveCall = totalIntervals; //next, we choose the sievingBlocksPerCall to cover the whole sieving interval
+    }
     gs_conf.num_subCubes = std::min(32768u,(1u << fs_params.shc_dim)/2)/gs_conf.num_polysPerSieveCall;
     //set activeBlocks to the max (that is how many subintervals are considered at once)
     gms_conf.num_activeBlocksPerCycle = blocksPerCycle;
@@ -979,12 +1509,49 @@ void DeviceSievingController::loadPartialCustomConfig(uint32_t totalPolys, uint3
     // --autotune_stage1 / no-autotune / loadStandardConfig (their M keeps sievingBlockSize < M
     // with 2*M >= sievingBlockSize*totalIntervals), so those modes are behaviorally unchanged.
     if (gs_conf.num_sievingBlockBatches == 0) gs_conf.num_sievingBlockBatches = 1;
+    // [C1] Interval-coverage invariant (scoped by path). The batch kernel sieves exactly
+    // num_sievingBlocksPerSieveCall * sievingBlockSize of [-M,M) per launch.
+    {
+        const uint64_t coverage =
+            (uint64_t)gs_conf.num_sievingBlocksPerSieveCall * gs_conf.sievingBlockSize;
+        const uint64_t two_M = 2ull * fs_params.M;
+        if (use_wide_accumulator_) {
+            // WIDE: hard == 2M in a single batch. This is the C1 catch — it fires if the wide
+            // coverage collapses to [-M,0) (half-interval yield loss).
+            if (coverage != two_M || gs_conf.num_sievingBlockBatches != 1) {
+                LOG(LOG_ERROR_CRITICAL) << "[C1] WIDE interval coverage invariant violated: intervals("
+                    << gs_conf.num_sievingBlocksPerSieveCall << ")*SB(" << gs_conf.sievingBlockSize
+                    << ")=" << coverage << " != 2M(" << two_M << "), num_sievingBlockBatches="
+                    << gs_conf.num_sievingBlockBatches;
+            }
+        } else {
+            // uint8 / shared: the sieve covers [-M,M) across num_sievingBlockBatches launches
+            // (the batch loops in sieveDataBatch / runSievingBatch / benchmarkSievingConfig
+            // offset each launch by intervals*SB), so one launch legitimately covers only a
+            // FRACTION of 2M when an --autotune geometry picks intervals*SB < 2M (giving
+            // num_sievingBlockBatches >= 2, e.g. Turing intervals=8/SB=32768 at M=262144 -> 2
+            // batches). A single launch may also OVER-cover (sievingBlockSize == M =>
+            // intervals*SB > 2M, with the num_sievingBlockBatches 0->1 clamp above). The real
+            // invariant is that the batches TOGETHER cover [-M,M); assert on the TOTAL coverage,
+            // not the per-launch coverage, so valid multi-batch configs do not false-trip this
+            // critical guard while a genuine coverage shortfall is still caught.
+            const uint64_t total_coverage =
+                (uint64_t)gs_conf.num_sievingBlockBatches * coverage;
+            if (total_coverage < two_M) {
+                LOG(LOG_ERROR_CRITICAL) << "[C1] total interval coverage below 2M: batches("
+                    << gs_conf.num_sievingBlockBatches << ")*intervals("
+                    << gs_conf.num_sievingBlocksPerSieveCall << ")*SB(" << gs_conf.sievingBlockSize
+                    << ")=" << total_coverage << " < 2M(" << two_M << ")";
+            }
+        }
+    }
     //incrase polyBlockSize until we run out of poly or we have too many active buckets
     gms_conf.polyBlockSize = polyBlockSize;
     //calculations that automatically follow the above definitions
     gms_conf.log2_polyBlockSize = log2(gms_conf.polyBlockSize);
     gms_conf.num_polyBlocksPerThreadBlock = (gs_conf.num_polysPerSieveCall/gms_conf.num_threadBlocks)/gms_conf.polyBlockSize;
     gms_conf.log2_num_polyBlocksPerThreadBlock = log2(gms_conf.num_polyBlocksPerThreadBlock);
+    applyMetaCycleCap();  // A2: optional SCATTER cycle cap (no-op when meta_cycle_cap_ == 0)
     gms_conf.num_metaSieveCycles = gs_conf.num_sievingBlocksPerSieveCall/gms_conf.num_activeBlocksPerCycle;
     gms_conf.num_activeBucketsPerThreadBlock = gms_conf.num_activeBlocksPerCycle*gms_conf.polyBlockSize;
     gms_conf.sharedMemReq = gms_conf.num_activeBucketsPerThreadBlock * sizeof(int);
@@ -992,11 +1559,77 @@ void DeviceSievingController::loadPartialCustomConfig(uint32_t totalPolys, uint3
     /* sieveAndScanConfig */
     ss_conf.num_threadsPerBlock = sasT;
     ss_conf.num_threadBlocks = sasB;
-    ss_conf.sharedMemReq = gs_conf.sievingBlockSize * sizeof(uint8_t) + 3 * gs_conf.bigPrimeStartIndex * sizeof(int);
+    // Width-aware: the wide (uint16) accumulator path sizes blockEntries at sizeof(uint16_t).
+    ss_conf.sharedMemReq = gs_conf.sievingBlockSize * accumElemBytes() + 3 * gs_conf.bigPrimeStartIndex * sizeof(int);
+    applyGatherBlockDimOverride();  // A/B knob: override ss_conf.num_threadsPerBlock (no-op when 0)
 
     /* processRelationsConfig */
     pr_conf.num_threadsPerBlock = 512;
     pr_conf.num_threadBlocks = pow2geq(g_info.multiProcessorCount);
+}
+
+/*
+ * A2 meta-sieve SCATTER cycle cap (--sieve_meta_cycle_cap, default 0 = OFF).
+ *
+ * The SCATTER kernels (globalMetaSieveKernel / globalMetaSieveBatchKernel) write each
+ * large-prime hit into a per-(poly, sievingBlock) bucket. Per cycle, a thread's write
+ * destinations span num_activeBlocksPerCycle * globalBucketSize contiguous bucket slots;
+ * with the default num_activeBlocksPerCycle == num_sievingBlocksPerSieveCall == 2M/SB this
+ * spread grows linearly with M, degrading L1 locality (A100 ncu: L1 73%->56%, long-scoreboard
+ * stalls x4.1 from M=256K->1M on flat DRAM bytes). Capping C := num_activeBlocksPerCycle at a
+ * fixed constant and running num_metaSieveCycles = blocks/C cycles bounds the spread
+ * independent of M.
+ *
+ * Correctness (coverage preservation): the kernels already implement the cycle partition —
+ * cycle c sieves the contiguous block slice [c*C, (c+1)*C) via
+ *   currentStart = sieveIntervalStart + c*C*SB          (kernel.cu:981 batch, :384 legacy)
+ * keeping exactly the hits with sievingBlockHit = (off-currentStart)/SB < C (kernel.cu:1038),
+ * and addresses the bucket as
+ *   globalBucketId = (polyIdx*num_metaSieveCycles + c)*C + hit = polyIdx*blocks + (c*C + hit)
+ * (kernel.cu:1021/:1051) — i.e. the flat (poly, absolute-block) layout is INDEPENDENT of the
+ * cycle split, so the GATHER consumer needs no change. The union over c of the slices is
+ * [0, cycles*C) = [0, blocks) exactly, because the division blocks/C is exact (below).
+ *
+ * Exactness of the split: the loader-derived C is a power of two (validateConfigs POW2_CHECK)
+ * that divides num_sievingBlocksPerSieveCall (EQUAL_CHECK cycles*C == blocks). The cap is
+ * rounded DOWN to a power of two and clamped to <= the derived C; a smaller power of two
+ * divides the derived C and hence blocks, so blocks/C' is exact and no partial ("remainder")
+ * last cycle can exist. If the requested cap >= derived C, this is a no-op. If
+ * meta_cycle_cap_ == 0 (default), the function returns immediately: byte-identical geometry.
+ *
+ * Must run before num_metaSieveCycles / num_activeBucketsPerThreadBlock / sharedMemReq are
+ * derived (they follow from C), and after the polyBlockSize sizing so poly batching, bucket
+ * buffer sizes (num_polys*blocks*bucketSize — split-invariant) and everything else match the
+ * uncapped baseline.
+ */
+void DeviceSievingController::applyMetaCycleCap()
+{
+    if (meta_cycle_cap_ == 0) return;  // OFF: exact legacy behavior
+    const uint32_t cap_pow2 = 1u << (31 - std::countl_zero(meta_cycle_cap_));  // pow2_floor(cap), cap >= 1
+    if (cap_pow2 < gms_conf.num_activeBlocksPerCycle) {
+        const uint32_t cycles = gs_conf.num_sievingBlocksPerSieveCall / cap_pow2;  // exact (pow2 chain)
+        LOG(LOG_INFO) << "[A2] meta-cycle cap active: num_activeBlocksPerCycle "
+                      << gms_conf.num_activeBlocksPerCycle << " -> " << cap_pow2
+                      << " (requested " << meta_cycle_cap_ << "), num_metaSieveCycles -> " << cycles;
+        gms_conf.num_activeBlocksPerCycle = cap_pow2;
+    } else {
+        LOG(LOG_INFO) << "[A2] meta-cycle cap " << meta_cycle_cap_ << " >= derived num_activeBlocksPerCycle "
+                      << gms_conf.num_activeBlocksPerCycle << " -- no-op";
+    }
+}
+
+void DeviceSievingController::applyGatherBlockDimOverride()
+{
+    if (gather_block_dim_override_ == 0) return;  // OFF: keep loader-derived blockDim (legacy)
+    // blockDim is result-invariant for the sieve-and-scan kernels (accumulator sized per
+    // sieving-block, not per-thread; all loops stride by blockDim.x), so only occupancy
+    // changes. The value is a power of two in [32,1024], validated at the CLI; here we only
+    // reassign ss_conf.num_threadsPerBlock — sharedMemReq and every buffer size are
+    // blockDim-independent, so nothing else needs re-deriving.
+    LOG(LOG_INFO) << "[GATHER] sieve-and-scan blockDim override: "
+                  << ss_conf.num_threadsPerBlock << " -> " << gather_block_dim_override_
+                  << " (result-invariant occupancy knob)";
+    ss_conf.num_threadsPerBlock = gather_block_dim_override_;
 }
 
 void DeviceSievingController::printConfigs() {
@@ -1020,6 +1653,7 @@ void DeviceSievingController::printConfigs() {
     LOG(LOG_DEBUG_1) << "threads: " << gms_conf.num_threadsPerBlock;
     LOG(LOG_DEBUG_1) << "blocks: " << gms_conf.num_threadBlocks;
     LOG(LOG_DEBUG_1) << "num activeblocks: " << gms_conf.num_activeBlocksPerCycle;
+    LOG(LOG_DEBUG_1) << "num metaSieveCycles: " << gms_conf.num_metaSieveCycles;
     LOG(LOG_DEBUG_1) << "shared memory required: " << gms_conf.sharedMemReq << " bytes";
     LOG(LOG_DEBUG_1) << "============================================================";
     LOG(LOG_DEBUG_1) << "sieveAndScanConfig:";
@@ -1048,6 +1682,7 @@ void DeviceSievingController::printConfigsDEBUG() {
     std::cout << "threads: " << gms_conf.num_threadsPerBlock << std::endl;
     std::cout << "blocks: " << gms_conf.num_threadBlocks << std::endl;
     std::cout << "num activeblocks: " << gms_conf.num_activeBlocksPerCycle << std::endl;
+    std::cout << "num metaSieveCycles: " << gms_conf.num_metaSieveCycles << std::endl;
     std::cout << "shared memory required: "<< gms_conf.sharedMemReq << " bytes" << std::endl;
     std::cout << "============================================================" << std::endl;
     std::cout << "sieveAndScanConfig:" << std::endl;
@@ -1125,7 +1760,12 @@ bool DeviceSievingController::validateConfigs() {
     //equations:
     EQUAL_CHECK(gms_conf.num_polyBlocksPerThreadBlock*gms_conf.polyBlockSize*gms_conf.num_threadBlocks, gs_conf.num_polysPerSieveCall, validFlag);
     EQUAL_CHECK(gms_conf.sharedMemReq, (gms_conf.num_activeBucketsPerThreadBlock * sizeof(int)), validFlag);
-    EQUAL_CHECK(ss_conf.sharedMemReq, (gs_conf.sievingBlockSize * sizeof(uint8_t) + 3 * gs_conf.bigPrimeStartIndex * sizeof(int)), validFlag);
+    // Width-aware: accumElemBytes() is 2 for the uint16 wide path, 1 for narrow AND the
+    // saturating-uint8 wide path (Option A). The narrow path RHS is byte-identical to before.
+    const size_t expected_ss_sharedMemReq =
+        gs_conf.sievingBlockSize * accumElemBytes()
+        + 3 * gs_conf.bigPrimeStartIndex * sizeof(int);
+    EQUAL_CHECK(ss_conf.sharedMemReq, expected_ss_sharedMemReq, validFlag);
     EQUAL_CHECK(gms_conf.num_activeBucketsPerThreadBlock, gms_conf.num_activeBlocksPerCycle * gms_conf.polyBlockSize,validFlag);
     EQUAL_CHECK(gms_conf.num_metaSieveCycles*gms_conf.num_activeBlocksPerCycle, gs_conf.num_sievingBlocksPerSieveCall, validFlag);
 
@@ -1147,6 +1787,43 @@ bool DeviceSievingController::validateConfigs() {
     LEQ_CHECK(bucketEntriesBytes(gs_conf.num_polysPerSieveCall, gs_conf.num_sievingBlocksPerSieveCall, gs_conf.globalBucketSize), sieveBucketBudget(g_info.totalGlobalMem, 0, kSieveBudgetNum, kSieveBudgetDen), validFlag);//keep a buffer
     LEQ_CHECK(gms_conf.sharedMemReq, g_info.maxSharedMemPerBlock, validFlag);
     LEQ_CHECK(ss_conf.sharedMemReq, g_info.maxSharedMemPerBlock, validFlag);
+
+    // RSA-155 dual-path (S3): wide-launch feasibility + occupancy (GRACEFUL, not a hard abort).
+    // The realized batch-sieve launch shared memory is ss_conf.sharedMemReq PLUS the per-block
+    // B_values (shc_dim * sizeof(uint512)) — mirrors kernel.cu runSievingBatch's sieve_smem.
+    // Validate the wide kernel actually fits opt-in shared and yields >= 1 resident block/SM. On
+    // infeasibility we WARN + fail the config (validFlag=false): the production caller escalates
+    // cleanly, while the autotune candidate sweep never calls validateConfigs, so a probe sweep is
+    // not torn down here. No LOG_ERROR_CRITICAL / throw on this path. feedback_safe_kernel_launch.
+    if (use_wide_accumulator_) {
+        const size_t wideSieveSmem =
+            ss_conf.sharedMemReq + (size_t)fs_params.shc_dim * sizeof(mpqs::uint512);
+        if (wideSieveSmem > g_info.maxSharedMemPerBlock) {
+            validFlag = false;
+            LOG(LOG_WARNING) << "Wide (uint16) sieve launch infeasible: smem " << wideSieveSmem
+                             << " B > maxSharedMemPerBlock " << g_info.maxSharedMemPerBlock
+                             << " B. Reduce M so the wide sieving block fits shared memory.";
+        } else {
+            int wide_blocks_per_sm = 0;
+            // Option A: query the kernel actually dispatched at this width.
+            const void* wideKern = wide_u8sat_selected_
+                ? (const void*)sieveAndScanBatchKernelWideU8Sat
+                : (const void*)sieveAndScanBatchKernelWide;
+            cudaError_t occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &wide_blocks_per_sm, wideKern,
+                (int)ss_conf.num_threadsPerBlock, wideSieveSmem);
+            if (occ_err != cudaSuccess || wide_blocks_per_sm < 1) {
+                validFlag = false;
+                LOG(LOG_WARNING) << "Wide (uint16) sieve launch infeasible: occupancy "
+                                 << wide_blocks_per_sm << " block/SM (cuda: "
+                                 << cudaGetErrorString(occ_err)
+                                 << "). Reduce M so the wide launch config is schedulable.";
+            } else {
+                LOG(LOG_DEBUG_1) << "Wide (uint16) sieve launch feasible: smem " << wideSieveSmem
+                                 << " B, occupancy " << wide_blocks_per_sm << " block/SM.";
+            }
+        }
+    }
 
     NON0_CHECK(gs_conf.num_sievingBlockBatches, validFlag);
     NON0_CHECK(gs_conf.num_subCubes, validFlag);

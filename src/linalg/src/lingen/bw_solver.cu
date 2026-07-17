@@ -318,6 +318,7 @@ void BlockWiedemannSolver::UpdateStage2Config() {
 
     // 5. I/O
     stage2_cfg_.save_checkpoints = cfg_.stage2_save_checkpoints;
+    stage2_cfg_.load_checkpoints = cfg_.stage2_load_checkpoints;
     stage2_cfg_.suffix_S = cfg_.stage2_suffix_S;
     stage2_cfg_.suffix_Pi = cfg_.stage2_suffix_Pi;
 
@@ -358,7 +359,8 @@ void BlockWiedemannSolver::UpdateStage3Config() {
     stage3_cfg_.expected_hash_first_solution = cfg_.stage3_hash_first_solution;
 
     // 5. I/O
-    stage3_cfg_.save_solutions = cfg_.stage3_save_solutions;
+    stage3_cfg_.save_solutions = cfg_.stage3_save_solutions || cfg_.stage3_save_checkpoints;
+    stage3_cfg_.load_checkpoints = cfg_.stage3_load_checkpoints;
     stage3_cfg_.suffix_Y = cfg_.stage3_suffix_Y;
     stage3_cfg_.suffix_Pi = cfg_.stage3_suffix_Pi;
     stage3_cfg_.suffix_solutions = cfg_.stage3_suffix_solutions;
@@ -438,6 +440,30 @@ void BlockWiedemannSolver::AutoTune() {
     }
 }
 
+uint64_t BlockWiedemannSolver::compute_ckpt_tag() const {
+    // FNV-1a over the identifying run parameters. Detects an accidental resume against a
+    // checkpoint set built for a different matrix / block geometry / seed.
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&h](uint64_t v) {
+        for (int b = 0; b < 8; ++b) {
+            h ^= (v & 0xFF);
+            h *= 1099511628211ULL;
+            v >>= 8;
+        }
+    };
+    mix((uint64_t)cfg_.nrows);
+    mix((uint64_t)cfg_.m_block);
+    mix((uint64_t)cfg_.n_block);
+    mix((uint64_t)cfg_.seed);
+    return h;
+}
+
+bool BlockWiedemannSolver::checkpoint_tag_matches() const {
+    uint64_t existing = 0;
+    if (!io_.load_checkpoint_tag(existing)) return false;
+    return existing == compute_ckpt_tag();
+}
+
 void BlockWiedemannSolver::RunStage1() {
 
     // --- BIT-EXACT CONTRACT ---
@@ -511,6 +537,14 @@ void BlockWiedemannSolver::RunStage1() {
             io_.save_vector(stage1_cfg_.suffix_X, hX_, stage1_cfg_.nrows, stage1_cfg_.m_block);
             io_.save_vector(stage1_cfg_.suffix_Y, hY_, stage1_cfg_.nrows, stage1_cfg_.n_block);
         }
+    }
+
+    // Vectors-only resume: a Stage 2 generator (Pi) checkpoint will be loaded, so the
+    // Krylov sequence S is not needed. The deterministic X/Z blocks generated above are
+    // all Stage 3 requires; skip the expensive sequence computation.
+    if (stage1_cfg_.vectors_only) {
+        LOG(LOG_INFO) << "[BWStage 1] Vectors-only mode (resume from generator) — skipping Krylov sequence.";
+        return;
     }
 
     LOG_INCREMENT_STAGE(10);
@@ -653,6 +687,22 @@ void BlockWiedemannSolver::RunStage1() {
 
 void BlockWiedemannSolver::RunStage2() {
     LOG(LOG_INFO) << "[BWStage 2] === Linear Generator Computation ===";
+
+    // Resume: if a valid generator (Pi) checkpoint exists, load it and skip the compute.
+    if (stage2_cfg_.load_checkpoints && io_.exists(stage2_cfg_.suffix_Pi)) {
+        if (checkpoint_tag_matches()) {
+            int dim = stage2_cfg_.m_block + stage2_cfg_.n_block;
+            int pi_len = 0;
+            if (io_.load_polynomial(hPi_, pi_len, dim)) {
+                LOG(LOG_STATS) << "[BWStage 2] Loaded generator Pi from checkpoint (degree "
+                               << (pi_len - 1) << "). Skipping computation.";
+                return;
+            }
+            LOG(LOG_WARNING) << "[BWStage 2] Pi checkpoint present but failed to load — recomputing.";
+        } else {
+            LOG(LOG_WARNING) << "[BWStage 2] Pi checkpoint tag mismatch (stale/different run) — recomputing.";
+        }
+    }
 
     // --- BIT-EXACT CONTRACT ---
     // Object: Generator Matrix Pi(x) (M x M matrix polynomial, M ~ 2n)
@@ -881,6 +931,34 @@ void BlockWiedemannSolver::RunStage3() {
      * parallel path (Batch) that processes multiple u(x) candidates simultaneously.
      */
 
+    // Resume: if a complete solution checkpoint exists (metadata + every _sol_<i>.bin,
+    // tag matches), load it and skip reconstruction entirely. Solutions on disk are
+    // already post-unpermutation, so no further processing is applied.
+    if (stage3_cfg_.load_checkpoints && io_.exists("_sol_meta.bin") && checkpoint_tag_matches()) {
+        if (io_.load_solutions(solutions_, stage3_cfg_.nrows,
+                               stage3_cfg_.m_block, stage3_cfg_.n_block)) {
+            LOG(LOG_STATS) << "[BWSolver] Loaded " << solutions_.size()
+                           << " solutions from checkpoint. Skipping reconstruction.";
+            // Upload to device for downstream GPU consumption (mirrors the compute path).
+            if (!solutions_.empty()) {
+                size_t words_per_solution = (stage3_cfg_.nrows + 63) / 64;
+                size_t total_words = solutions_.size() * words_per_solution;
+                CHECK_SOLVER(cudaMalloc(&d_solutions_, total_words * sizeof(uint64_t)));
+                for (size_t i = 0; i < solutions_.size(); ++i) {
+                    CHECK_SOLVER(cudaMemcpy(
+                        d_solutions_ + i * words_per_solution,
+                        solutions_[i].data(),
+                        words_per_solution * sizeof(uint64_t),
+                        cudaMemcpyHostToDevice));
+                }
+                num_device_solutions_ = solutions_.size();
+            }
+            LOG(LOG_INFO) << "[BWSolver] Total Solutions Found: " << solutions_.size();
+            return;
+        }
+        LOG(LOG_WARNING) << "[BWSolver] Solution checkpoint incomplete/corrupt — reconstructing.";
+    }
+
     if (hPi_.empty()) return;
 
     if (!spmm_) {
@@ -1032,7 +1110,9 @@ void BlockWiedemannSolver::RunStage3() {
 
     if (stage3_cfg_.save_solutions && !stage3_cfg_.checkpoint_prefix.empty()) {
         io_.save_solutions(solutions_, stage3_cfg_.nrows);
-    }    
+        io_.save_solutions_meta((int)solutions_.size(), stage3_cfg_.nrows,
+                                stage3_cfg_.m_block, stage3_cfg_.n_block);
+    }
 }
  
 void BlockWiedemannSolver::Solve() {
@@ -1047,15 +1127,49 @@ void BlockWiedemannSolver::Solve() {
     double ms_tune = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     LOG(LOG_STATS) << "[BWSolver] AutoTune finished in " << FormatDuration(ms_tune);
 
+    // === Stage-boundary resume orchestration ===
+    // Verify the integrity tag once. On mismatch (or no tag file) disable ALL loading so
+    // stale cross-run checkpoints are recomputed rather than consumed; then stamp this
+    // run's tag if we intend to save.
+    bool any_save = stage1_cfg_.save_checkpoints || stage2_cfg_.save_checkpoints
+                    || stage3_cfg_.save_solutions;
+    bool want_load = stage1_cfg_.load_checkpoints || stage2_cfg_.load_checkpoints
+                     || stage3_cfg_.load_checkpoints;
+    bool tag_ok = checkpoint_tag_matches();
+    if (!tag_ok && want_load) {
+        uint64_t dummy = 0;
+        if (io_.load_checkpoint_tag(dummy))
+            LOG(LOG_WARNING) << "[BWSolver] Checkpoint integrity tag mismatch — ignoring existing checkpoints.";
+        stage1_cfg_.load_checkpoints = false;
+        stage2_cfg_.load_checkpoints = false;
+        stage3_cfg_.load_checkpoints = false;
+    }
+    if (any_save && !tag_ok) {
+        io_.save_checkpoint_tag(compute_ckpt_tag());
+    }
+
+    // Determine the highest completed stage to resume from.
+    bool load_sol = stage3_cfg_.load_checkpoints && io_.exists("_sol_meta.bin");
+    bool load_pi  = !load_sol && stage2_cfg_.load_checkpoints && io_.exists(stage2_cfg_.suffix_Pi);
+    if (load_pi) {
+        // Pi will be loaded in Stage 2: Stage 1 need only regenerate the deterministic
+        // X/Z blocks (Stage 3 still uses Z), not the Krylov sequence S.
+        stage1_cfg_.vectors_only = true;
+    }
+    // Solutions complete → all three stages skipped except the Stage 3 load.
+    bool skip_stage1 = load_sol;
+    bool skip_stage2 = load_sol;
+
     LOG_SET_STAGE(LOG_STAGE_BW_STAGE1, "LinAlg");
     t0 = clock::now();
-    RunStage1();
+    if (!skip_stage1) RunStage1();
+    else LOG(LOG_INFO) << "[BWStage 1] === Krylov Sequence Generation SKIPPED (solution checkpoint) ===";
     double ms_stage1 = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     LOG(LOG_STATS) << "[BWSolver] Stage 1 finished in " << FormatDuration(ms_stage1);
 
     LOG_SET_STAGE(LOG_STAGE_BW_STAGE2, "LinAlg");
     t0 = clock::now();
-    if (!cfg_.stage2_skip) RunStage2();
+    if (!cfg_.stage2_skip && !skip_stage2) RunStage2();
     else LOG(LOG_INFO) << "[BWStage 2] === Linear Generator Computation SKIPPED ===";
     double ms_stage2 = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     LOG(LOG_STATS) << "[BWSolver] Stage 2 finished in " << FormatDuration(ms_stage2);

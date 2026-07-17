@@ -211,6 +211,24 @@ target_link_libraries(test_oom_guard PRIVATE
     mpqs_autotune mpqs_sieve mpqs_common cudampqs_build_flags)
 add_test(NAME oom_guard COMMAND test_oom_guard)
 
+# WIDE (uint16) num_polys apply-path clamp (S1, wide-autotune foundation): the
+# custom apply path (loadPartialCustomConfig) now routes num_polysPerSieveCall
+# through the shared clampWideNumPolys() helper so an autotune/pinned winner can
+# never re-inflate polys past 512 on the wide path (the ~8-16x bucket-traffic the
+# 27f810e geometry fix removed). Asserts the cap fires on wide, is a byte-for-byte
+# no-op on narrow, and preserves total polys sieved per hypercube. Pure host
+# arithmetic over sieve_memory_model.h (no kernels, no device needed). Links
+# mpqs_sieve (sieve_memory_model.h) + mpqs_common (uint512 via the math headers).
+add_executable(test_wide_num_polys_clamp
+    ${CMAKE_SOURCE_DIR}/tools/autotune/test_wide_num_polys_clamp.cu)
+set_target_properties(test_wide_num_polys_clamp PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(test_wide_num_polys_clamp PRIVATE
+    mpqs_sieve mpqs_common cudampqs_build_flags)
+add_test(NAME wide_num_polys_clamp COMMAND test_wide_num_polys_clamp)
+
 # Mid-sieve checkpoint I/O contract (S1): (A) m-trailer-test — deserialize_v2 ignores
 # appended trailing bytes; (B) writeCheckpointAtomic/readCheckpoint round-trip; (C) .prev
 # retention + torn-footer rejection + loadLatestCheckpoint fallback. CPU-only host test
@@ -253,6 +271,31 @@ set_target_properties(test_cluster_resume PROPERTIES
 target_include_directories(test_cluster_resume PRIVATE ${CMAKE_SOURCE_DIR}/src/cluster)
 target_link_libraries(test_cluster_resume PRIVATE mpqs_common cudampqs_build_flags)
 add_test(NAME cluster_resume COMMAND test_cluster_resume)
+
+# v2 WORK_ASSIGN wire format (FB hash instead of FB arrays): (a) serialize->deserialize
+# round-trip preserves N/fb_size/M/F/params/poly range/snapshot, yields the sender's
+# computeFactorBaseHash, ships NO FB arrays, and has an fb_size-INDEPENDENT payload
+# (132 + snapshot bytes — the fix for the 64 MiB frame-cap blocker at high F);
+# (b) regen-equivalence — generateFactorBase(N, F) is deterministic, so a worker's
+# regenerated FB reproduces the coordinator's hash; (c) mismatch — any FB divergence
+# (prime, root, truncation, different F) flips the hash, firing the worker fail-loud
+# path. CPU-only host test (no kernel launches); compiled as CUDA so the
+# __host__ __device__ math headers compile. Links cudampqs_cluster (wire),
+# mpqs_sieve (generateFactorBase), mpqs_common (uint512).
+add_executable(test_work_assign_hash
+    ${CMAKE_SOURCE_DIR}/tools/sqrt_failure/test_work_assign_hash.cu)
+set_target_properties(test_work_assign_hash PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+# serialization.h pulls in the sieve common.h (factoringData); add both include
+# dirs explicitly (PRIVATE link does not propagate them).
+target_include_directories(test_work_assign_hash PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/sieve
+    ${CMAKE_SOURCE_DIR}/src/cluster)
+target_link_libraries(test_work_assign_hash PRIVATE
+    cudampqs_cluster mpqs_sieve mpqs_common cudampqs_build_flags)
+add_test(NAME work_assign_hash COMMAND test_work_assign_hash)
 
 # Optional Sqrt specific benchmark (EXCLUDE_FROM_ALL: uses AoS Relation API, needs M2 update for SoA)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sqrt_benchmark.cpp")

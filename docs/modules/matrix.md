@@ -174,7 +174,7 @@ the combined vector is the **XOR** of its constituents:
 
 The V2 pipeline carries **packed 1-partial entries** through all preprocessing stages, computing `sqrt_Q` products incrementally via Montgomery multiplication during merges. The merge tree is eliminated entirely. The GF(2) matrix for BW is extracted at the end by an odd-exponent filter.
 
-**Activation conditions** (gate in `orchestrator.cpp:1185`, `use_packed_pipeline`):
+**Activation conditions** (gate in `orchestrator.cpp:1789`, `use_packed_pipeline`):
 - `cluster_mode == SOLO` (workers/coordinator use the CPU V1 pipeline)
 - GPU backend selected (`--matrix_backend gpu` or `auto`)
 - **Either** a live sieve postprocessor exists (device-resident smooth + LP witness batches),
@@ -467,7 +467,7 @@ Structurally identical to the standard `char_col_kernel` (CC1), reading from mer
 Under `--char_mode branch`, the packed pipeline instead carries a per-relation `char_bits` seed
 through the merge/compaction (XOR-composed via `ROW_WS_BIT`, relocated during compaction, gathered
 at the end) and appends those columns — see [Character Columns](#character-columns) below. Under the
-default `--char_mode none` the whole product-char-column step (`preprocess.cpp:310`, M9f) is skipped
+default `--char_mode none` the whole product-char-column step (`preprocess.cpp:309`, M9f) is skipped
 and zero columns are appended.
 
 ### `PreprocessResultV2`
@@ -509,7 +509,7 @@ std::vector<uint32_t> selectKernelVectorRows(
 
 ### `gpuPreprocessMatrix_packed()`
 
-Top-level V2 pipeline driver (`preprocess.h:153`). Chains
+Top-level V2 pipeline driver (`preprocess.h:160`). Chains
 M9a -> M9b -> M10b (compact-merge cycles) -> M9f (GF(2) extract) -> M11b (post-merge GF(2)
 singleton) -> M9c-post (M12-S1 truncation) -> M9f (product char cols).
 
@@ -586,16 +586,21 @@ longer trigger any auto-switch.
 | `LINALG_ONLY` | V1 (binary CSR + merge tree) | Relations loaded from disk to host |
 | `MATRIX_ONLY` (`--matrix_only`) | Load v2 relations → Matrix → BW → Sqrt | Replay device-saved v2 relations; AUTO expands only here (raw partials present) |
 
-> **`MATRIX_ONLY` mode** (`ExecutionMode::MATRIX_ONLY`, `orchestrator.h:63`): loads device-format
+> **`MATRIX_ONLY` mode** (`ExecutionMode::MATRIX_ONLY`, `orchestrator.h:66`): loads device-format
 > `relations.v2` and runs Matrix → BW → Sqrt without sieving. Combined with `--partial_subsample` /
 > `--smooth_subsample` it is the standard harness for matrix-preprocessing experiments against
-> stored relation sets (`mpqs_work/*.v2`).
+> stored relation sets (`mpqs_work/*.v2`). `--matrix_lp1_bound <L>` additionally applies a true
+> LP-magnitude down-filter immediately after the `.v2` load: every LP-combined relation whose large
+> prime exceeds `L` (and the corresponding raw partials) is dropped, exactly reproducing the
+> relation set a sieve at bound `L` would have produced — the primary Phase-2 LP-reduction lever
+> (no re-sieve). Pure smooths are never dropped; composes with `--partial_subsample` (filter first);
+> zero effect on the sieve path.
 
 ### CLI
 
 Flag spellings and defaults below are the single source of truth as parsed in
-`tests/cuda-mpqs.cpp` (matrix block ~lines 220–233, `--matrix_only` at ~line 375) and mapped to
-`MPQSConfig` fields in `include/orchestrator.h:98–126`.
+`tests/cuda-mpqs.cpp` (matrix block ~lines 510–680, `--matrix_only` at line 419) and mapped to
+`MPQSConfig` fields in `include/orchestrator.h:124–182`.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -612,6 +617,8 @@ Flag spellings and defaults below are the single source of truth as parsed in
 | `--lp_preprocess_threshold <float>` | 0.55 | **DEPRECATED / INERT.** Formerly the LP fraction above which AUTO selected preprocess; the auto-switch was removed. Still parsed, no effect |
 | `--lp_matrix_threshold <float>` | — | **DEPRECATED** alias for `--lp_preprocess_threshold` (backwards compatibility; also inert) |
 | `--matrix_only` | off | Load v2 relations, run matrix preprocessing + BW + sqrt (no sieving) |
+| `--matrix_lp1_bound <L>` | 0 (inert) | `matrix_only` LP-magnitude down-filter (suffix-aware K/M/B/T): drop LP-combined relations with large prime > L (and matching partials) after `.v2` load. Pure smooths never dropped. Primary Phase-2 LP-reduction lever — trials a lower effective L with no re-sieve |
+| `--matrix_max_rows <N>` | 0 (off) | Cap the legacy relation batch to the first `N` rows (suffix-drop) before matrix build / `pad_to_square`, preserving row↔relation↔FB-column alignment (incl. the factor CSR). Used to keep padded `n_cols ≤ 2^24-1` so TiledCOO-256 stays admissible on very large matrices (e.g. the RSA-155 truncated-fallback LA run, `--matrix_max_rows 16700000`) |
 | `--partial_subsample <float>` | 1.0 | `matrix_only` experiments: fraction of partials/LP-combined to retain [0.0–1.0] |
 | `--smooth_subsample <float>` | 1.0 | `matrix_only` experiments: fraction of pure smooths to retain (LP-combined always kept) [0.0–1.0] |
 

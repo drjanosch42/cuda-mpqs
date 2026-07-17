@@ -31,6 +31,39 @@ __global__ void sieveAndScanBatchKernel(
     generalSievingConfig gs_conf,
     sieveAndScanConfig ss_conf); // We want gridDim.x blocks with size of blockDim.x
 
+// RSA-155 dual-path wide (uint16) accumulator fork of sieveAndScanBatchKernel.
+// Near-verbatim copy; width-only diff. Declared here so the controller ctors can
+// reference it for cudaFuncSetAttribute (cross-TU). Defined in kernel.cu.
+// (Declaration mirrors the legacy sieveAndScanBatchKernel decl above: the
+//  __launch_bounds__(1024) qualifier lives on the definition in kernel.cu only.)
+__global__ void sieveAndScanBatchKernelWide(
+    devicePointers dev_pointers,
+    fixedSievingParams fs_params,
+    const mpqs::uint512* __restrict__ batch_a_array,
+    const mpqs::uint512* __restrict__ batch_B_flat,
+    uint32_t step_index,
+    int32_t sieveIntervalStart, // Previously ds_params.startIndex (usually -M)
+    uint32_t* __restrict__ dev_blockRelationCounts, // Output for compaction
+    generalSievingConfig gs_conf,
+    sieveAndScanConfig ss_conf); // We want gridDim.x blocks with size of blockDim.x
+
+// RSA-155 dual-path SATURATING-uint8 wide accumulator kernel (Option A).
+// Copy of the legacy narrow sieveAndScanBatchKernel with the five forward-
+// accumulation sites saturating at 255 (see kernel.cu). Restores SB to narrow's
+// full width while staying bit-for-bit equivalent to sieveAndScanBatchKernelWide
+// in candidate selection under the config-time gate APV_max-threshold<=254.
+// Declared here so the controller ctors can reference it for cudaFuncSetAttribute.
+__global__ void sieveAndScanBatchKernelWideU8Sat(
+    devicePointers dev_pointers,
+    fixedSievingParams fs_params,
+    const mpqs::uint512* __restrict__ batch_a_array,
+    const mpqs::uint512* __restrict__ batch_B_flat,
+    uint32_t step_index,
+    int32_t sieveIntervalStart,
+    uint32_t* __restrict__ dev_blockRelationCounts,
+    generalSievingConfig gs_conf,
+    sieveAndScanConfig ss_conf);
+
 __global__ void initPrimeDataKernel(devicePointers dev_pointers, generalSievingConfig gs_conf, fixedSievingParams fs_params, dynamicSievingParams ds_params);
 
 // Updated: a_factors is now uint32_t*
@@ -196,6 +229,23 @@ int excludeNonRelations(
     polyData& p_data
 );
 
+// RSA-155 dual-path wide (uint16) accumulator fork of excludeNonRelations.
+// Near-verbatim copy; only the blockEntries width changes (uint8_t* -> uint16_t*).
+// Defined in kernel.cu (same TU as sieveAndScanBatchKernelWide).
+__device__
+int excludeNonRelationsWide(
+    uint16_t* __restrict__ blockEntries,
+    int32_t* __restrict__ indexToCandidate,
+    candidateRelation* __restrict__ candidates,
+    const mpqs::uint512& b,
+    uint32_t poly_id,
+    uint32_t candidatesFound,
+    int startOffset,
+    int sievingBlockSize,
+    int maxPerBlock,
+    polyData& p_data
+);
+
 // ============================================================================
 // Global Host Wrappers
 // ============================================================================
@@ -261,7 +311,9 @@ void runSievingBatch(
     sieveAndScanConfig* ss_conf_ptr,
     int num_steps,
     int start_batch_index,
-    cudaStream_t stream
+    cudaStream_t stream,
+    bool use_wide = false,  // S4: select sieveAndScanBatchKernelWide when true (default false = legacy)
+    bool wide_u8sat = false  // Option A: when use_wide, dispatch the saturating-uint8 wide kernel
 );
 
 } // namespace sieve

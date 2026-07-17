@@ -54,5 +54,5 @@ cmake --build build-orin -j$(nproc)
 ## Notes
 
 - **CMake 3.22 compatibility:** Native GPU detection uses `CMAKE_CUDA_ARCHITECTURES=native` (requires 3.24). On CMake 3.22 (common on Jetson), the build falls back to parsing `nvidia-smi` output for GPU arch detection.
-- **Submodules:** Clone with `--recurse-submodules` or run `git submodule update --init --recursive` after cloning. The `src/sieve/` and `src/linalg/` directories are git submodules.
+- **Submodules:** Clone with `--recurse-submodules` or run `git submodule update --init --recursive` after cloning. The `src/linalg/` directory is a git submodule (`src/sieve/` is in-tree, not a submodule).
 - **Separable compilation (RDC):** All CUDA libraries use relocatable device code. The final executable resolves device symbols at link time via `CUDA_RESOLVE_DEVICE_SYMBOLS ON`.

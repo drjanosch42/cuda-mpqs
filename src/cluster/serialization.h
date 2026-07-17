@@ -40,13 +40,28 @@ serializePartialBatch(const mpqs::structures::HostRelationBatch& batch, uint64_t
     return serializeRelationBatch(batch, count);
 }
 
-/// Serialize WORK_ASSIGN: N + factor base + sieve params + poly range + AFactorsSnapshot (M3).
+/// Canonical 64-bit FNV-1a hash of a factor base: fb_size (u32, raw bytes), then
+/// the raw bytes of factorBase[] (u32 primes, ascending), then the raw bytes of
+/// rootN[] (u32 normalized roots, index-aligned). This is the SINGLE hash used by
+/// both the coordinator (serializeWorkAssign) and the worker (regen-and-verify) —
+/// never duplicate the logic. Raw-byte hashing assumes a homogeneous little-endian
+/// cluster (x86-64 + aarch64 Jetson are both LE; enforced by the static_asserts in
+/// serialization.cpp / cluster_common.h).
+uint64_t computeFactorBaseHash(const mpqs::sieve::factoringData& fdata);
+
+/// Serialize WORK_ASSIGN: N + FB hash + sieve params + poly range + AFactorsSnapshot (M3).
 /// Wire layout: [N:64B][fb_size:u32][M:u32][F:u32]
 ///   [sieve_batch_size:u32][shc_dim:u8][pad:3B][threshold_override:u64]
 ///   [lp1_bound:u64][poly_range_start:u64][poly_range_count:u64][target_relations:u64]
-///   [factorBase: fb_size*4B][rootN: fb_size*4B]
+///   [fb_hash:u64]                                    <-- computeFactorBaseHash(fdata);
+///                                                        REPLACES the former
+///                                                        [factorBase][rootN] blob so the
+///                                                        payload is F-independent (~220 B,
+///                                                        vs >64 MiB at RSA-155 F=500M)
 ///   [snapshot_dim:u32][snapshot_a_factors: dim*4B]
 ///   [snapshot_lowerHalfStart:u32][snapshot_upperHalfStart:u32]  (when snapshot != nullptr)
+/// The worker regenerates the FB locally from the shipped (N, F) via
+/// generateFactorBase (deterministic) and verifies its hash against fb_hash.
 /// @param snapshot         Optional AFactorsSnapshot (M3). Pass nullptr for M2-compatible output.
 /// @return (buffer, byte count written).
 std::pair<std::vector<uint8_t>, size_t>
@@ -59,7 +74,11 @@ serializeWorkAssign(const mpqs::sieve::factoringData& fdata,
                     uint64_t target_relations,
                     const mpqs::sieve::AFactorsSnapshot* snapshot = nullptr);
 
-/// Deserialize WORK_ASSIGN payload. Populates fdata and output params.
+/// Deserialize WORK_ASSIGN payload. Populates fdata scalars (N, M, F, size) and
+/// output params. Does NOT populate fdata.factorBase / fdata.rootN — the FB is no
+/// longer on the wire; the caller must regenerate it from (N, F) and verify the
+/// regenerated hash (computeFactorBaseHash) against @p fb_hash_out before use.
+/// @param fb_hash_out          Receives the coordinator's FB hash from the wire.
 /// @param snapshot_out         If non-null, populated from the M3 snapshot extension when present.
 ///                             Left unchanged if the message was sent by an M2 sender (no snapshot).
 /// Backward compatible: returns true even if buffer contains no snapshot fields.
@@ -71,6 +90,7 @@ bool deserializeWorkAssign(const uint8_t* data, size_t len,
                            uint64_t& poly_range_start,
                            uint64_t& poly_range_count,
                            uint64_t& target_relations,
+                           uint64_t& fb_hash_out,
                            mpqs::sieve::AFactorsSnapshot* snapshot_out = nullptr);
 
 /// Serialize an incremental batch (combined full + partial relations).

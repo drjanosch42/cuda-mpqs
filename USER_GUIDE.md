@@ -199,7 +199,11 @@ All buffer size flags accept an optional `K` or `M` suffix for base-1024 scaling
 | `--sieve_max_batches <N>` | uint64 | `0` (disabled) | Stop the sieve after N batch iterations. 0 disables the cap. | Yes |
 | `--sieve_truncate_continue` | boolean | `false` | When a sieve-truncation cap (`--sieve_max_relations`/`--sieve_max_batches`) fires, continue the pipeline (matrix, BW, sqrt) with the relations collected so far instead of stopping. | No |
 | `--sieve_gms_blocks <N>` | uint32 | Auto (64) | Number of CUDA blocks for the globalMetaSieve kernel. | Yes |
-| `--sieve_hc_dim <N>` | uint32 | Auto | Hypercube dimension for polynomial construction (number of prime factors in the `a` coefficient). Currently hidden from `--help` output but functional. | Yes |
+| `--sieve_hc_dim <N>` | uint32 | Auto | Hypercube dimension for polynomial construction (number of prime factors in the `a` coefficient). | Yes |
+| `--wide_accum <MODE>` | string | `auto` | Wide-accumulator kernel selection for large inputs (>~150 digits): `auto` (size-gate driven), `u8sat` (saturating-uint8, restores narrow throughput when the exactness gate holds), or `u16` (uint16). No effect on smaller inputs, which always use the narrow (uint8) accumulator. See `docs/modules/sieve.md`. | Yes |
+| `--bucket_size_factor <F>` | double | `0` (legacy SB/2) | Meta-sieve bucket capacity as a multiple of the sieving block size (`globalBucketSize = F × SB`). `1.0` un-clamps the default bucket for large-`M` wide-path runs (eliminates bucket overflow). Charged against the VRAM budget before allocation — an over-large factor degrades poly count or is rejected, never an OOM. | Yes |
+| `--sieve_gather_block_dim <N>` | uint32 | `0` (off) | Overrides the GATHER kernel block dimension (power of two in `[32,1024]`). Result-invariant occupancy A/B knob. | Yes |
+| `--sieve_meta_cycle_cap <N>` | uint32 | `0` (off) | Caps the meta-sieve (SCATTER) active-blocks-per-cycle to shrink the bucket-write window. A write-locality ablation knob, not a speedup lever (capping multiplies factor-base re-reads). | No |
 
 ### Checkpoint / Resume Options
 
@@ -231,6 +235,7 @@ These flags control the matrix construction and preprocessing stage, which conve
 | `--partial_subsample <F>` | double | `1.0` | Fraction of partial / LP-combined relations to retain (for `--matrix_only` experiments). Range `[0.0, 1.0]`. | No |
 | `--smooth_subsample <F>` | double | `1.0` | Fraction of pure smooth relations to retain (LP-combined relations are always kept) for `--matrix_only` experiments. Range `[0.0, 1.0]`. | No |
 | `--lp_preprocess_threshold <F>` | double | `0.55` | **Deprecated / inert.** Formerly the LP-fraction threshold for auto-selecting `preprocess` mode; AUTO no longer auto-selects preprocess from LP fraction (use `--matrix_mode preprocess` to opt in). Retained as a no-op for backwards compatibility. (`--lp_matrix_threshold` is a deprecated alias.) | No |
+| `--matrix_max_rows <N>` | uint64 | `0` (off) | Cap the legacy relation batch at `N` rows (suffix-drop) before matrix build, preserving row↔relation↔FB-column alignment. Keeps the padded column count admissible for the packed SpMM formats and can reduce VRAM on very large matrices. Optional performance/memory lever for the largest inputs. | No |
 
 **GPU preprocessing pipeline (V2, `--matrix_backend gpu`):**
 
@@ -253,13 +258,16 @@ The CPU backend (`--matrix_backend cpu`) uses the V1 pipeline: binary CSR with G
 |------|------|---------|-------------|--------|
 | `--bw_m <N>` | uint32 | `256` | Block Wiedemann block width m. Controls the blocking factor for the Krylov sequence generation. | Yes |
 | `--bw_n <N>` | uint32 | `256` | Block Wiedemann block width n. Controls the blocking factor for reconstruction. | Yes |
+| `--bw_max_solutions <N>` | int | `-1` (all) | Cap the number of Block Wiedemann solution vectors reconstructed. `-1` reconstructs all. Lowering it can skip a zero-yield reconstruction batch on large inputs. *Experimental.* | No |
+| `--bw_checkpoint_dir <path>` | string | `""` (off) | Directory for Block Wiedemann stage-boundary checkpoints (Krylov sequence, lingen polynomial, final solutions). Enables resume across the long linear-algebra stages. *Experimental — resumes from the last completed stage, not mid-stage.* | No |
+| `--bw_resume` | boolean | `false` | Load completed-stage Block Wiedemann checkpoint artifacts from `--bw_checkpoint_dir` and skip those stages. *Experimental.* | No |
 
 ### Square Root Options
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--sqrt_legacy` | boolean | `false` | Use the CPU-based sequential square root path instead of the GPU batched path. The CPU path processes solution vectors one at a time; the GPU path processes all solution vectors simultaneously using batched Montgomery arithmetic. Primarily for debugging and benchmarking. |
-| `--sqrt_diagnostic` | boolean | `false` | Log extra square-root diagnostics: HalveExponents validity checks and solution-vector diversity. Useful for diagnosing trivial-factor or non-squarefree relation issues. |
+| `--sqrt_diagnostic` | boolean | `false` | Log solution-vector diversity statistics (distinct BW solutions by hash). HalveExponents validity checks and the per-solution nontrivial-GCD rate are logged unconditionally regardless of this flag — pair with `--debug --log_file` to capture them. Useful for diagnosing trivial-factor or non-squarefree relation issues. |
 
 ### Autotune Options
 

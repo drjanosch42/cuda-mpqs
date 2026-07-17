@@ -1,14 +1,17 @@
 # Orchestrator Module (`src/orchestrator/`, `include/`)
 
-Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline, manages configuration, execution modes, autotune integration, and inter-stage data flow.
+Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline (plus the optional autotune stage), manages configuration, execution modes, cluster topology (solo/coordinator/worker), sieve checkpointing, and inter-stage data flow.
 
 ## Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `include/orchestrator.h` | ~400 | `MPQSOrchestrator` class, `MPQSConfig` struct, `ExecutionMode` enum, `SieveProgressTracker`, `LPFillProjector`, `TruncatedSieveResult` |
-| `src/orchestrator/orchestrator.cpp` | ~2450 | Pipeline implementation, SoA serialization, stage dispatch, truncated sieve probes |
-| `src/orchestrator/CMakeLists.txt` | 23 | Static library `mpqs_orchestrator` |
+| `include/orchestrator.h` | ~780 | `MPQSOrchestrator` class, `MPQSConfig` struct, `ExecutionMode` enum, `SieveProgressTracker`, `LPFillProjector`, `TruncatedSieveResult` |
+| `src/orchestrator/orchestrator.cpp` | ~7690 | Pipeline implementation, stage dispatch, truncated sieve probes, coordinator `networkLoop()` (Thread A), checkpoint/resume flows |
+| `src/orchestrator/CMakeLists.txt` | 29 | Static library `mpqs_orchestrator` |
+
+Relation disk I/O (`serialize_v1/v2`) lives in `src/common/relation_io.{h,cpp}`; the checkpoint
+file format helpers live in `src/common/sieve_checkpoint.{h,cpp}` (both linked via `mpqs_common`).
 
 ## MPQSConfig
 
@@ -24,6 +27,16 @@ Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline, ma
 | `work_dir` | `string` | `./mpqs_work` | Working directory for disk I/O |
 | `silent` | `bool` | false | Suppress constructor/destructor log output (used by autotune probes to prevent header pollution) |
 
+### Diagnostic Dump Fields (sqrt-failure investigation; strictly opt-in)
+
+All three are ADDITIVE: when false, the standard path is byte-for-byte unchanged.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `dump_matrix` | `bool` | false | Dump finalized `matrix_A_` (CSR binary + human-readable column legend) to `work_dir`. CLI: `--dump_matrix` |
+| `dump_kernel_vectors` | `bool` | false | Enable the BW writer (`bw_config.stage3_save_solutions`) AND dump the final `kernel_solutions_` (original-relation space) plus a sidecar documenting row space + bit→relation map. CLI: `--dump_kernel_vectors` |
+| `dump_combine_provenance` | `bool` | false | Capture the two constituents (probe root, witness root, signs, `val_2_exps`, LP) of every LP-combined relation BEFORE the slab purge; serialize to `combine_provenance.bin`. CLI: `--dump_combine_provenance` |
+
 ### Tuning / Sieve Fields
 
 | Field | Type | Default | Description |
@@ -33,19 +46,28 @@ Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline, ma
 | `fb_bound` | `uint32_t` | 0 (auto) | Factor base bound F |
 | `sieve_bound` | `uint32_t` | 0 (auto) | Sieve interval half-width M |
 | `lp1_bound` | `uint64_t` | 0 (disabled) | Large prime bound; 0 disables LP variant |
-| `lp1_max_witness_capacity` | `uint64_t` | 0 (auto: 1M) | Max LP witness entries in slab hash |
-| `lp1_sort_bound` | `uint32_t` | 0 (disabled) | Enables second sort in LP processing |
+| `lp1_max_witness_capacity` | `uint64_t` | 0 (auto) | Max LP witness entries in slab hash. Auto: derived in `initLargePrimes()`, scaled with the LP-to-FB ratio and rounded to a power of 2 (Jetson default: 4M) |
 | `lp_interval` | `uint32_t` | 1 | LP processing frequency: 0 = auto/adaptive, N > 0 = process LP every N batches. CLI: `--lp_interval` |
 | `target_relations` | `uint32_t` | 0 (auto: FB+5%+64) | Target relation count |
 | `dedup_safety_factor` | `double` | 1.05 | Oversample margin for dedup: collect `target × factor` relations. Auto-set to 1.35 for inputs < 80 digits. CLI: `--dedup_safety_factor` |
 | `sieve_batch_size` | `uint32_t` | 0 (auto) | Batch GPU sieving; 0 = auto-calculate |
 | `sieve_gms_num_blocks` | `uint32_t` | 0 (auto) | MetaSieve CUDA blocks |
 | `sieve_hcube_dimension` | `uint32_t` | 0 (auto) | Hypercube dimension for polynomial construction |
+| `sieve_accumulator_mode` | `int` | 0 (auto) | Sieve log-accumulator width: 0 = auto (`use_wide` dispatch predicate decides), 1 = force uint8, 2 = force uint16. CLI: `--sieve_accumulator auto\|u8\|u16` |
+| `sieve_wide_accum_mode` | `int` | 0 (auto) | Wide-regime accumulator variant (Option A): 0 = auto (saturating-uint8 iff the exactness gate `APV_max−threshold ≤ 254` holds, else uint16), 1 = force u8sat (gate-honoured), 2 = force uint16. Only consulted in the wide regime. CLI: `--wide_accum auto\|u8sat\|u16` |
+| `sieve_meta_cycle_cap` | `uint32_t` | 0 (OFF) | A2 meta-sieve SCATTER locality knob: caps `num_activeBlocksPerCycle` and raises `num_metaSieveCycles` correspondingly, bounding each thread's bucket-write spread independent of M. 0 = exact legacy geometry. CLI: `--sieve_meta_cycle_cap` |
+| `sieve_gather_block_dim` | `uint32_t` | 0 (OFF) | A/B knob for the GATHER (sieve-and-scan) kernel's blockDim (`ss_conf.num_threadsPerBlock`). Result-invariant performance knob (only occupancy changes); power of two in [32, 1024]. 0 = loader-derived (currently 256). CLI: `--sieve_gather_block_dim` |
+| `sieve_bucket_size_factor` | `double` | 0.0 (OFF) | Decouples large-prime bucket capacity from the legacy `globalBucketSize = SB/2`: F>0 sizes it `F·SB` (0.5 reproduces legacy; 1.0 doubles it). VRAM budget + config validator both account for the resized bucket. CLI: `--bucket_size_factor` |
+| `autotune_probe_polys` | `uint32_t` | 0 (auto) | Wide-autotune survivors/sec probe sample size (# distinct polynomials staged; every candidate re-sieves the same sample). 0 = auto-scale by N. Wide path only. CLI: `--autotune_probe_polys` |
 | `cuda_graph_unroll` | `uint32_t` | 0 (disabled) | Capture N batches as a CUDA graph for replay. Must be even (double-buffer constraint). Recommended: 2 or 4. CLI: `--cuda_graph_unroll` |
 | `probe_timeout` | `double` | 120.0 | Hard timeout (seconds) for `TruncatedSieveRun()`. CLI: `--probe_timeout` |
 | `estimate_only` | `bool` | false | Run truncated sieve in current topology, print runtime estimate, exit. CLI: `--estimate_only` |
+| `sieve_max_relations` | `uint64_t` | 0 (disabled) | Truncation: stop sieve after N relations (coordinator-only in cluster mode — counts the pooled total). CLI: `--sieve_max_relations` |
+| `sieve_max_batches` | `uint64_t` | 0 (disabled) | Truncation: stop sieve after N batch iterations. CLI: `--sieve_max_batches` |
+| `sieve_truncate_continue` | `bool` | false | If true, continue the pipeline after a truncated sieve |
 | `useParams` | `bool` | false | Use custom sieve parameter tuple |
 | `params[8]` | `uint32_t[8]` | all 0 | Custom sieve parameters (passed to `loadPartialCustomConfig`) |
+| `pinned_params` | `map<string,bool>` | empty | Records which config fields were explicitly set via CLI. `isPinned(name)` is checked by auto-apply, autotune, and the Jetson/small-N default blocks before overriding any user-provided value |
 
 ### Buffer Sizing Overrides
 
@@ -77,6 +99,11 @@ Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline, ma
 | `lp_matrix_threshold` | `double` | 0.01 | **DEPRECATED** alias for `lp_preprocess_threshold` (also inert). CLI: `--lp_matrix_threshold` |
 | `partial_subsample` | `double` | 1.0 | Fraction of partials/LP-combined to retain in `MATRIX_ONLY`. Range [0.0, 1.0]; 1.0 = no subsampling. CLI: `--partial_subsample` |
 | `smooth_subsample` | `double` | 1.0 | Fraction of pure smooths (`large_primes ≤ 1`) to retain in `MATRIX_ONLY`. LP-combined relations are always retained. Range [0.0, 1.0]; 1.0 = no subsampling. CLI: `--smooth_subsample` |
+| `matrix_lp1_bound` | `uint64_t` | 0 (inert) | `MATRIX_ONLY` LP-magnitude down-filter: after `.v2` load, DROP every LP-combined relation (and raw partial) whose stored large prime exceeds this value — reproducing the relation set a sieve at bound L would have produced, with NO re-sieve. Pure smooths (`large_primes ≤ 1`) are never dropped. Distinct from `--lp1_bound` (the sieve bound, restored from metadata). Composes with `--partial_subsample` (filter first). Suffix-aware K/M/B/T parse. CLI: `--matrix_lp1_bound` |
+| `merge_max_weight` | `uint32_t` | 10 | DIAGNOSTIC: max column weight for higher-weight merges (preprocess CPU path, `mergeHigherWeight` k_max). Default 10 = no behavior change; 2 disables all weight≥3 multi-cycle merges. CLI: `--merge_max_weight` |
+| `force_preprocess` | `bool` | false | DIAGNOSTIC: force the preprocess expand+merge path even with 0 raw partials (normally the orchestrator force-legacies in that case). CLI: `--force_preprocess` |
+| `preprocess_lp_materialize_max` | `double` | 0.45 | Facet-3 gate: max combined-smooth LP fraction at which the preprocess path materializes matched raw-1-partial 2-cycle rows (above it they pin the BW kernel to the trivial genus → 0% nontrivial). 1.0 = never skip (pre-fix); 0.0 = always skip. CLI: `--preprocess_lp_materialize_max` |
+| `truncation_min_rows` | `uint32_t` | 5000000 | Facet-2 size gate: skip CPU-preprocess truncation when the reduced matrix has ≤ this many rows (BW-tractable untruncated). CLI: `--truncation_min_rows` |
 | `truncation_factor` | `double` | 1.05 | Matrix truncation on/off switch: > 0 = enabled, 0 = disabled. Actual target is excess-based (M12-S1): `n_cols + n_extra_cols + matrix_truncation_excess`. Retained as backward-compatible CLI toggle. CLI: `--truncation_factor` |
 | `matrix_truncation_excess` | `uint32_t` | 200 | Excess rows above `(n_cols + n_extra_cols)` after truncation; controls how overdetermined the post-augmentation matrix is. CLI: `--matrix_truncation_excess` |
 | `compact_cycles` | `uint32_t` | 5 | Max compact-merge cycles (GPU backend only). 0 = single pass (no compaction, reverts to pre-M10 behavior). CLI: `--compact_cycles` |
@@ -95,7 +122,7 @@ Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline, ma
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `sqrt_legacy` | `bool` | false | If true, use CPU `Perform()` loop; default uses GPU batched path |
-| `sqrt_diagnostic` | `bool` | false | If true, log extra sqrt diagnostics: per-solution nontrivial-GCD rate (`k/n`) per Block-Wiedemann solution, HalveExponents validity, solution diversity (at `LOG_DEBUG_1`). CLI: `--sqrt_diagnostic` |
+| `sqrt_diagnostic` | `bool` | false | If true, log solution-diversity statistics (distinct BW solutions by hash) at `LOG_INFO`. Per-solution nontrivial-GCD rate (`LOG_DEBUG_1`) and HalveExponents validity (`LOG_WARNING`) are logged unconditionally, independent of this flag. CLI: `--sqrt_diagnostic` |
 
 ### Checkpoint Fields
 
@@ -122,8 +149,11 @@ are identical to a pre-feature run. The feature is never auto-enabled.
 | `cluster_init_timeout` | `uint32_t` | 300 | Seconds: worker retry window + coordinator accept timeout. CLI: `--cluster_init_timeout` |
 | `cluster_node_weights` | `string` | (auto) | Comma-separated per-node throughput weights; overrides SM×clock auto-balance. CLI: `--cluster_node_weights` |
 | `cluster_headroom` | `double` | 10.0 | Per-node headroom percent (0 = exact assignment, default 10%). CLI: `--cluster_headroom` |
+| `cluster_pool_oversize` | `double` | 1.0 | Coordinator-only multiplier enlarging the on-demand OVERFLOW pool of polynomial windows (pure index space drawn only after a node exhausts its initial range with the target unmet — over-sizing is essentially free; the run stops at the relation cap). Does NOT affect initial contiguous ranges. CLI: `--cluster_pool_oversize` |
+| `transport` | `string` | `"tcp"` | Communication backend selector (future: `"mpi"`, `"gpi2"`) |
 | `poly_range_start` | `uint64_t` | 0 | First a-index for this node (0 = natural start; set from `WORK_ASSIGN`/`CHUNK_ASSIGN`) |
 | `poly_range_count` | `uint64_t` | 0 | Number of a-values in this node's contiguous range |
+| `received_snapshot` | `AFactorsSnapshot` | -- | A-factor walk snapshot received via `WORK_ASSIGN` (workers only, M3 extension) |
 
 ### Embedded Component Configs
 
@@ -161,7 +191,7 @@ If `auto_tune_parameters`, calls `determineParams(&f_data_)` to heuristically se
 
 ### Autotune (between Tuning and Sieve)
 
-When `autotune_enabled` or mode is `AUTOTUNE_ONLY`, the orchestrator instantiates `AutotuneController(autotune_config, config_, f_data_)` and calls `run()`. The controller runs up to 4 stages (projection, kernel params, runtime estimation, sieve params) using truncated sieve probes with `TruncatedSieveRun()`. Results are written back to `config_` (stages run, confidence score). In `AUTOTUNE_ONLY` mode, the pipeline returns immediately after autotune completes.
+When mode is `AUTOTUNE_ONLY`, or when `autotune_enabled` and mode is `FULL_PIPELINE` or `SIEVE_ONLY` (the SIEVE_ONLY autotune gate), the orchestrator instantiates `AutotuneController(autotune_config, config_, f_data_)` and calls `run()`. Even without `--autotune`, `AutoApplyController` applies history-based parameters after `TuningStage()` (zero GPU probes; disable with `--autotune_no_history`). The controller runs up to 4 stages (projection, kernel params, runtime estimation, sieve params) using truncated sieve probes with `TruncatedSieveRun()`. Results are written back to `config_` (stages run, confidence score). In `AUTOTUNE_ONLY` mode, the pipeline returns immediately after autotune completes.
 
 Autotune probes use `silent = true` on sub-orchestrators to suppress log header/footer noise.
 
@@ -189,7 +219,7 @@ Three private helpers are shared by `SieveStage()` and `TruncatedSieveRun()` to 
 **PATH 1: Batch** (`sieve_batch_size > 0`)
 
 Zero-sync GPU pipeline with CUDA event DAG. Adaptive convergence:
-- `dedup_margin = max(256, 3% × target_relations)`, `relation_cap = target_relations + dedup_margin`
+- `dedup_margin = max(256, target × (dedup_safety_factor − 1.0))` (5% at the 1.05 default, matching the cluster accumulator), `relation_cap = target + dedup_margin`
 - `postprocessor_->getPersistentBatch()->setTargetCap(relation_cap)` caps device-side writes
 - `postprocessor_->setPredictionParams(target, lp_telemetry)` enables yield-rate prediction
 
@@ -214,7 +244,7 @@ Host-driven loop: per step `siever_->updateState`, `sieveFullCube`, `postprocess
 Same host-driven loop; when buffer full: `processBufferedCandidates`, `consolidateToPersistent`. Logs progress every 200 new relations. Exits when `getPersistentCount() >= target_relations`.
 
 **Post-loop (all paths):**
-Legacy paths: `postprocessor_->flush()`, optional final LP commit. All paths: clear sticky CUDA error via `cudaGetLastError`, `deduplicatePersistentBatch`, `d_persistent->moveToHost(host_relations_soa_)`.
+Legacy paths: `postprocessor_->flush()`, optional final LP commit. All paths: clear sticky CUDA error via `cudaGetLastError`, then `finalizePersistentToHost()` — end-of-sieve drain → device `deduplicatePersistentBatch()` → deficit-guard re-sieve if the post-dedup count falls below `fb_size + 64` (`kDeficitFloorAuto`) → copy into `host_relations_soa_`/`host_partials_soa_`. A solo resume instead runs `finalizeResumeUnion()` (loaded ∪ new union merge, see Sieve Checkpointing below).
 
 Cleanup: `siever_->clearSievingBuffers()`, `postprocessor_->clearBuffers()`, `largeprime_->clearBuffers()` (if active). Persistent batch is **not** cleared here — `MatrixStage` reads it.
 
@@ -303,30 +333,32 @@ Result of a truncated sieve probe run, containing all telemetry needed for runti
 | `eta_reliable` | `bool` | True if ≥ 6 ETA samples and tracker converged |
 | `converged_early` | `bool` | True if probe exited via ETA convergence |
 
-## SoA Disk Serialization
+## Relation Disk Serialization (`src/common/relation_io.{h,cpp}`)
 
-Binary format (anonymous namespace helpers `serialize_soa` / `deserialize_soa`):
+Two formats, both under namespace `mpqs::io`, auto-detected on load via `detect_and_deserialize()`:
 
-| Offset | Content |
-|--------|---------|
-| 0 | Magic `MPQS_SOA` (8 bytes) |
-| 8 | `num_relations` (uint64) |
-| 16 | `num_factors` (uint64) |
-| 24+ | 7 flat vectors, each preceded by uint64 element count |
+- **v1** (`serialize_v1` / `deserialize_v1`, magic `MPQS_SOA\0`): single `HostRelationBatch`
+  with projected LP values — flat SoA vectors (`sqrt_Q`, `signs`, `val_2_exps`, `large_primes`,
+  `factor_offsets`, `factor_indices`, `factor_counts`), each length-prefixed. Written to
+  `{work_dir}/relations.soa`; loaded by `LINALG_ONLY`.
+- **v2** (`serialize_v2` / `deserialize_v2`, magic `MPQS_V2\0`, version=2, flags bitfield): full
+  smooths + raw partials + `V2Metadata` (N, factor base, `lp_bound`, `sieve_bound`; plus a
+  flag-guarded branch-char extension — `aux_primes`, `t_s`, `r`, `has_char_bits` — appended at
+  the end of the fixed metadata block so char-less files parse byte-for-byte unchanged). Written
+  to `{work_dir}/relations.v2`; loaded by `MATRIX_ONLY`. Also the payload format of the mid-sieve
+  checkpoint `sieve.ckpt` (see below).
 
-Vectors in order: `sqrt_Q`, `signs`, `val_2_exps`, `large_primes`, `factor_offsets`, `factor_indices`, `factor_counts`.
-
-File path: `{work_dir}/relations.soa`. BW checkpoints: `{work_dir}/bw*`.
+BW checkpoints: `{work_dir}/bw*`.
 
 ## Execution Modes
 
 | Mode | Stages Executed | Disk I/O |
 |------|-----------------|----------|
-| `FULL_PIPELINE` | Tuning [+ Autotune] + Sieve + Matrix + LinAlg + Sqrt | Optional save after sieve |
-| `SIEVE_ONLY` | Tuning + Sieve | Save required (writes `.soa`), then returns |
-| `LINALG_ONLY` | Tuning + Matrix + LinAlg + Sqrt | Load required (reads `.soa`) |
-| `MATRIX_ONLY` | Load v2 relations → Matrix → BW → Sqrt | Load required (reads `.v2`), no sieve |
-| `SQRT_ONLY` | *(not implemented)* | Logs error and returns immediately — no disk loader for kernel solutions or factor base |
+| `FULL_PIPELINE` | Tuning [+ Autotune] + Sieve + Matrix + LinAlg + Sqrt | Optional save after sieve (`disk_io`) |
+| `SIEVE_ONLY` | Tuning [+ Autotune] + Sieve | Save required: writes BOTH `relations.soa` (v1) and `relations.v2` (v2, smooths + partials + metadata), then returns |
+| `LINALG_ONLY` | Tuning + Matrix + LinAlg + Sqrt | Load required (reads `relations.soa`, v1) |
+| `MATRIX_ONLY` | Load v2 relations [+ `matrix_lp1_bound` L-filter + subsampling] → Matrix → BW → Sqrt | Load required (reads `relations.v2`), no sieve |
+| `SQRT_ONLY` | *(not implemented)* | Logs `LOG_ERROR_CRITICAL` and returns immediately — no disk loader for kernel solutions or factor base |
 | `PARAM_TEST` | Tuning + Sieve init (calls `runParamTest`, then returns) | None |
 | `AUTOTUNE_ONLY` | Tuning + Autotune | None (prints results, returns) |
 
@@ -427,7 +459,10 @@ All restore steps happen **before Thread A starts and before any `requestWork`/`
 |--------|------|---------|
 | `config_` | `MPQSConfig` | Runtime configuration (mutated during tuning/autotune) |
 | `f_data_` | `sieve::factoringData` | Factor base, polynomial state |
+| `is_jetson_` | `bool` | SM 8.7 or unified-memory < 12 GB detected at runtime |
+| `data_tap_` | `cluster::DataTap*` | Copied from `config_` at `SieveStage()` entry; `nullptr` = solo |
 | `host_relations_soa_` | `structures::HostRelationBatch` | Downloaded relations (SoA) |
+| `host_partials_soa_` | `structures::HostRelationBatch` | Raw partials (LP > 1) for the expanded-matrix path and `.v2` output |
 | `matrix_A_` | `HostMatrix` | Sparse GF(2) relation matrix (jagged rows) |
 | `kernel_solutions_` | `vector<vector<uint64_t>>` | Packed kernel vectors from BW solver |
 | `result_factors_` | `vector<uint512>` | Final non-trivial factors |
@@ -441,6 +476,10 @@ All restore steps happen **before Thread A starts and before any `requestWork`/`
 | `lp_fill_history_` | `LPFillHistory` | LP hash table fill tracking |
 | `lp_projector_` | `LPFillProjector` | Witness fill projection for adaptive sizing |
 | `adaptive_lp_batch_interval_` | `uint32_t` | LP processing interval (initial 10, calibrated from ETA) |
+| `cluster_*` members | various | Coordinator-only (null in solo/worker): `cluster_queue_`, `cluster_accumulator_`, `cluster_handoff_`, `cluster_cpu_lp_`, `cluster_channel_`, `cluster_thread_a_`, `comm_backend_`, `cluster_work_pool_`, `cluster_scheduler_`, `cluster_raw_partials_`, per-node initial-range tracking (`cluster_initial_ranges_`, `cluster_node0_initial_hw_`), and resume state (`cluster_resume_*`) — see [cluster.md](cluster.md) |
+| checkpoint state | various | Solo mid-sieve checkpoint/resume: `last_checkpoint_time_`, `ckpt_scratch_*` (copy-only snapshot buffers), `resume_active_`, `resume_loaded_raw_`, `resume_global_a_index_`, `ckpt_loaded_*` (held for the end-of-sieve union merge) |
+| preprocessing state | various | `merge_tree_`, `preproc_row_map_`, `used_expanded_matrix_`, `used_packed_pipeline_`, `preproc_v2_result_`, `precomputed_lp_y_` (Montgomery-domain LP Y-contributions) |
+| branch-char state | various | `branch_aux_primes_`/`branch_aux_t_s_` (+ device copies), selected once by `initBranchCharData()` under `--char_mode branch` |
 
 ## Dependencies
 

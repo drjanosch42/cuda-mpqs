@@ -557,12 +557,9 @@ void determineParams(factoringData* fData) {
     }
 
     // Calculate a_target = sqrt(2 * N) / M
-    // 1. 2 * N
-    mpqs::uint512 twoN = N;
-    twoN.lshift(1);
-
-    // 2. sqrt(2 * N)
-    mpqs::uint512 sqrt2N = twoN.sqrt();
+    // 1./2. sqrt(2 * N). isqrt_2N avoids the 2N overflow at N >= 2^511 (RSA-155),
+    //       where the naive twoN = N<<1 drops bit 511. STRICT NO-OP for N < 2^511.
+    mpqs::uint512 sqrt2N = mpqs::isqrt_2N(N);
 
     // 3. Divide by M
     sqrt2N.div_uint32_inplace(fData->M); // Performs division, sqrt2N becomes the quotient

@@ -2,9 +2,11 @@
 
 A high-performance GPU implementation of the Self-Initializing Multiple Polynomial
 Quadratic Sieve (SIQS/MPQS) for integer factorization. cuda-mpqs factors composite
-integers up to 512 bits (RSA-100 through RSA-155 range) end-to-end on a single GPU
-or across a small cluster of GPUs, combining a fully on-device sieve with a packed
-sparse GF(2) preprocessor and a Block Wiedemann linear algebra solver.
+integers up to 512 bits (RSA-100 through RSA-155 range) end-to-end, scaling from a
+single GPU to large multi-node clusters — production runs use 64 H100 GPUs across
+16 nodes, with measured coordinator headroom supporting 100+ GPUs deployments. It
+combines a fully on-device sieve with a packed sparse GF(2) preprocessor and a
+Block Wiedemann linear algebra solver.
 
 ## Features
 
@@ -27,6 +29,9 @@ sparse GF(2) preprocessor and a Block Wiedemann linear algebra solver.
   `--checkpoint_dir`, `--resume`): writes atomic `sieve.ckpt` snapshots; a killed or
   wall-clock-expired run resumes from the last checkpoint instead of re-sieving from
   zero. Default-off; coordinator-only in cluster mode.
+- 512-bit (RSA-155) capability via a wide `uint16`/`u8sat` sieve accumulator
+  path, tunable large-prime bucket capacity (`--bucket_size_factor`), and cluster
+  scaling to 64+ GPUs across many nodes.
 - Validated on consumer NVIDIA GPUs from Turing (CC 7.5) through Blackwell
   (CC 12.0), including Jetson Orin (CC 8.7).
 
@@ -106,15 +111,46 @@ setup, parameters, and launch examples.
 
 ## Performance
 
-End-to-end wall-clock time on a single RTX 5070 Ti (Blackwell, CC 12.0), full
-pipeline (sieve + linear algebra + square root):
+### Factorization records
+
+- **RSA-155 (512 bits, 155 decimal digits) factored 2026-07-14** on a 16-node
+  H100 cluster (64 GPUs). Total **700.64 GPU-hours**: sieving 689.74 GPU-h on
+  64× H100 across 16 nodes (10.78 h wall-clock), linear algebra 10.90 GPU-h on a
+  single H100 (10.90 h wall-clock). 17.27 M relations collected (41.4 % via the
+  single large-prime variant); Block Wiedemann on a 16.7 M × 15.67 M GF(2)
+  matrix with 684 M nonzeros. Result: two 78-digit primes, product-verified.
+  Total energy ≈ 242 kWh.
+- **RSA-140 (463 bits) factored 2026-06-29** on the same pipeline: ≈ 104
+  GPU-hours — sieving on 16× H100 (6 h 28 m wall-clock) and linear algebra in
+  21 m 31 s on a single H100. Result: two 70-digit primes, product-verified.
+
+**Record RSA-100 runtime:** the full pipeline factors RSA-100 (100 decimal
+digits) end-to-end in **51.12 s** on an NVIDIA H100 SXM — the per-GPU breakdown
+is in the table below.
+
+### RSA-100 across GPU generations
+
+End-to-end RSA-100 (100-digit) full-pipeline factorization time across NVIDIA
+GPUs, ordered by CUDA-core count:
+
+| GPU | Architecture (CC) | CUDA cores | RSA-100 (full pipeline) | Version |
+|-----|-------------------|-----------:|-------------------------|---------|
+| Jetson Orin Nano Super 8 GB (25 W) | Ampere (8.7) | 1,024 | 39 m 56 s | 1.0.5 |
+| TITAN RTX 24 GB | Turing (7.5) | 4,608 | 3 m 39 s | 1.0.4 |
+| A100 SXM4 | Ampere (8.0) | 6,912 | 2 m 20 s | 1.0.4 |
+| RTX 5070 Ti 16 GB | Blackwell (12.0) | 8,960 | 1 m 25 s | 1.0.5 |
+| H100 SXM | Hopper (9.0) | 16,896 | 51.12 s | 1.0.4 |
+
+The table below lists end-to-end wall-clock time on a single RTX 5070 Ti
+(Blackwell, CC 12.0) across input sizes, using the autotuned default parameters,
+full pipeline (sieve + linear algebra + square root):
 
 | Input         | Digits | Time (s) | Hardware     |
 |---------------|--------|----------|--------------|
 | 70d composite | 70     | 1.60     | RTX 5070 Ti  |
 | 80d composite | 80     | 7.72     | RTX 5070 Ti  |
 | 90d composite | 90     | 41.36    | RTX 5070 Ti  |
-| RSA-100       | 100    | 119.49   | RTX 5070 Ti  |
+| RSA-100       | 100    | 84.72    | RTX 5070 Ti  |
 | RSA-110       | 110    | 1040.03  | RTX 5070 Ti  |
 
 Numbers reflect the full pipeline with autotuned parameters. The single large
@@ -146,7 +182,7 @@ BibTeX:
   title   = {cuda-mpqs: A GPU-accelerated Self-Initializing Multiple Polynomial
              Quadratic Sieve},
   year    = {2026},
-  version = {1.0.0},
+  version = {1.0.5},
   url     = {https://github.com/drjanosch42/cuda-mpqs},
   license = {LGPL-3.0-only}
 }

@@ -217,5 +217,28 @@ inline __host__ uint32_t reduceNumPolysToBudget(uint32_t start_num_polys,
     return num_polys;
 }
 
+// -----------------------------------------------------------------------------
+// WIDE (uint16) accumulator num_polys cap (S1, wide-autotune foundation).
+//
+// The wide-path default geometry fix (commit 27f810e) caps num_polysPerSieveCall
+// at kWideNumPolysCap in loadStandardConfig to keep the per-launch bucket-write
+// traffic bounded (an uncapped seed drives ~4096-8192 polys/call at RSA-155 M,
+// inflating bucket traffic ~8-16x). loadPartialCustomConfig — the autotune /
+// pinned-tuple / AutoApply apply path — previously set num_polysPerSieveCall
+// DIRECTLY from the tuple, so a winner could re-inflate polys and re-introduce
+// exactly the traffic the fix removed. This helper is the single place that cap
+// lives for the custom apply path; it is a NO-OP on the narrow (uint8) path
+// (wide==false returns np verbatim), so every narrow config is byte-for-byte
+// unchanged. loadStandardConfig keeps its own equivalent inline `std::min(np,
+// kWideNumPolysCap)` clamp (validated, untouched); both enforce the same cap.
+// -----------------------------------------------------------------------------
+inline constexpr uint32_t kWideNumPolysCap = 512u;
+
+inline __host__ uint32_t clampWideNumPolys(uint32_t num_polys, bool wide)
+{
+    return wide ? (num_polys < kWideNumPolysCap ? num_polys : kWideNumPolysCap)
+                : num_polys;
+}
+
 } // namespace sieve
 } // namespace mpqs

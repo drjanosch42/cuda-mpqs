@@ -14,28 +14,31 @@ Static library `mpqs_cluster`. Separable CUDA compilation ON. Namespace: `mpqs::
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `data_tap.h` | 29 | Abstract `DataTap` callback interface: `onBatchComplete()`, `shouldStop()` |
-| `direct_channel.h` | 120 | `DirectChannel`: mutex-guarded SPSC circular buffer, implements `DataTap` for coordinator Thread B -> Thread A |
-| `spsc_ring.h` | ~80 | `SPSCRing<T, N>`: lock-free single-producer single-consumer ring buffer template |
-| `async_network_data_tap.h` | ~120 | `AsyncNetworkDataTap`: SPSC ring DataTap for workers; `onBatchComplete()` <50us (memcpy into ring slot). Explicit `shutdown()`. |
-| `async_network_data_tap.cpp` | ~200 | I/O thread: serialization, batch coalescing (`mergeRelationBatches()`), TCP send, heartbeat, STOP polling |
-| `network_data_tap.h` | 10 | **Deprecated stub.** Superseded by `async_network_data_tap.h`; retained for git history only, contains no active code. |
-| `accumulator.h` | 244 | `AccumulatorQueue` (MPSC thread-safe queue), `RelationAccumulator` (single-thread dedup + counting), `FinalBatchHandoff` (blocking condition-variable handoff) |
-| `cpu_lp.h` | 73 | `CPULargePrimeTable`: CPU hash table for single large prime matching in cluster mode |
-| `cpu_lp.cu` | 140 | `CPULargePrimeTable` implementation: insert-and-match, Montgomery-based partial combination, sorted factor merge |
-| `cluster_common.h` | 181 | Wire protocol: `FrameHeader`, `MsgType` enum (17+ types incl. `CHUNK_REQUEST`), payload structs, protocol constants |
-| `comm_backend.h` | 113 | Abstract `CommBackend` interface: lifecycle, point-to-point, collective, info. Factory `createCommBackend()` |
-| `tcp_transport.h` | 63 | `TcpSocket` RAII wrapper: listen/accept/connect, length-prefixed framing + CRC32 |
-| `tcp_transport.cpp` | 289 | POSIX TCP implementation: CRC32 table-driven, buffered recv, `sendExact` with EAGAIN retry |
-| `tcp_backend.h` | 66 | `TCPBackend`: epoll-based coordinator, single-socket worker |
-| `tcp_backend.cpp` | 408 | TCP backend: HELLO/HELLO_ACK handshake, epoll multiplexing, barrier, peer management |
-| `serialization.h` | 85 | Binary serialization for `HostRelationBatch`, `WORK_ASSIGN`, and `INCREMENTAL_BATCH` |
-| `serialization.cpp` | 300 | Serialization implementation: bounds-checked `SafeReader`, CSR-aware batch encoding, backward-compatible M3 snapshot extension |
-| `work_pool.h` | 135 | `WorkPool`: thread-safe polynomial work-unit pool with tracked checkout, reclaim, single-chunk return, and cursor restore |
+| `data_tap.h` | 43 | Abstract `DataTap` callback interface: `onBatchComplete()`, `shouldStop()` |
+| `direct_channel.h` | 182 | `DirectChannel`: mutex-guarded SPSC circular buffer, implements `DataTap` for coordinator Thread B -> Thread A |
+| `spsc_ring.h` | 107 | `SPSCRing<T, N>`: lock-free single-producer single-consumer ring buffer template |
+| `async_network_data_tap.h` | 141 | `AsyncNetworkDataTap`: SPSC ring DataTap for workers; `onBatchComplete()` <50us (memcpy into ring slot). Explicit `shutdown()`, `tryTakeChunkAssign()`. |
+| `async_network_data_tap.cpp` | 271 | I/O thread: serialization, batch coalescing (`mergeRelationBatches()`), TCP send, heartbeat, STOP/RECALL/CHUNK_ASSIGN polling (sole socket reader) |
+| `network_data_tap.h` | 9 | **Deprecated stub.** Superseded by `async_network_data_tap.h`; retained for git history only, contains no active code. |
+| `accumulator.h` | 242 | `AccumulatorQueue` (MPSC thread-safe queue), `RelationAccumulator` (single-thread dedup + counting, non-consuming `peek()` for checkpoints), `FinalBatchHandoff` (blocking condition-variable handoff) |
+| `cpu_lp.h` | 86 | `CPULargePrimeTable`: CPU hash table for single large prime matching in cluster mode |
+| `cpu_lp.cu` | 170 | `CPULargePrimeTable` implementation: insert-and-match, Montgomery-based partial combination, sorted factor merge, same-`sqrt_Q` identity guard, char-bit XOR-combine |
+| `cluster_common.h` | 187 | Wire protocol: `FrameHeader`, `MsgType` enum (17 types incl. `CHUNK_REQUEST`), payload structs, protocol constants |
+| `comm_backend.h` | 136 | Abstract `CommBackend` interface: lifecycle, point-to-point, collective, info. Factory `createCommBackend()` (takes `init_timeout_ms`) |
+| `tcp_transport.h` | 77 | `TcpSocket` RAII wrapper: listen/accept/connect, length-prefixed framing + CRC32 |
+| `tcp_transport.cpp` | 327 | POSIX TCP implementation: CRC32 table-driven, buffered recv, `sendExact` with EAGAIN retry, 64 MiB `kMaxPayloadBytes` frame cap |
+| `tcp_backend.h` | 74 | `TCPBackend`: epoll-based coordinator, single-socket worker |
+| `tcp_backend.cpp` | 452 | TCP backend: HELLO/HELLO_ACK handshake, epoll multiplexing, barrier, peer management |
+| `serialization.h` | 123 | Binary serialization for `HostRelationBatch`, `WORK_ASSIGN` (v2: FB hash), and `INCREMENTAL_BATCH`; `computeFactorBaseHash()` |
+| `serialization.cpp` | 418 | Serialization implementation: bounds-checked `SafeReader`, CSR-aware batch encoding, FNV-1a factor-base hash, backward-compatible M3 snapshot extension |
+| `work_pool.h` | 159 | `WorkPool`: thread-safe polynomial work-unit pool with tracked checkout, reclaim, single-chunk return, completed-prefix cursor, and cursor restore |
 | `work_pool.cpp` | 171 | WorkPool implementation: LIFO reclaim/return queue, linear cursor fallback, per-worker in-flight tracking |
 | `chunk_scheduler.h` | 148 | `ChunkScheduler`: EMA throughput tracker, adaptive chunk sizing, contiguous range computation, default-inert debug window cap |
 | `chunk_scheduler.cpp` | 280 | Scheduler implementation: SM-proportional initial split, quantum/hypercube alignment, confidence ramp |
-| **Total** | **~3200** | |
+| **Total** | **~3600** | |
+
+The 64-bit relation dedup hash shared with the solo path lives outside this module in
+`src/common/relation_hash.h` (see [RelationAccumulator](#relationaccumulator)).
 
 ## Architecture
 
@@ -94,7 +97,7 @@ Abstract callback interface (`data_tap.h`). Injected into `SieveStage()`.
 
 | Method | Description |
 |--------|-------------|
-| `onBatchComplete(full, partials, batch_index)` | Called after each postprocessor batch. Must be non-blocking (< 50us). |
+| `onBatchComplete(full, partials, batch_index, a_values_advanced=0)` | Called after each postprocessor batch. Must be non-blocking (< 50us). `a_values_advanced`: a-values consumed since the previous call — `0` means "use the per-batch default from `setRange`"; the CUDA-graph replay loop passes the true count (`sieve_batch_size × cuda_graph_unroll`) since one replay advances `graph_N` batches but fires this callback once. Without it, the per-worker a-range guard under-counted by the unroll factor and nodes overran into each other's a-ranges, producing byte-identical duplicate partials (the cluster duplicate-partial bug, fixed `9881c00`). |
 | `shouldStop()` | Polled in sieve loop condition. Returns `true` when coordinator signals STOP. |
 
 ### DirectChannel
@@ -153,9 +156,16 @@ Single-thread dedup + counting (`accumulator.h`). Owned exclusively by Thread A.
 | `addLPRelations(batch)` | Alias for `addRelations(batch, 255)`. |
 | `targetReached()` | True when `accumulated_.num_relations >= effective_target_`. |
 | `extractFinal()` | Move-extract the accumulated batch. Accumulator is empty after this. |
+| `peek()` | Non-consuming const view of the accumulated batch (S3 coordinator checkpoint). |
 | `relationsFrom(source_id)` | Per-source breakdown for logging. |
 
-**Dedup hash:** `(len << 48) | (exp_xor << 32) | body_xor`, matching `deduplicateHostBatch` in `mpqs_soa.cu`.
+**Dedup hash:** `(len << 48) | (exp_xor << 32) | body_xor`, where `body_xor` folds
+`factor_indices·MAGIC`, sign, and `val_2_exp`. The formula is defined ONCE in
+`src/common/relation_hash.h` (`mpqs::computeRelationHash`, m-sharedTU) and delegated to by the
+accumulator, the solo checkpoint host-dedup, and the GPU `compute_relation_hashes_soa`
+(`src/postprocessing/postprocessing.cu`) — byte-for-byte agreement across all three.
+`char_bits` is deliberately NOT folded in (it is a deterministic function of `(ax+b)`, so
+including it cannot change dedup identity and would diverge from the GPU hash).
 
 ### FinalBatchHandoff
 
@@ -163,7 +173,7 @@ Blocking producer-consumer handoff (`accumulator.h`). Thread A calls `deliver()`
 
 ### NodeTelemetry
 
-Per-node telemetry struct (`accumulator.h` or `cluster_common.h`). Populated by Thread A after sieve completion and logged as a formatted table.
+Per-node telemetry struct (local to `networkLoop()` in `src/orchestrator/orchestrator.cpp`). Populated by Thread A after sieve completion and logged as a formatted table.
 
 | Field | Description |
 |-------|-------------|
@@ -189,14 +199,14 @@ Abstract communication backend (`comm_backend.h`). Decouples coordinator/worker 
 | `peerCount()`, `selfId()`, `peerInfo(id)` | Connection info. |
 | `isPeerConnected(id)`, `disconnectPeer(id)` | Peer health management. |
 
-Factory: `createCommBackend("tcp", is_coordinator, host, port, expected_workers)`.
+Factory: `createCommBackend("tcp", is_coordinator, host, port, expected_workers, init_timeout_ms = kDefaultInitTimeoutMs)`.
 
 ### TCPBackend
 
 TCP implementation of `CommBackend` (`tcp_backend.h`, `tcp_backend.cpp`).
 
-- **Coordinator mode:** `TcpSocket::listen()` on port, `epoll_create1()` for multiplexed I/O. Accept loop with 180s timeout (Jetson workers take ~80s to start). HELLO/HELLO_ACK handshake assigns worker IDs 1-254. Worker sockets set to non-blocking after handshake. Buffered recv via `recvFromEpoll()` scans all peer buffers before falling back to `epoll_wait()`.
-- **Worker mode:** Single blocking `TcpSocket::connect()`. Non-blocking recv uses 1ms timeout.
+- **Coordinator mode:** `TcpSocket::listen()` on port, `epoll_create1()` for multiplexed I/O. Accept loop bounded by `init_timeout_ms` (default `kDefaultInitTimeoutMs` = 300s, CLI `--cluster_init_timeout`; Jetson workers take ~80s of cold JIT to start). HELLO/HELLO_ACK handshake assigns worker IDs 1-254. Worker sockets set to non-blocking after handshake. Buffered recv via `recvFromEpoll()` scans all peer buffers before falling back to `epoll_wait()`.
+- **Worker mode:** `TcpSocket::connect()` with retry every `kConnectRetryIntervalMs` (5s) within the same `init_timeout_ms` window. Non-blocking recv uses 1ms timeout.
 
 ### TcpSocket
 
@@ -208,7 +218,7 @@ RAII TCP socket wrapper (`tcp_transport.h`, `tcp_transport.cpp`). Length-prefixe
 | `accept()` | Blocking accept, returns new `TcpSocket` with `TCP_NODELAY`. |
 | `connect(host, port)` | Client connect with DNS resolution fallback. |
 | `sendMsg(type, payload, len)` | Frame: `FrameHeader + payload + CRC32`. |
-| `recvMsg(type, payload)` | Buffered recv: accumulates partial frames in `recv_buf_`. |
+| `recvMsg(type, payload)` | Buffered recv: accumulates partial frames in `recv_buf_`. Rejects any frame whose `payload_len` exceeds `kMaxPayloadBytes` = 67,108,864 (64 MiB, `tcp_transport.cpp:222`) — the frame cap that a full-FB `WORK_ASSIGN` (~105 MB at F=500M) used to trip before the FB-hash fix (`b220a61`). |
 
 ### WorkPool
 
@@ -217,13 +227,15 @@ Thread-safe polynomial work-unit pool (`work_pool.h`, `work_pool.cpp`). Tracked-
 | Method | Description |
 |--------|-------------|
 | `WorkPool(a_start, total_a, unit_size=64)` | Linear cursor from `a_start` to `a_start + total_a`. |
-| `checkoutWork(count, worker_id)` | Returns `CheckedOutWork` with unique `chunk_id`. Serves reclaimed work before linear cursor. |
+| `checkoutWork(count, worker_id)` | Returns `optional<CheckedOutWork>` with unique `chunk_id`. Serves reclaimed work before linear cursor. |
 | `completeChunk(chunk_id)` | Remove from in-flight tracking. |
-| `returnChunk(chunk_id)` | Return a single checked-out chunk to the assignable (`returned_`) pool without consuming any of it — used when a `CHUNK_ASSIGN` send fails so the chunk can be re-dispatched immediately. No-op if not in flight. |
-| `reclaimWork(worker_id)` | Reclaim all in-flight chunks for a dead worker (returned to LIFO queue). |
-| `reclaimPartial(worker_id, chunk_id)` | Reclaim a specific in-flight chunk from a straggler (CHUNK_RECALL path). |
-| `remaining()`, `exhausted()`, `inFlight()` | Pool status queries. |
-| `setCursor(cursor)` | Restore from checkpoint (startup only). |
+| `returnChunk(chunk_id)` | Return a single checked-out chunk to the assignable (`returned_`) pool without consuming any of it — used when a `CHUNK_ASSIGN` send fails so the chunk can be re-dispatched immediately. Returns the a-value count returned (0 if not in flight). |
+| `reclaimWork(worker_id)` | Reclaim all in-flight chunks for a dead worker (returned to LIFO queue). Returns total a-values reclaimed. |
+| `reclaimPartial(chunk_id, consumed_count)` | Reclaim the unconsumed tail of a specific in-flight chunk from a straggler (CHUNK_RECALL path); equivalent to `completeChunk` when fully consumed. |
+| `remaining()`, `exhausted()`, `inFlight()`, `inFlightFor(worker_id)`, `remainingOrInFlight()` | Pool status queries. |
+| `nextCursor()` | Raw linear cursor `next_` (diagnostics only — drops in-flight/returned chunks). |
+| `completedPrefixCursor()` | `min(next_, min start over in_flight_ ∪ returned_)` — the checkpoint-safe cursor (see Coordinator Checkpointing below). |
+| `setCursor(cursor)` | Restore from checkpoint (startup only; asserts clean state). |
 
 ### ChunkScheduler
 
@@ -247,11 +259,13 @@ CPU-side single large prime hash table (`cpu_lp.h`, `cpu_lp.cu`). Replaces GPU `
 
 | Method | Description |
 |--------|-------------|
-| `CPULargePrimeTable(lp1_bound, fdata)` | Initialize Montgomery context from N. Reserve 1M buckets. |
+| `CPULargePrimeTable(lp1_bound, fdata)` | Initialize Montgomery context from N. |
 | `insertAndMatch(partials, accumulator)` | Insert new partials, combine matches into full relations via Montgomery multiply. |
-| `witnesses()`, `totalInserts()`, `totalMatches()`, `totalCombines()` | Telemetry. |
+| `witnesses()`, `totalInserts()`, `totalMatches()`, `totalCombines()`, `totalDupDropped()` | Telemetry. |
 
-**Combination:** Two partials with matching LP value p are combined: `sqrt_Q = a*b mod N` (Montgomery), `sign = XOR`, `val_2_exp = sum`, factors merged via sorted merge with exponent summation.
+**Combination:** Two partials with matching LP value p are combined: `sqrt_Q = a*b mod N` (Montgomery), sign via encoding-agnostic XOR of the "negative iff `!= 1`" booleans (M11c pattern — output encoded `{1, 0xFF}`), `val_2_exp = sum`, `char_bits = XOR` (Stage 5 branch-character combine), factors merged via sorted merge with exponent summation.
+
+**Identity guard:** a match whose two partials share the same `sqrt_Q` (byte-identical cross-node duplicate) is dropped and counted in `totalDupDropped()` — combining them would yield a perfect square (`X == Y`) and a trivial sqrt (defense-in-depth for the duplicate-partial pathology fixed in `9881c00`).
 
 ## Communication Protocol
 
@@ -267,12 +281,12 @@ Every message is framed as:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `magic` | `uint16_t` | `0x4D51` ("MQ") |
+| `magic` | `uint16_t` | `0x4D52` ("MR") — bumped from `0x4D51` ("MQ") with the v2 WORK_ASSIGN layout so a stale binary fails fast at the frame-magic check instead of mis-parsing |
 | `msg_type` | `uint8_t` | `MsgType` enum value |
 | `seq_no` | `uint32_t` | Monotonic per-connection sequence number |
-| `payload_len` | `uint32_t` | Byte length of payload (excludes header and CRC) |
+| `payload_len` | `uint32_t` | Byte length of payload (excludes header and CRC); rejected above `kMaxPayloadBytes` (64 MiB) |
 
-CRC32 covers header + payload (polynomial 0xEDB88320, table-driven). All platforms are little-endian (static assertion enforced).
+CRC32 covers header + payload (polynomial 0xEDB88320, table-driven). All platforms are little-endian (static assertion enforced). All frames share the magic, enforcing all-or-nothing build lockstep across the cluster.
 
 ### Message Types
 
@@ -280,7 +294,7 @@ CRC32 covers header + payload (polynomial 0xEDB88320, table-driven). All platfor
 |------|------|-----------|---------|-------------|
 | `HELLO` | 0x01 | W -> C | `HelloPayload` (88B) | Worker registration: GPU name, SM version, SMs, VRAM, capacity, resume fields |
 | `HELLO_ACK` | 0x02 | C -> W | `HelloAckPayload` (2B) | Accept + assign worker_id (1-254) |
-| `WORK_ASSIGN` | 0x10 | C -> W | Variable | N + factor base + sieve params + poly range + AFactorsSnapshot |
+| `WORK_ASSIGN` | 0x10 | C -> W | Variable (~220 B, F-independent) | N + FB hash + sieve params + poly range + AFactorsSnapshot; worker regenerates + verifies the FB |
 | `WORK_MORE` | 0x11 | C -> W | `WorkMorePayload` (16B) | Additional poly range |
 | `WORK_REQUEST` | 0x12 | W -> C | -- | Request more work |
 | `CHUNK_ASSIGN` | 0x13 | C -> W | `ChunkAssignPayload` (24B) | Chunk of a-values with flags (initial/final/overflow) |
@@ -302,6 +316,9 @@ CRC32 covers header + payload (polynomial 0xEDB88320, table-driven). All platfor
 ```
 [num_relations:u32][num_factors:u32]
 [sqrt_Q: N*64B][signs: N*1B][val_2_exps: N*4B][large_primes: N*16B]
+[char_bits: N*4B]                                -- Stage 4 branch char vector (always present;
+                                                 --   a defined 0 under --char_mode norm; never
+                                                 --   enters the dedup hash)
 [factor_offsets: (N+1)*8B][factor_indices: NNZ*4B][factor_counts: NNZ*1B]
 ```
 
@@ -310,17 +327,31 @@ CRC32 covers header + payload (polynomial 0xEDB88320, table-driven). All platfor
 [full_data_len:u32][full_batch_data][partial_data_len:u32][partial_batch_data]
 ```
 
-**WORK_ASSIGN** (`serializeWorkAssign`):
+**WORK_ASSIGN** (`serializeWorkAssign`, v2 layout — protocol magic 0x4D52):
 ```
 [N:64B][fb_size:u32][M:u32][F:u32][sieve_batch_size:u32]
 [shc_dim:u8][pad:3B][threshold_override:u64][lp1_bound:u64]
 [poly_range_start:u64][poly_range_count:u64][target_relations:u64]
-[factorBase: fb_size*4B][rootN: fb_size*4B]
+[fb_hash:u64]                                    -- computeFactorBaseHash(fdata); REPLACES the
+                                                 --   former [factorBase][rootN] blob, making the
+                                                 --   payload F-independent (~220 B vs >64 MiB at
+                                                 --   RSA-155 F=500M, which exceeded the frame cap)
 [snapshot_dim:u32][snapshot_a_factors: dim*4B]  -- M3 extension (optional)
 [lowerHalfStart:u32][upperHalfStart:u32]
 ```
 
-M3 snapshot extension is backward-compatible: M2-era messages without snapshot fields are accepted.
+**Factor-base hash + regen-and-verify:** `computeFactorBaseHash(fdata)` (`serialization.h`) is a
+canonical 64-bit FNV-1a over the raw bytes of `fb_size` (u32), then `factorBase[]` (u32 primes,
+ascending), then `rootN[]` (u32 normalized roots, index-aligned) — the SINGLE hash used by both
+sides, never duplicated. `deserializeWorkAssign` does NOT populate `fdata.factorBase/rootN`; the
+worker regenerates the FB locally from the coordinator's authoritative `(N, F)` via the
+deterministic `generateFactorBase()`, recomputes the hash, and verifies it (plus `fb_size`)
+before sieving — on any mismatch it logs `LOG_ERROR_CRITICAL` "factor-base hash mismatch" and
+exits rather than sieving a divergent FB (`orchestrator.cpp:397`). Raw-byte hashing assumes a
+homogeneous little-endian cluster (static-assert enforced). Fix commit `b220a61`; validated at
+cluster scale by the F=500M A100 valprobe (job 33466828).
+
+M3 snapshot extension is backward-compatible: v2-magic messages without snapshot fields are accepted.
 
 All deserialization uses a bounds-checked `SafeReader` that tracks position and validates remaining buffer length before every read.
 
@@ -411,14 +442,17 @@ The I/O thread in `AsyncNetworkDataTap` ensures heartbeats continue during graph
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `kProtocolMagic` | `0x4D51` | Frame magic ("MQ") |
-| `kProtocolVersion` | 1 | Wire protocol version |
+| `kProtocolMagic` | `0x4D52` | Frame magic ("MR"); bumped from `0x4D51` with the v2 WORK_ASSIGN layout |
+| `kProtocolVersion` | 2 | Wire protocol version (defined for future handshake use, NOT transmitted in `FrameHeader` — cross-version rejection is via the magic) |
 | `kDefaultPort` | 9100 | Default TCP port |
+| `kDefaultInitTimeoutMs` | 300000 | Init window: coordinator accept + worker connect-retry (300s; Jetson cold JIT ~80s) |
+| `kConnectRetryIntervalMs` | 5000 | Worker connect retry interval during init window |
 | `kHeartbeatIntervalMs` | 5000 | Background heartbeat period |
 | `kFlushTimeoutMs` | 120000 | Flush/heartbeat timeout (120s, for Jetson graph capture) |
 | `kBatchSendThreshold` | 1000 | Relations per send trigger |
 | `kBatchSendCeilingMs` | 10000 | Maximum time between sends |
 | `kCRC32Size` | 4 | CRC32 trailer size |
+| `kMaxPayloadBytes` | 67108864 | 64 MiB per-frame payload cap (`tcp_transport.cpp:222`, local to `recvMsg`) |
 
 ## Coordinator Checkpointing and Resume
 
@@ -519,3 +553,4 @@ See `tools/cluster/rsa140_a100_4node_pc2.sbatch` (production) and
 - **Thread B range enforcement:** Coordinator Thread B may slightly overshoot its assigned contiguous range due to batch quantization.
 - **Heartbeat timeout during graph capture:** `AsyncNetworkDataTap`'s I/O thread sends heartbeats independently of the sieve loop, so CUDA graph compilation does not cause timeouts. Workers must still complete their first graph replay within `kFlushTimeoutMs` (120s) for the SPSC ring not to overflow; Jetson workers with `cuda_graph_unroll=8` are near this limit.
 - **LP below 85 digits:** LP causes 100% sqrt failure below ~85 digits due to a-factor/sieve-prime structural dependence. This is a mathematical limitation, not a cluster-specific bug. LP is disabled below 85 digits.
+- **Coordinator single-threaded CPU LP-matching ceiling:** `CPULargePrimeTable::insertAndMatch` (`cpu_lp.h`/`cpu_lp.cu`) is explicitly not thread-safe (`cpu_lp.h:39`) and owns a single `std::unordered_map<uint64_t, PartialRelation> table_` (`cpu_lp.h:78`) — all cross-node LP matching runs on one coordinator CPU thread regardless of GPU count. Empirical throughput ceiling **~3,200–3,500 witnesses/s**: 32 GPU/L=200T sustains 1,731.8 witnesses/s cleanly, but 64 GPU (production scale) already shows ~8.4% sub-linear scaling off the linear projection. A **108-GPU (27-node) scale-up was evaluated and REJECTED** on this basis (2026-07-15) — it would offer ~6,060 witnesses/s, but the coordinator saturates well before that, wasting ~44 GPUs. Host RAM is the other constraint: ~110–120M accumulated witnesses ≈ ~35–50 GB coordinator RAM; **`--lp1_max_witnesses` does not bound `table_`** (it sizes the solo-mode GPU `LargePrimeVariant` capacity instead) — only lowering the LP bound `L` shrinks the coordinator's table. Future lever: hash-shard the witness table, or pool-allocate `PartialRelation` instead of its 2 per-entry `std::vector`s.

@@ -6,10 +6,10 @@ Main driver binary and auxiliary test utilities for the MPQS pipeline.
 
 | File | Lines | Build Target | Purpose |
 |------|-------|-------------|---------|
-| `cuda-mpqs.cpp` | ~700 | `cuda-mpqs` | Primary driver: CLI parsing, orchestrator invocation, factor verification, bootstrap mode |
+| `cuda-mpqs.cpp` | ~1300 | `cuda-mpqs` | Primary driver: CLI parsing, orchestrator invocation, factor verification, bootstrap mode |
 | `tools/sqrt_failure/relation_validator.cu` | -- | `relation_validator` | Standalone host-side relation + large-prime validator (see below) |
-| `sqrt_benchmark.cpp` | 135 | `bench_sqrt` (`EXCLUDE_FROM_ALL`) | **Stale**: uses old AoS `Relation` API; kept for reference but not functional with current SoA pipeline |
-| `sieving_benchmark.cpp` | 317 | *(not in build)* | **Stale**: development-only isolated sieve + postprocessing via low-level API; no build target |
+| `sqrt_benchmark.cpp` | 142 | `bench_sqrt` (`EXCLUDE_FROM_ALL`) | **Stale**: uses old AoS `Relation` API; kept for reference but not functional with current SoA pipeline |
+| `sieving_benchmark.cpp` | 324 | *(not in build)* | **Stale**: development-only isolated sieve + postprocessing via low-level API; no build target |
 | `mpqs_analyzer.html` | -- | -- | Browser-based analysis/visualization artifact |
 
 ## CLI Reference (cuda-mpqs)
@@ -23,6 +23,9 @@ Main driver binary and auxiliary test utilities for the MPQS pipeline.
 | `--device` | `<id>` | GPU device (default: 0) |
 | `--dir` | `<path>` | Work directory (default: `./mpqs_work`) |
 | `--disk_io` | -- | Enable disk serialization between stages |
+| `--dump_matrix` | -- | Diagnostic: dump finalized matrix (CSR binary + column legend) to work dir |
+| `--dump_kernel_vectors` | -- | Diagnostic: enable BW solution writer + dump original-relation-space kernel vectors |
+| `--dump_combine_provenance` | -- | Diagnostic: serialize LP-combine constituents to `combine_provenance.bin` (opt-in; no effect on the factorization path when unset) |
 
 ### Tuning and Sieving
 
@@ -30,21 +33,39 @@ Main driver binary and auxiliary test utilities for the MPQS pipeline.
 |------|----------|-------------|
 | `--fb_bound` | `<n>` | Factor base bound F (0 = auto) |
 | `--sieve_bound` | `<n>` | Sieve interval half-width M (0 = auto) |
+| `--sieve_hc_dim` | `<n>` | SIQS hypercube dimension (0 = auto) |
 | `--lp1_bound` | `<n>` | Large prime bound (0 = disabled) |
-| `--lp1_max_witnesses` | `<SIZE>` | Max LP witness capacity; accepts K/M suffix, snaps to power of 2 (default: 1M) |
+| `--lp1_max_witnesses` | `<SIZE>` | Max LP witness capacity; accepts K/M suffix, snaps to power of 2 (default: 0 = auto-derived) |
 | `--target_rels` | `<n>` | Target relation count (0 = auto) |
 | `--dedup_safety_factor` | `<F>` | Dedup oversample margin (default: 1.05; auto 1.35 for <80d). Warns outside [1.0, 2.0] |
 | `--sieve_batch_size` | `<n>` | Batch GPU sieving (0 = legacy host-driven) |
 | `--cuda_graph_unroll` | `<n>` | Capture N sieve batches as a CUDA graph for replay (0 = disabled, default 0). Must be even (rounded up if odd); capped at 16 |
-| `--lp_interval` | `<n>` | LP processing frequency (0 = auto/adaptive, N>0 = every N batches) |
+| `--lp_interval` | `<n>` | LP processing frequency (default: 1; 0 = auto/adaptive, N>0 = every N batches) |
 | `--sieve_gms_blocks` | `<n>` | MetaSieve CUDA blocks (0 = auto) |
+| `--sieve_meta_cycle_cap` | `<n>` | Cap `num_activeBlocksPerCycle` in the meta-sieve (ablation knob; 0 = off) |
+| `--sieve_gather_block_dim` | `<n>` | GATHER-kernel blockDim occupancy override; power of two in [32, 1024]; 0 = off (loader default) |
+| `--bucket_size_factor` | `<F>` | Wide-path bucket sizing: `globalBucketSize = F·SB` (F=0.5 == legacy SB/2; 0 = off/legacy). Rejects F < 0 |
+| `--sieve_accumulator` | `<auto\|u8\|u16>` | Sieve log-accumulator width (default auto: dispatch predicate decides; u8/u16 force narrow/wide) |
+| `--wide_accum` | `<auto\|u8sat\|u16>` | Wide-regime accumulator variant (default auto: saturating-uint8 iff the exactness gate holds, else uint16) |
+| `--autotune_probe_polys` | `<n>` | Wide-autotune survivors/sec probe sample size (# distinct staged polynomials; 0 = auto-scale by N) |
 | `--probe_timeout` | `<sec>` | Hard timeout for sieve probes (default: 120.0) |
 | `--sieve_max_relations` | `<n>` | Stop sieve after N relations; K/M/B/T suffix (0 = disabled) |
 | `--sieve_max_batches` | `<n>` | Stop sieve after N batch iterations (0 = disabled) |
 | `--sieve_truncate_continue` | -- | Continue pipeline (matrix/BW/sqrt) after truncation |
 | `--params` | `<p1,...,p8>` | Custom 8-element sieve parameter tuple |
 
-`--sieve_hc_dim <n>` (hypercube dimension) is parsed but intentionally omitted from the help text.
+Numeric-bound flags (`--lp1_bound`, `--lp1_max_witnesses`, `--sieve_max_relations`,
+`--matrix_lp1_bound`) parse **decimal** suffixes via `parse_suffixed_uint64` (K = 10³, M = 10⁶,
+B = 10⁹, T = 10¹²) — distinct from the base-1024 `parse_size` used by the buffer-size flags below.
+
+### Sieve Checkpointing (default-off)
+
+| Flag | Argument | Description |
+|------|----------|-------------|
+| `--checkpoint_interval` | `<sec>` | Wall-seconds between mid-sieve checkpoints (0 = disabled) |
+| `--checkpoint_batches` | `<n>` | Alternative interval in sieve batches (fires first if both set; 0 = disabled) |
+| `--checkpoint_dir` | `<path>` | Checkpoint directory (default `""` → `<work_dir>/checkpoint`) |
+| `--resume` | -- | Load `sieve.ckpt` from `checkpoint_dir` and continue; warns and starts fresh if absent |
 
 ### Buffer Sizing
 
@@ -55,7 +76,7 @@ All buffer size flags accept K/M suffixes (base-1024, e.g. `512K`, `4M`).
 | `--accum_buf_size` | `max(4096, batch_size·2048)` | Accumulation buffer capacity |
 | `--partial_buf_size` | `= accum` (1×) | Partial (LP staging) buffer; only when `--lp1_bound > 0` |
 | `--persistent_buf_size` | `target·2 + accum` | Persistent relation store |
-| `--lp1_combined_buf` | 32K | LP match output buffer |
+| `--lp1_combined_buf` | 0 = auto (32768) | LP match output buffer |
 | `--lp1_hash_bits` | auto | LP hash table directory bits |
 
 ### Execution Modes
@@ -69,7 +90,7 @@ All buffer size flags accept K/M suffixes (base-1024, e.g. `512K`, `4M`).
 | `--sqrt_only` | Load kernel vectors + sqrt (**BROKEN** — use `--linalg_only` instead) |
 | `--param_test` | Parameter exploration (exits after sieve) |
 | `--sqrt_legacy` | Force CPU sqrt path (debug/benchmark; default: GPU batched) |
-| `--sqrt_diagnostic` | Log extra sqrt diagnostics: per-solution nontrivial-GCD rate (`k/n`) per BW solution, HalveExponents validity, solution diversity (at `LOG_DEBUG_1`; pair with `--log_file`) |
+| `--sqrt_diagnostic` | Log solution-diversity statistics (distinct BW solutions by hash) at `LOG_INFO`. The per-solution nontrivial-GCD rate (`LOG_DEBUG_1`) and HalveExponents validity (`LOG_WARNING`) are logged unconditionally regardless of this flag — pair with `--debug --log_file` to capture them |
 | `--estimate_only` | Run truncated sieve probe + print runtime estimate, then exit |
 
 `--autotune_only` (sets `AUTOTUNE_ONLY` mode) and `--autotune_bootstrap` (bootstrap mode) are documented in the Autotune section.
@@ -90,6 +111,11 @@ All buffer size flags accept K/M suffixes (base-1024, e.g. `512K`, `4M`).
 | `--matrix_gf2_min_floor` | `<N>` | M12-S2: absolute minimum GF(2) column floor (default: 8192) |
 | `--partial_subsample` | `<F>` | Subsample partials/LP-combined for `--matrix_only` experiments ([0.0,1.0], default: 1.0) |
 | `--smooth_subsample` | `<F>` | Subsample pure smooths (LP-combined always kept) for `--matrix_only` experiments ([0.0,1.0], default: 1.0) |
+| `--matrix_lp1_bound` | `<L>` | `--matrix_only` LP-magnitude down-filter (K/M/B/T suffix): drop LP-combined relations with large prime > L after `.v2` load; pure smooths never dropped (default: 0 = inert) |
+| `--truncation_min_rows` | `<N>` | Skip CPU-preprocess truncation when the reduced matrix has ≤ N rows (default: 5,000,000) |
+| `--preprocess_lp_materialize_max` | `<F>` | Max combined-smooth LP fraction above which preprocess skips materializing raw-1-partial 2-cycle rows (default: 0.45) |
+| `--merge_max_weight` | `<K>` | Diagnostic: CPU-preprocess `mergeHigherWeight` k_max (default: 10; 2 disables weight≥3 merges) |
+| `--force_preprocess` | -- | Diagnostic: force the expand+merge path even with 0 raw partials |
 
 `--matrix_only` is listed in the Execution Modes table above.
 
@@ -107,6 +133,7 @@ Flag names and defaults mirror [`cluster.md`](cluster.md) and the [cluster usage
 | `--cluster_init_timeout` | `<sec>` | Init window: worker retries + coordinator accept (default: 300) |
 | `--cluster_node_weights` | `<w1,...>` | Comma-separated per-node throughput weights (overrides SM×clock) |
 | `--cluster_headroom` | `<pct>` | Per-node headroom percent (default: 10) |
+| `--cluster_pool_oversize` | `<F>` | a-value pool over-provisioning multiplier (default: 1.0) |
 
 The `MPQSConfig::transport` field ("tcp", default) exists in `orchestrator.h` but is **not** wired to a CLI flag — there is no `--transport` parser entry; TCP is the only transport.
 
@@ -178,7 +205,8 @@ Requires `--autotune_candidates <file>`. Loads candidate composites (one decimal
 
 `tools/sqrt_failure/relation_validator.cu` builds the `relation_validator` executable: a host-side,
 CPU-only exhaustive correctness checker for a saved relations file (`.v2` or `.soa`, loaded via
-`detect_and_deserialize`). It independently re-derives every relation from scratch — it does not
+`detect_and_deserialize`; also accepts a `sieve.ckpt` checkpoint file or a checkpoint directory,
+and takes an optional `--out <summary.json>`). It independently re-derives every relation from scratch — it does not
 trust what the GPU sieve/postprocessing recorded — and, crucially, runs a **deterministic primality
 test on every recorded large prime**. Per relation (smooths and partials) it checks:
 
@@ -190,10 +218,12 @@ test on every recorded large prime**. Per relation (smooths and partials) it che
 Compiled as CUDA (for the `__host__ __device__` math headers) but launches no kernels; parallelised
 with OpenMP. Not registered as a CTest target (it takes a relations-file argument).
 
-## CTest Targets (branch-fixed character columns, Stages 1–6)
+## CTest Targets (13)
 
-Six regression tests are registered with CTest (`add_test`), all CPU-only host tests compiled as
-CUDA. They certify the branch-fixed character-column machinery end to end:
+Thirteen regression tests are registered with CTest (`add_test`), all CPU-only host tests compiled
+as CUDA (no kernel launches; deterministic).
+
+**Branch-fixed character columns, Stages 1–6** (7 tests):
 
 | Test (`add_test` name) | Stage | Certifies |
 |------|-------|-----------|
@@ -206,6 +236,22 @@ CUDA. They certify the branch-fixed character-column machinery end to end:
 
 The Stage-3 fixture (`branch_char_fixture.h`) is regenerated at build time from the Python reference
 so it tracks the genus prototype.
+
+**Autotune / wide-path guards** (2 tests, sources under `tools/autotune/`):
+
+| Test | Certifies |
+|------|-----------|
+| `oom_guard` | Autotune OOM-guard decision logic: `sieve_memory_model.h` estimator + 0.80 budget + `KernelLaunchValidator::fitsTotalFootprint` + seed-reduction loop. Asserts no clamps at pinned M=131072 and that a synthetic over-budget config fires the guard. Skips cleanly without a CUDA device |
+| `wide_num_polys_clamp` | `clampWideNumPolys()` in the custom apply path: an autotune/pinned winner can never re-inflate `num_polysPerSieveCall` past 512 on the wide path; byte-for-byte no-op on narrow |
+
+**Checkpoint / cluster resume / wire format** (4 tests, sources under `tools/sqrt_failure/`):
+
+| Test | Certifies |
+|------|-----------|
+| `checkpoint_io` | `deserialize_v2` trailing-bytes tolerance; `writeCheckpointAtomic`/`readCheckpoint` round-trip; `.prev` retention, torn-footer rejection, `loadLatestCheckpoint` fallback |
+| `work_pool_cursor` | `WorkPool::completedPrefixCursor()` returns the completed contiguous prefix (min over in-flight ∪ returned), not `nextCursor()` |
+| `cluster_resume` | `computeResumeTrim` per-node initial-range trim (+ re-sieve-last-hypercube guard), `clusterResumeTopologyOk` N2 topology guard, re-inject ordering (`addRelations` rebuilds dedup before partial combines) |
+| `work_assign_hash` | v2 `WORK_ASSIGN` wire format: FB-hash round-trip with fb_size-independent payload (the 64 MiB frame-cap fix), `generateFactorBase(N, F)` regen-equivalence, mismatch detection (fail-loud worker path) |
 
 ## Built-in Test Numbers
 
@@ -244,9 +290,8 @@ target_link_libraries(cuda-mpqs PRIVATE
 | File | Description |
 |------|-------------|
 | `candidates.txt` | Semiprime test composites (two prime factors) for standard benchmarking |
-| `non-rsa-candidates.txt` | Multi-factor composites: 3/4 coprime factors, prime powers, mixed p^2×q×r forms (60–90 digits) |
-
-`multi_factor_candidates.txt` was removed — it was byte-identical to `non-rsa-candidates.txt`.
+| `non-rsa-candidates.txt` | Large multi-factor composites: 3/4 coprime factors, prime powers, mixed p^2×q×r forms (60–90 digits; `tools/generate_test_composites_large.py`, seed=2026) |
+| `multi_factor_candidates.txt` | Small multi-factor composites for M10 BCD (coprime refinement) testing (`tools/generate_test_composites.py`, seed=42) |
 
 ## Factor Verification
 

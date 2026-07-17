@@ -12,8 +12,8 @@ authors:
     given-names: Christoph
   - family-names: Januszewski
     given-names: Fabian
-version: "1.0.0"
-date-released: "2026-06-01"
+version: "1.0.5"
+date-released: "2026-07-17"
 license: LGPL-3.0-only
 repository-code: "https://github.com/drjanosch42/cuda-mpqs"
 url: "https://github.com/drjanosch42/cuda-mpqs"

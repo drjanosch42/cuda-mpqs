@@ -745,9 +745,13 @@ __global__ void BatchedGCDKernel(
         return;
     }
 
-    // 3. Sum: X + Y (wrapping at 512 bits, matching CPU)
+    // 3. Sum: (X + Y) mod N. Since gcd(X+Y, N) = gcd((X+Y) mod N, N), reducing
+    //    mod N is OUTPUT-identical to the legacy add for N < 2^511 (X+Y < 2^512,
+    //    no wrap) and overflow-safe at N >= 2^511 (RSA-155), where X+Y reaches ~2N
+    //    and the bare 512-bit add would wrap mod 2^512 and corrupt the gcd.
+    //    X, Y are residues (< N), so add_mod's precondition holds.
     mpqs::uint512 sum = Xj;
-    sum.add(Yj);
+    sum.add_mod(Yj, N);
 
     // 4. f2 = gcd(X + Y, N)
     mpqs::uint512 f2 = mpqs::math::gcd(sum, N);
@@ -1793,9 +1797,11 @@ std::pair<mpqs::uint512, mpqs::uint512> SquareRootRefinement::Perform(
     
     mpqs::uint512 factor1 = mpqs::math::gcd(diff, N_);
 
-    // Factor2 = GCD(X + Y, N)
+    // Factor2 = GCD(X + Y, N). Use (X+Y) mod N: gcd(X+Y,N) = gcd((X+Y) mod N, N),
+    // so this is OUTPUT-identical for N < 2^511 and overflow-safe at N >= 2^511
+    // (RSA-155). X, Y are residues (< N). See device BatchedGCDKernel.
     mpqs::uint512 sum = X;
-    sum.add(Y);
+    sum.add_mod(Y, N_);
     mpqs::uint512 factor2 = mpqs::math::gcd(sum, N_);
 
     LOG(LOG_STATS) << "Candidates: " << factor1.to_string() << ", " << factor2.to_string();

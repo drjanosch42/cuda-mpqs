@@ -658,16 +658,13 @@ __global__ __launch_bounds__(256, 1) void debug_validate_soa_kernel(
         diff = sqrt_Q_val;
         diff.mul_mod(sqrt_Q_val, N);
     } else {
-        // Exact path: LHS = |sqrt_Q² - N|
-        mpqs::uint512 val_sq = square_uint512(sqrt_Q_val);
-        if (val_sq < N) {
-            is_negative_residue = true;
-            diff = N;
-            diff.sub(val_sq);
-        } else {
-            diff = val_sq;
-            diff.sub(N);
-        }
+        // Exact path: LHS = |sqrt_Q² - N|. The square (~2N) overflows uint512 for
+        // N >= 2^511 (RSA-155), so form it in a 1024-bit accumulator via
+        // abs_square_minus_N (STRICT NO-OP for N < 2^511 — bit-identical to the
+        // legacy square_uint512 + |.-N|). Keeps relation_validator exact at 512-bit N.
+        int8_t sq_sign;
+        diff = mpqs::abs_square_minus_N(sqrt_Q_val, N, sq_sign);
+        is_negative_residue = (sq_sign < 0);
     }
 
     // 2. Check Sign Consistency (single relations only)

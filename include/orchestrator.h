@@ -156,6 +156,8 @@ struct MPQSConfig {
                                       ///< exceeds this value; pure smooths (large_primes <= 1) are NEVER dropped.
                                       ///< 0 = inert (default; legacy behavior unchanged). Distinct from --lp1_bound
                                       ///< (the sieve bound, restored from metadata at load). CLI: --matrix_lp1_bound
+    uint64_t matrix_max_rows = 0;    ///< Cap legacy relation-batch rows before matrix build (0=off); used to keep
+                                      ///< padded n_cols <= 2^24-1 so TiledCOO-256 stays admissible. CLI: --matrix_max_rows
     double truncation_factor = 1.05; ///< Matrix truncation enable flag. > 0 = enabled, 0 = disabled.
                                       ///< Per M12-S1 the actual target is char-col-aware and excess-based:
                                       ///<   target_rows = n_cols + n_extra_cols + matrix_truncation_excess.
@@ -183,6 +185,43 @@ struct MPQSConfig {
     uint32_t sieve_bound = 0;      // 0 = Auto-calculate "M"
     uint32_t sieve_hcube_dimension = 0;  // 0 = Auto-calculate
     uint32_t sieve_batch_size = 0;       // 0 = Auto-calculate
+    int sieve_accumulator_mode = 0;      ///< CLI: --sieve_accumulator auto|u8|u16.
+                                         ///< 0 = auto (dispatch predicate decides), 1 = force u8, 2 = force u16.
+    int sieve_wide_accum_mode = 0;       ///< CLI: --wide_accum auto|u8sat|u16 (Option A). Only consulted
+                                         ///< in the wide regime. 0 = auto (saturating-uint8 iff the exactness
+                                         ///< gate APV_max-threshold<=254 holds, else uint16), 1 = force u8sat
+                                         ///< (gate-honoured), 2 = force uint16.
+    uint32_t sieve_meta_cycle_cap = 0;   ///< CLI: --sieve_meta_cycle_cap. A2 meta-sieve SCATTER
+                                         ///< locality knob. 0 = OFF (exact legacy geometry). N>0 caps
+                                         ///< num_activeBlocksPerCycle at min(pow2_floor(N), current) and
+                                         ///< raises num_metaSieveCycles = num_sievingBlocksPerSieveCall /
+                                         ///< cap (exact — both powers of two), bounding each thread's
+                                         ///< bucket-write destination spread independent of M. Coverage
+                                         ///< of [-M,M) is preserved exactly (cycles partition the blocks).
+    uint32_t sieve_gather_block_dim = 0; ///< CLI: --sieve_gather_block_dim. A/B knob for the GATHER
+                                         ///< (sieve-and-scan) kernel's blockDim (ss_conf.num_threadsPerBlock).
+                                         ///< 0 = OFF (loader-derived, currently 256 — byte-identical legacy).
+                                         ///< N>0 overrides the sieve-and-scan threads-per-block. blockDim is a
+                                         ///< RESULT-INVARIANT performance knob here (accumulator is sized per
+                                         ///< sieving-block, not per-thread; all work loops stride by blockDim),
+                                         ///< so relations/witnesses are identical across values — only occupancy
+                                         ///< changes. Must be a power of two in [32,1024] (downstream POW2_CHECK).
+    double sieve_bucket_size_factor = 0.0; ///< CLI: --bucket_size_factor. Ablation knob decoupling the
+                                         ///< large-prime bucket capacity from the legacy globalBucketSize=SB/2.
+                                         ///< 0.0 = OFF (legacy SB/2 — byte-identical on ALL paths: narrow uint8,
+                                         ///< wide uint16, wide u8sat). F>0 sizes globalBucketSize = F*SB (so
+                                         ///< F=0.5 reproduces legacy; F=1.0 DOUBLES the bucket). Larger buckets
+                                         ///< reduce the silent bucket-overflow discard root-caused in the
+                                         ///< 2026-07-10 A100 uint16 degenerate-baseline analysis.
+                                         ///< The bucket buffer scales with it; the VRAM budget reduction and the
+                                         ///< config validator both account for the resized bucket, so a too-large
+                                         ///< F degrades num_polys (or is rejected) rather than OOM-crashing.
+    uint32_t autotune_probe_polys = 0;   ///< CLI: --autotune_probe_polys. Wide-autotune survivors/sec
+                                         ///< probe sample size (# DISTINCT polynomials staged; every
+                                         ///< candidate re-sieves the SAME sample, so this is the actual
+                                         ///< sample the objective sees). 0 = auto-scale by N (per-poly
+                                         ///< survivor density falls with N, so larger N needs more polys
+                                         ///< to keep the sample non-empty). Wide path only; narrow ignores.
     uint32_t sieve_gms_num_blocks = 0;   // 0 = Auto-calculate
     uint32_t cuda_graph_unroll = 0;  ///< 0 = disabled. N > 0: capture N batches as CUDA graph.
                                      ///< Must be even (double-buffer constraint). Recommended: 2 or 4.
@@ -213,6 +252,9 @@ struct MPQSConfig {
     // Linear Algebra
     uint32_t bw_m = 256; // vector block width m
     uint32_t bw_n = 256; // vector block width n
+    int32_t bw_max_solutions = -1;       // BW Stage 3 solution cap (-1 = ALL)
+    std::string bw_checkpoint_dir = "";  // BW stage-boundary checkpoint dir ("" = off)
+    bool bw_resume = false;              // Load BW stage checkpoints and resume
 
     // Component Configs
     postprocessing::PostProcConfig pp_config;

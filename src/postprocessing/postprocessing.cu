@@ -313,20 +313,14 @@ __device__ __forceinline__ void processCandidate(
     int8_t sign_axb;
     mpqs::math::calculate_sqrt_of_QX(c.a, c.b, c.true_x, sqrt_Q, sign_axb);
 
-    mpqs::uint512 Q = sqrt_Q;
+    // Q = |(ax+b)^2 - N|, with sign = +1 if (ax+b)^2 >= N else -1.
+    // The intermediate square (ax+b)^2 reaches ~2N ~ 2^513 for N >= 2^511 (RSA-155)
+    // and would overflow a 512-bit product; abs_square_minus_N forms it in a
+    // 1024-bit accumulator and reduces |s^2 - N| (< N < 2^512) back to uint512.
+    // STRICT NO-OP for N < 2^511 (RSA-150 and below): bit-for-bit identical to the
+    // legacy "Q=sqrt_Q; Q.mult(Q); if(Q<N){sign=-1;Q=N-Q;} else {sign=1;Q-=N;}".
     int8_t sign;
-
-    Q.mult(Q); // Q = (ax+b)^2
-
-    if (Q < N_val) {
-        sign = -1;
-        mpqs::uint512 tmp = N_val;
-        tmp.sub(Q);
-        Q = tmp;
-    } else {
-        sign = 1;
-        Q.sub(N_val);
-    }
+    mpqs::uint512 Q = mpqs::abs_square_minus_N(sqrt_Q, N_val, sign);
 
     // --- 2. Trial Division Setup ---
     uint32_t local_factors[64];

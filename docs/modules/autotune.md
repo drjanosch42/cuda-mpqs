@@ -8,32 +8,32 @@ Namespace: `mpqs::autotune`.
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `autotune.h` | 128 | `AutotuneController` class, `AutotuneConfig`, `AutotuneResult` |
-| `autotune.cpp` | 922 | Controller implementation: 4-stage loop, history I/O, convergence, buffer recommendations |
-| `autotune_types.h` | 126 | Shared types: `RuntimeEstimate`, `SieveOptimizationResult`, `SieveSearchBounds`, `L_function()` |
-| `autotune_projection.h` | 92 | `ParameterProjector` class, `ProjectedParams` struct |
-| `autotune_projection.cpp` | 484 | 4-tier projection cascade: exact match, interpolation, extrapolation, theory fallback |
-| `kernel_param_optimizer.h` | 70 | `optimizeKernelLaunchParams()`, candidate value arrays, heuristic defaults |
-| `kernel_param_optimizer.cpp` | 181 | Seeded coordinate descent over 8 kernel launch parameters |
-| `kernel_launch_validator.h` | 121 | `KernelLaunchValidator` class, `PreflightResult`, `Params8`, `ParamIndex` enum |
-| `kernel_launch_validator.cpp` | 390 | 6-check validation pipeline, enumeration, preflight with LP-aware auto-correction |
-| `runtime_estimator.h` | 33 | `estimateRuntime()` free function |
-| `runtime_estimator.cpp` | 269 | Truncated sieve probe via ephemeral orchestrator, ETA extrapolation, confidence scoring |
-| `sieve_optimizer.h` | 181 | `SieveParameterOptimizer` class with joint (F,L) convex optimizer |
-| `sieve_optimizer.cpp` | 714 | Three-phase optimizer: L-sweep (A), 3×3 grid (B), gradient descent (C) |
-| `cost_models.h` | 28 | `estimateMatrixTime()`, `estimateLinalgTime()`, `deriveSieveSearchBounds()` |
-| `cost_models.cpp` | 50 | Heuristic power-law cost models calibrated on RTX 5070 Ti |
-| `autotune_history.h` | 116 | `HistoryStore` class, `HistoryEntry` struct, `sha256_hex()` |
-| `autotune_history.cpp` | 789 | JSON persistence, FIPS 180-4 SHA-256, k-nearest-neighbor lookup with F5 two-pass filter |
-| `auto_apply.h` | 70 | `AutoApplyController` class, `AutoApplyResult` struct |
-| `auto_apply.cpp` | 360 | History-based parameter application without GPU probes |
-| `benign_history.h` | 60 | `BenignHistoryStore` class, `BenignHistoryEntry` struct |
-| `benign_history.cpp` | 369 | Cross-GPU hardcoded parameter defaults (17 entries: 12 desktop + 5 Jetson Orin), JSON persistence |
-| `json_reader.h` | ~322 | Shared cursor-based recursive-descent JSON parser; used by `HistoryStore::load` and `BenignHistoryStore::load` |
-| `memory_estimator.h` | ~45 | `memory_costs` namespace (per-element byte costs for on-device buffers), `kMinPartialBufferSize` floor constant |
-| `CMakeLists.txt` | 28 | Static library `mpqs_autotune`, links `mpqs_common`, `mpqs_sieve` |
+| `autotune.h` | 140 | `AutotuneController` class, `AutotuneConfig`, `AutotuneResult` |
+| `autotune.cpp` | 1238 | Controller implementation: 4-stage loop, history I/O, convergence, buffer recommendations, wide floor-gate/no-signal handling |
+| `autotune_types.h` | 130 | Shared types: `RuntimeEstimate`, `SieveOptimizationResult`, `SieveSearchBounds`, `L_function()` |
+| `autotune_projection.h` | 96 | `ParameterProjector` class, `ProjectedParams` struct |
+| `autotune_projection.cpp` | 488 | 4-tier projection cascade: exact match, interpolation, extrapolation, theory fallback |
+| `kernel_param_optimizer.h` | 120 | `optimizeKernelLaunchParams()`, candidate value arrays (narrow + wide), heuristic defaults, wide probe constants |
+| `kernel_param_optimizer.cpp` | 464 | Seeded coordinate descent over 8 kernel launch parameters; wide (uint16) survivors/sec search with floor gate |
+| `kernel_launch_validator.h` | 159 | `KernelLaunchValidator` class, `PreflightResult`, `Params8`, `ParamIndex` enum |
+| `kernel_launch_validator.cpp` | 456 | 6-check validation pipeline, enumeration, preflight with LP-aware auto-correction |
+| `runtime_estimator.h` | 37 | `estimateRuntime()` free function |
+| `runtime_estimator.cpp` | 273 | Truncated sieve probe via ephemeral orchestrator, ETA extrapolation, confidence scoring |
+| `sieve_optimizer.h` | 185 | `SieveParameterOptimizer` class with joint (F,L) convex optimizer |
+| `sieve_optimizer.cpp` | 718 | Three-phase optimizer: L-sweep (A), 3×3 grid (B), gradient descent (C) |
+| `cost_models.h` | 32 | `estimateMatrixTime()`, `estimateLinalgTime()`, `deriveSieveSearchBounds()` |
+| `cost_models.cpp` | 54 | Heuristic power-law cost models calibrated on RTX 5070 Ti |
+| `autotune_history.h` | 120 | `HistoryStore` class, `HistoryEntry` struct, `sha256_hex()` |
+| `autotune_history.cpp` | 530 | JSON persistence, FIPS 180-4 SHA-256, k-nearest-neighbor lookup with F5 two-pass filter |
+| `auto_apply.h` | 74 | `AutoApplyController` class, `AutoApplyResult` struct |
+| `auto_apply.cpp` | 387 | History-based parameter application without GPU probes |
+| `benign_history.h` | 64 | `BenignHistoryStore` class, `BenignHistoryEntry` struct |
+| `benign_history.cpp` | 243 | Cross-GPU hardcoded parameter defaults (17 entries: 12 desktop + 5 Jetson Orin), JSON persistence |
+| `json_reader.h` | 321 | Shared cursor-based recursive-descent JSON parser; used by `HistoryStore::load` and `BenignHistoryStore::load` |
+| `memory_estimator.h` | 53 | `memory_costs` namespace (per-element byte costs for on-device buffers), `kMinPartialBufferSize` floor constant |
+| `CMakeLists.txt` | 29 | Static library `mpqs_autotune`, links `mpqs_common`, `mpqs_sieve` |
 
-Total: ~5,581 lines across 23 source files (21 previously documented + `json_reader.h` + `memory_estimator.h`).
+Total: ~6,400 lines across 23 source files.
 
 ## Architecture Overview
 
@@ -74,7 +74,7 @@ When auto-apply changes M (sieve_bound), the orchestrator propagates the change 
 
 ### Buffer Cascade
 
-Auto-apply also merges buffer parameters (witness capacity, partial buffer, accum buffer) using the same tier cascade, with a minimum partial buffer floor of 65,536 and a batch-mode floor of 8× accum.
+Auto-apply also merges buffer parameters (witness capacity, partial buffer, accum buffer) using the same tier cascade, with a minimum partial buffer floor of 65,536 (`kMinPartialBufferSize`, `memory_estimator.h`) and a partial ≥ 8× accum floor (all modes, not just batch).
 
 ## Stage 0: Parameter Projection (`autotune_projection.cpp`)
 
@@ -133,9 +133,9 @@ High confidence (1.0) -> 5% radius; zero confidence -> 50% radius.
 | Index | Name | Symbol | Kernel Config | Candidate Values |
 |-------|------|--------|--------------|-----------------|
 | 0 | `subCubeSize` | P_SUB_CUBE_SIZE | `gs_conf.num_polysPerSieveCall` | {128, 256, 512, 1024} |
-| 1 | `numIntervals` | P_NUM_INTERVALS | `gs_conf.num_sievingBlocksPerSieveCall` | {4, 8, 16, 32} |
+| 1 | `numIntervals` | P_NUM_INTERVALS | `gs_conf.num_sievingBlocksPerSieveCall` | {1, 2, 4, 8, 16, 32} |
 | 2 | `polyBlockSize` | P_POLY_BLOCK_SIZE | `gms_conf.polyBlockSize` | {1, 2, 4, 8, 16, 32} |
-| 3 | `blocksPerCycle` | P_BLOCKS_PER_CYC | `gms_conf.num_activeBlocksPerCycle` | {4, 8, 16, 32} |
+| 3 | `blocksPerCycle` | P_BLOCKS_PER_CYC | `gms_conf.num_activeBlocksPerCycle` | {1, 2, 4, 8, 16, 32} |
 | 4 | `metaGridDim` | P_META_GRID_DIM | `gms_conf.num_threadBlocks` | {32, 64, 128, 256} |
 | 5 | `metaBlockDim` | P_META_BLOCK_DIM | `gms_conf.num_threadsPerBlock` | {256, 512, 1024} |
 | 6 | `sasGridDim` | P_SAS_GRID_DIM | `ss_conf.num_threadBlocks` | {32, 128, 256, 512} |
@@ -155,9 +155,50 @@ All values must be powers of 2.
 
 **Post-optimization:** Clears sticky CUDA errors (`cudaDeviceSynchronize()` + `cudaGetLastError()`) that may accumulate from failed kernel launches during benchmarking. Runs a defense-in-depth preflight check on the winning config before applying to the pipeline.
 
+**Stage-1 OOM guard:** the controller passes `non_sieve_bytes` = `computePostprocessingLpBytes()` (postprocessing/LP device footprint + CUDA-context reserve, computed from `memory_estimator.h` per-element costs) into `optimizeKernelLaunchParams()`; when > 0 the optimizer skips/clamps any candidate — and gates its own seed eval — whose complete footprint exceeds 0.80 of free VRAM.
+
+### Wide-Path (uint16) Autotune (S0–S5)
+
+When the siever resolved to the wide accumulator (`siever.isWideAccumulator()`, i.e. the
+RSA-150/155 uint16 — or Option-A saturating-uint8 — regime), Stage 1 switches from the
+narrow µs-timing objective to a **survivors/sec rate objective** that actually drives the
+committed `sieveAndScanBatchKernelWide` geometry (`loadPartialCustomConfig`-wide, matched to
+u8sat when selected). The narrow (uint8) path is byte-for-byte unchanged. All discriminators
+live in `KernelParamResult`: `objective_is_rate` (true ⇒ `timing_us` is survivors/sec,
+HIGHER is better), `beats_floor`, `floor_score`.
+
+- **Survivors/sec harness (S3):** each candidate re-sieves the same staged polynomial sample
+  (`--autotune_probe_polys`, 0 = auto-scale by N) over a wall-clock window
+  (`WIDE_PROBE_WINDOW_SEC` = 10 s, shrinking toward `WIDE_PROBE_WINDOW_FLOOR_SEC` = 6 s under a
+  tight `probe_budget_sec`), after a discarded `WIDE_PROBE_WARMUP_SEC` = 2.5 s warm-up (JIT,
+  clock ramp, caches). When the budget is exhausted the search stops adding candidates but the
+  floor is ALWAYS still timed.
+- **Floor gate (S4):** `loadStandardConfig`-wide is timed as candidate #0
+  (`sieveMiniStandardWide()`, the `floor_score`); the tuned winner is applied only if its rate
+  ≥ `floor · (1 + WIDE_FLOOR_MARGIN)` (margin 0.05). Otherwise the controller keeps the
+  loadStandardConfig defaults (`useParams = false`) — provable parity; closes the −73%
+  W-track regression class.
+- **No-signal guard:** a measured 0 survivors/s across every candidate AND the floor (e.g. LP
+  off / too-tight threshold at this scale) means the autotune got no signal: warn and keep
+  loadStandardConfig instead of silently reverting to a meaningless floor
+  (`stages[1].notes = "wide no-signal: keeping loadStandardConfig"`).
+- **Occupancy-seeded search (S5):** the search is seeded AT the known-good wide default (not
+  descended from `HEURISTIC_DEFAULTS`, whose geometry region is wrong for wide); the GATHER
+  blockDim seed comes from `siever.wideGatherOccupancyBlockDim()` (cudaOccupancy API; falls
+  back to the standard value when unavailable). The wide sweep uses its own index lists —
+  `WIDE_WEAK_PARAM_INDICES = {7, 4, 0}` (GATHER blockDim, SCATTER grid, subCubeSize/num_polys)
+  always, `WIDE_STRONG_PARAM_INDICES = {5}` (SCATTER blockDim) thorough-only — and
+  `WIDE_CANDIDATE_VALUES_0 = {128, 256, 512}` for subCubeSize (1024 dropped:
+  `clampWideNumPolys` caps num_polys at 512, so it would probe a redundant geometry).
+  `numIntervals` (1) is INERT on wide (`loadPartialCustomConfig`-wide overrides it to
+  `2M/SB_wide`) and is excluded from both lists.
+
+Validated on RTX 5070 Ti: floor gate fired on the −73% regression scenario; +38.5% wide efficacy
+at RSA-100; narrow byte-identical (RSA-100 ~85 s record reproduced on the S0–S5 binary).
+
 ### Skip Logic
 
-Stage 1 is skipped on iterations > 0 when both F and M have changed by < 10% since the last Stage 1 run, since kernel launch parameters are weakly sensitive to small F/M changes.
+Stage 1 is skipped on iterations > 0 when both F and M have changed by < 10% since the last Stage 1 run, since kernel launch parameters are weakly sensitive to small F/M changes. The gate and the recorded last-run values key on **`f_data_.F` / `f_data_.M`** — the F/M Stage 1 actually consumes — NOT on `config_.fb_bound`/`sieve_bound` (which are legitimately 0 in auto mode; keying on them zeroed the recorded values and made Stage 1 run twice per autotune, applying the noisier second-iteration winner — a ~17% self-inflicted loss, fixed `8005da9`).
 
 ## Kernel Launch Validator (`kernel_launch_validator.cpp`)
 

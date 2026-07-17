@@ -73,6 +73,21 @@ The transport is fixed to TCP: there is **no** `--transport` CLI flag. The `MPQS
 
 All standard flags (`--fb_bound`, `--sieve_bound`, `--lp1_bound`, `--sieve_batch_size`, `--cuda_graph_unroll`, etc.) work identically to solo mode and can be set independently per node. Workers receive N, factor base, and polynomial parameters from the coordinator via `WORK_ASSIGN`.
 
+### Large-Prime Sieve Tuning Flags (v1.0.5)
+
+For large inputs (>~150 digits, e.g. RSA-150/RSA-155) the sieve runs a wide accumulator path with additional geometry knobs. These apply identically per node. See [docs/modules/sieve.md](docs/modules/sieve.md) for full detail.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bucket_size_factor <F>` | `0` (legacy SB/2) | Meta-sieve bucket capacity as a multiple of the sieving block size (`globalBucketSize = F × SB`). `1.0` un-clamps the default bucket for large-M wide-path runs (eliminated bucket overflow on the RSA-155 production sieve). Charged against the VRAM budget — never an OOM. |
+| `--wide_accum <MODE>` | `auto` | Wide-accumulator kernel selection: `auto` (gate-driven), `u8sat` (saturating-uint8, restores narrow throughput when the exactness gate holds), or `u16` (uint16). Only active on the wide path (>~150-digit N); no effect on smaller inputs. |
+| `--sieve_gather_block_dim <N>` | `0` (off) | Overrides the GATHER kernel block dimension (power of two in `[32,1024]`). Result-invariant occupancy A/B knob. |
+| `--sieve_meta_cycle_cap <N>` | `0` (off) | Caps the meta-sieve (SCATTER) active-blocks-per-cycle to shrink the bucket-write window. A write-locality ablation knob, not a speedup lever (capping multiplies factor-base re-reads). |
+
+### Scaling
+
+Production-validated at **64 GPUs** (16 nodes × 4 H100, the RSA-155 sieve). The cross-node LP-matching path runs single-threaded on the coordinator host CPU; its measured occupancy leaves ample headroom for **100+ GPU (27-node) deployments**. At those scales the binding constraint is coordinator **host RAM** (the witness table and raw-partial buffer grow with accumulated relations), not the matching thread — size `--mem` generously on the coordinator node.
+
 ---
 
 ## Work Distribution and Reliability
@@ -148,6 +163,8 @@ At sieve completion, an aggregate summary is printed:
 [Thread A] Aggregate: 119846 rels in 104.9s (1142.1 rel/s)
 [Thread A] LP yield: 12.3% (17746 combines / 143742 inserts)
 ```
+
+As of v1.0.5, coordinators additionally emit a `[Cluster] LPocc:` line at the same ~5 s cadence. It partitions the single-threaded Thread-A LP-matching path into its component stages (receive / deserialize / buffer / accumulate / insert-and-match timings, plus the live witness-table occupancy and the max per-call match time). It surfaces whether the coordinator's CPU LP-matching thread has spare headroom — the saturation signature is the sleep time flattening while the insert-and-match time tracks elapsed. Coordinator-only; workers never emit it.
 
 This telemetry is unconditional — it runs during every cluster sieve, not just `--estimate_only` probes.
 
@@ -424,10 +441,29 @@ All nodes must be reachable over SSH without an interactive password prompt
 ### Multi-node A100 (RSA-130)
 
 RSA-130 has been factored end-to-end on an 8-GPU A100-SXM4-40GB cluster (2 nodes
-× 4 GPUs, 1 GPU per process) on the PC2 cluster, validating the v1.0.3 cluster
+× 4 GPUs, 1 GPU per process), validating the v1.0.3 cluster
 correctness and performance fixes at scale (overflow-chunk allocator, coordinator
 self-assign keeping the local GPU at full duty, and the duplicate-partial
 correctness guard).
+
+### Multi-node H100 (RSA-140, factored 2026-06-29)
+
+RSA-140 (463-bit) has been factored end-to-end on a 4-node × 4 H100 = 16-GPU
+cluster. The cluster sieve ran 6 h 28 m wall (~104 GPU-h total including the
+single-GPU linear-algebra stage), producing two 70-digit prime factors
+(product-verified). Large-prime fraction 56.8%, which cleared the 2-cycle sqrt
+cliff at a 63% per-solution nontrivial-GCD rate.
+
+### Multi-node H100 (RSA-155, 512-bit, factored 2026-07-14)
+
+RSA-155 (512-bit) has been factored end-to-end — the largest input this pipeline
+has completed. The cluster sieve ran on a 16-node × 4 H100 = 64-GPU cluster:
+**689.74 GPU-h / 10.78 h wall**, 41.4% large-prime fraction, 0 bucket overflow,
+zero errors, fleet balance ±1.5%. The linear-algebra stage ran on a single H100
+(**10.90 GPU-h**). **Total: 700.64 GPU-h**, yielding two 78-digit prime factors
+(product-verified). This run exercised the wide (uint16/u8sat) sieve accumulator
+path and bucket-capacity scaling (`--bucket_size_factor 1.0`); see the
+v1.0.5 tuning flags below.
 
 ### Solo Regression
 

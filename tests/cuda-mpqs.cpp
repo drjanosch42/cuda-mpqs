@@ -124,8 +124,10 @@ bool parse_int(const char* str, int& value) {
 
 /// Parse a numeric string with optional K/M/B/T suffix (base-1000).
 /// If snap_pow2 is true, result is rounded to nearest power of 2.
-/// Returns true on success.
-bool parse_suffixed_uint64(const char* str, uint64_t& out, bool snap_pow2 = false) {
+/// If pre_snap is non-null, it receives the pre-snap (rounded) value, so callers
+/// can detect and report a power-of-two snap. Returns true on success.
+bool parse_suffixed_uint64(const char* str, uint64_t& out, bool snap_pow2 = false,
+                           uint64_t* pre_snap = nullptr) {
     char* end = nullptr;
     double val = std::strtod(str, &end);
     if (end == str) return false;  // no numeric part
@@ -140,6 +142,7 @@ bool parse_suffixed_uint64(const char* str, uint64_t& out, bool snap_pow2 = fals
     if (val < 0 || val > 1e18) return false;  // out of range
 
     uint64_t result = static_cast<uint64_t>(val + 0.5);  // round
+    if (pre_snap) *pre_snap = result;                    // report the un-snapped value
 
     if (snap_pow2 && result > 0) {
         // Snap to nearest power of 2
@@ -206,6 +209,8 @@ void print_usage(const char* prog_name) {
               << "  --lp1_bound <N>  Large Prime Bound 1 (K/M/B/T suffix)\n"
               << "  --matrix_lp1_bound <N> matrix_only: drop LP-combined rows/partials with stored large prime > N\n"
               << "                         (effective L down-filter; pure smooths kept; 0=inert; K/M/B/T suffix)\n"
+              << "  --matrix_max_rows <N>  Cap legacy relation rows before matrix build (suffix-drop to first N;\n"
+              << "                         keeps padded n_cols <= 2^24-1 so TiledCOO-256 stays admissible; 0=off; K/M/B/T)\n"
               << "  --lp1_max_witnesses <SIZE> LP witness capacity (K/M suffix, snaps to pow2) [Default: 1M]\n"
               << "  --lp_interval <N>    LP processing frequency: 0=auto/adaptive, N>0=every N batches\n"
               << "  --target_rels <N> Target Relations [Default: Auto]\n"
@@ -228,6 +233,9 @@ void print_usage(const char* prog_name) {
               << "  --matrix_mode <MODE>    Matrix construction: legacy, preprocess [Default: auto]\n"
               << "  --char_mode <MODE>      Character-column aux-prime selection: norm, branch, none [Default: none]\n"
               << "                            none = append ZERO character columns (scientific null control).\n"
+              << "  --sieve_accumulator <MODE>  Sieve accumulator width: auto, u8, u16 [Default: auto]\n"
+              << "  --wide_accum <MODE>  Wide-path accumulator (Option A): auto, u8sat, u16 [Default: auto].\n"
+              << "                       auto = saturating-uint8 when the exactness gate holds, else uint16.\n"
               << "  --lp_preprocess_threshold <F>  DEPRECATED/INERT: AUTO no longer auto-selects preprocess from LP fraction; use --matrix_mode preprocess to opt in [Default: 0.55]\n"
               << "  --lp_matrix_threshold <F>  DEPRECATED: alias for --lp_preprocess_threshold (kept for backwards compatibility)\n"
               << "  --partial_subsample <F>  Subsample partials/LP-combined for matrix_only experiments [0.0-1.0, default: 1.0]\n"
@@ -275,10 +283,21 @@ void print_usage(const char* prog_name) {
               << "  --sieve_max_batches <N>   Stop sieve after N batch iterations [0=disabled]\n"
               << "  --sieve_truncate_continue Continue pipeline (matrix/BW/sqrt) after truncation\n"
               << "  --sieve_gms_blocks <N> Number of CUDA blocks for metaSieve [Default: Auto/64]\n"
+              << "  --sieve_meta_cycle_cap <N> Cap meta-sieve active blocks per cycle (SCATTER locality);\n"
+              << "                          rounded down to a power of two; 0 = off (legacy) [Default: 0]\n"
+              << "  --sieve_gather_block_dim <N> GATHER (sieve-and-scan) blockDim A/B knob; result-invariant\n"
+              << "                          occupancy override; power of two in [32,1024]; 0 = off (256) [Default: 0]\n"
+              << "  --bucket_size_factor <F> Wide-path bucket-overflow ablation: globalBucketSize = F*SB\n"
+              << "                          (F=0.5 == legacy SB/2; F=1.0 doubles the bucket); 0 = off/legacy [Default: 0]\n"
+              << "  --autotune_probe_polys <N> Wide-autotune survivors/sec probe sample size (# distinct\n"
+              << "                          polynomials staged); 0 = auto-scale by N [Default: 0]\n"
               << "  --sieve_hc_dim <N>     Hypercube dimension for polynomial construction\n"
               << "\n--- Block Wiedemann ---\n"
               << "  --bw_m <N>       Block size m [Default: 256]\n"
               << "  --bw_n <N>       Block size n [Default: 256]\n"
+              << "  --bw_max_solutions <N> Stop BW reconstruction after N solutions; -1 = ALL [Default: -1]\n"
+              << "  --bw_checkpoint_dir <path> Save BW stage outputs (S/Pi/solutions) under path for resume [Default: off]\n"
+              << "  --bw_resume      Load BW stage checkpoints from --bw_checkpoint_dir and resume [Default: off]\n"
             #ifdef SIEVING_DEBUG_FLAG
               << "\n--- Debug (SIEVING_DEBUG_MODE) ---\n"
               << "  --metaSnapshot <k> Snapshot of metaSieve buckets at step k\n"
@@ -531,6 +550,36 @@ ParsedArgs parse_args(int argc, char** argv) {
             }
             args.mark("char_mode");
         }
+        else if (arg == "--sieve_accumulator" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "auto") {
+                args.config.sieve_accumulator_mode = 0;
+            } else if (mode == "u8") {
+                args.config.sieve_accumulator_mode = 1;
+            } else if (mode == "u16") {
+                args.config.sieve_accumulator_mode = 2;
+            } else {
+                std::cerr << "Error: unknown --sieve_accumulator '" << mode
+                          << "'. Valid values: auto, u8, u16\n";
+                exit(1);
+            }
+            args.mark("sieve_accumulator");
+        }
+        else if (arg == "--wide_accum" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "auto") {
+                args.config.sieve_wide_accum_mode = 0;
+            } else if (mode == "u8sat") {
+                args.config.sieve_wide_accum_mode = 1;
+            } else if (mode == "u16") {
+                args.config.sieve_wide_accum_mode = 2;
+            } else {
+                std::cerr << "Error: unknown --wide_accum '" << mode
+                          << "'. Valid values: auto, u8sat, u16\n";
+                exit(1);
+            }
+            args.mark("wide_accum");
+        }
         else if (arg == "--lp_preprocess_threshold" && i + 1 < argc) {
             double val;
             if (!parse_double(argv[++i], val)) exit(1);
@@ -575,6 +624,18 @@ ParsedArgs parse_args(int argc, char** argv) {
             }
             args.config.matrix_lp1_bound = val;
             args.mark("matrix_lp1_bound");
+        }
+        else if (arg == "--matrix_max_rows" && i + 1 < argc) {
+            // Cap the legacy relation-batch row count before matrix construction
+            // (suffix-drop to the first N relations). 0 = off. Keeps the padded
+            // square dimension max(rows,cols) <= 2^24-1 so TiledCOO-256 stays
+            // admissible in the SpMM autotuner. Accepts K/M/B/T suffix.
+            uint64_t val;
+            if (!parse_suffixed_uint64(argv[++i], val, false)) {
+                std::cerr << "Error: invalid value for --matrix_max_rows\n"; exit(1);
+            }
+            args.config.matrix_max_rows = val;
+            args.mark("matrix_max_rows");
         }
         else if (arg == "--truncation_factor" && i + 1 < argc) {
             double val;
@@ -639,9 +700,19 @@ ParsedArgs parse_args(int argc, char** argv) {
             args.mark("matrix_backend");
         }
         else if (arg == "--sieve_bound" && i+1 < argc) {
-            uint64_t val;
-            if (!parse_suffixed_uint64(argv[++i], val, true)) {
+            uint64_t val, requested = 0;
+            if (!parse_suffixed_uint64(argv[++i], val, true, &requested)) {
                 std::cerr << "Error: invalid value for --sieve_bound\n"; exit(1);
+            }
+            if (val != requested) {
+                // The sieve interval M must be a power of two; a non-pow2 request
+                // silently snaps (ties round down) and can duplicate another config.
+                // Emitted via std::cerr (matching this parser's other diagnostics):
+                // the HPCLogger is not initialized until after arg parsing, so a
+                // LOG(LOG_WARNING) here would be suppressed (empty sink list).
+                std::cerr << "[CLI] Warning: --sieve_bound M=" << requested
+                          << " is not a power of two; snapped to M=" << val
+                          << " (sieve interval M must be a power of two).\n";
             }
             args.config.sieve_bound = static_cast<uint32_t>(val);
             args.mark("sieve_bound");
@@ -685,6 +756,44 @@ ParsedArgs parse_args(int argc, char** argv) {
         } else if (arg == "--sieve_gms_blocks" && i+1 < argc) {
             if (!parse_uint32(argv[++i], args.config.sieve_gms_num_blocks)) exit(1);
             args.mark("sieve_gms_num_blocks");
+        } else if (arg == "--sieve_meta_cycle_cap" && i+1 < argc) {
+            if (!parse_uint32(argv[++i], args.config.sieve_meta_cycle_cap)) exit(1);
+            args.mark("sieve_meta_cycle_cap");
+        } else if (arg == "--sieve_gather_block_dim" && i+1 < argc) {
+            if (!parse_uint32(argv[++i], args.config.sieve_gather_block_dim)) exit(1);
+            // GATHER blockDim is a result-invariant occupancy knob. 0 = off (loader default).
+            // Restrict N>0 to a power of two in [32,1024]: multiple of 32 (warp-aligned) and
+            // <= 1024 (matches __launch_bounds__(1024) on the sieve-and-scan kernels), and a
+            // power of two because the downstream config validator asserts POW2_CHECK on
+            // ss_conf.num_threadsPerBlock (so {32,64,128,256,512,1024} are the only legal values).
+            {
+                uint32_t n = args.config.sieve_gather_block_dim;
+                if (n != 0 && (n < 32 || n > 1024 || (n & 31u) != 0 || (n & (n - 1u)) != 0)) {
+                    std::cerr << "Error: --sieve_gather_block_dim must be 0 (off) or a power of two in "
+                                 "[32,1024] (one of 32,64,128,256,512,1024); got " << n << "\n";
+                    exit(1);
+                }
+            }
+            args.mark("sieve_gather_block_dim");
+        } else if (arg == "--bucket_size_factor" && i+1 < argc) {
+            double val;
+            if (!parse_double(argv[++i], val)) exit(1);
+            // Ablation knob (default 0 = legacy globalBucketSize=SB/2, byte-identical). F>0 sizes
+            // globalBucketSize = F*SB (F=0.5 == legacy; F=1.0 doubles the bucket). Reject negatives;
+            // an over-large F is handled downstream (VRAM budget reduces num_polys, or the config
+            // validator rejects it) rather than here — see the 2026-07-10 A100
+            // uint16 degenerate-baseline root-cause analysis.
+            if (val < 0.0) {
+                std::cerr << "Error: --bucket_size_factor must be >= 0.0 (0 = off/legacy SB/2)\n";
+                exit(1);
+            }
+            args.config.sieve_bucket_size_factor = val;
+            args.mark("bucket_size_factor");
+        } else if (arg == "--autotune_probe_polys" && i+1 < argc) {
+            if (!parse_uint32(argv[++i], args.config.autotune_probe_polys)) exit(1);
+            // Wide-autotune survivors/sec probe sample size (# distinct staged polynomials).
+            // 0 = auto-scale by N (default). >0 forces the sample directly (A/B / diagnostics).
+            args.mark("autotune_probe_polys");
         } else if (arg == "--cuda_graph_unroll" && i+1 < argc) {
             if (!parse_uint32(argv[++i], args.config.cuda_graph_unroll)) exit(1);
             uint32_t val = args.config.cuda_graph_unroll;
@@ -747,6 +856,18 @@ ParsedArgs parse_args(int argc, char** argv) {
         else if (arg == "--bw_n" && i+1 < argc) {
             if (!parse_uint32(argv[++i], args.config.bw_n)) exit(1);
             args.mark("bw_n");
+        }
+        else if (arg == "--bw_max_solutions" && i+1 < argc) {
+            args.config.bw_max_solutions = (int32_t)std::strtol(argv[++i], nullptr, 10);
+            args.mark("bw_max_solutions");
+        }
+        else if (arg == "--bw_checkpoint_dir" && i+1 < argc) {
+            args.config.bw_checkpoint_dir = argv[++i];
+            args.mark("bw_checkpoint_dir");
+        }
+        else if (arg == "--bw_resume") {
+            args.config.bw_resume = true;
+            args.mark("bw_resume");
         }
 
         #ifdef SIEVING_DEBUG_FLAG

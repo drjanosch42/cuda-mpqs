@@ -184,8 +184,12 @@ where applicable.
 | 70d composite | 70     | 300K  | 262K   | 0     | 1.60     |
 | 80d composite | 80     | 700K  | 65K    | 0     | 7.72     |
 | 90d composite | 90     | 3M    | 262K   | 300M  | 41.36    |
-| RSA-100       | 100    | 7M    | 262K   | 1T    | 119.49   |
+| RSA-100       | 100    | 7M    | 262K   | 1T    | 84.72    |
 | RSA-110       | 110    | 9M    | 262K   | 1T    | 1040.03  |
+
+RSA-100 factors in **51.12 s** on an NVIDIA H100 SXM and **1 m 25 s** on the
+RTX 5070 Ti; the cross-GPU record table and per-stage breakdowns are in
+[`README.md`](../README.md).
 
 Below ~85 digits the large prime variant is disabled; above that threshold,
 enabling LP dramatically increases relation yield.
@@ -195,3 +199,11 @@ memory bandwidth. Jetson Orin (8 SMs, 1 MB L2) prefers larger `F` and
 smaller `M` than discrete GPUs at the same input size. Detailed
 parameter-tuning guidance for various inputs and devices is in
 [`USER_GUIDE.md`](../USER_GUIDE.md).
+
+**Large inputs (v1.0.5).** Inputs above ~150 digits use a *wide* sieve
+accumulator path (uint16, or a saturating-uint8 variant when an exactness gate
+holds) to avoid overflow of the per-cell log accumulator, dispatched
+automatically by input size. Meta-sieve bucket capacity is tunable via
+`--bucket_size_factor` for large sieve intervals `M`. With these paths the
+pipeline factors 512-bit inputs (RSA-155) end-to-end; RSA-155 was completed on
+a 64-GPU H100 cluster (see [`CLUSTER.md`](../CLUSTER.md)).

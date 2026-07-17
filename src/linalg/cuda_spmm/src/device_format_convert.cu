@@ -10,6 +10,7 @@
 
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
+#include <thrust/reduce.h>
 #include <thrust/execution_policy.h>
 #include <stdexcept>
 #include <algorithm>
@@ -365,6 +366,33 @@ void gpu_convert_csr_to_delta16(
             slice.n_rows * sizeof(uint32_t), "delta16_sizes");
         k_delta16_escape_sizes<<<(slice.n_rows + 255) / 256, 256, 0, stream>>>(
             slice.d_row_ptr, slice.d_col_ind, slice.n_rows, d_expanded_sizes);
+
+        // uint32 overflow guard.  The Delta-16 offset stream (d_delta_offsets and
+        // the inclusive_scan below) is uint32-indexed, so the total escape-expanded
+        // length must fit in uint32.  At whole-range scale (n_rows ~1.7e7 and a max
+        // column index ~1.6e7) the length ~= nnz + 2*n_rows*(max_col/65535) can
+        // exceed UINT32_MAX (~4.29e9); it would then wrap, the encode kernel would
+        // write out of bounds (illegal memory access → poisoned CUDA context), and
+        // the surrounding try/catch could not recover.  Sum the per-row sizes in
+        // 64-bit and refuse Delta-16 for this slice on overflow — throwing lets the
+        // whole-range benchmark's try/catch fall back to a safe kernel (Warp-CSR /
+        // TiledCOO) with the context intact.  For any slice with total <= UINT32_MAX
+        // (all n_cols<=65535 fast-path slices skip this branch entirely, and all
+        // per-block tuning slices with n_rows<=65536 stay far below the cap) this is
+        // a pure read: no allocation, no kernel launch, no output change.
+        {
+            thrust::device_ptr<uint32_t> d_sizes_ptr(d_expanded_sizes);
+            uint64_t total64 = thrust::reduce(thrust::cuda::par.on(stream),
+                d_sizes_ptr, d_sizes_ptr + slice.n_rows,
+                static_cast<uint64_t>(0));
+            if (total64 > 0xFFFFFFFFull) {
+                throw std::runtime_error(
+                    "gpu_convert_csr_to_delta16: escape-expanded stream length "
+                    + std::to_string(total64)
+                    + " exceeds uint32 offset range; Delta-16 not applicable at "
+                      "this matrix scale");
+            }
+        }
 
         // Exclusive scan → per-row output offsets
         d_delta_offsets = (uint32_t*)arena.alloc_temporary(

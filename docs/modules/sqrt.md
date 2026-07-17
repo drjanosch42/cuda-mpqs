@@ -92,13 +92,15 @@ Grid: `<<<n_solutions, 256>>>`. Shared memory: `256 × sizeof(uint512)`.
 #### `BatchedGCDKernel` (M4)
 One thread per solution. Computes `diff = |X[j]−Y[j]|` (explicit comparison to avoid unsigned wrap), `f1 = gcd(diff, N)`. If trivial, computes `sum = X[j]+Y[j]`, `f2 = gcd(sum, N)`. Sets `d_factor_status[j]` to 0 (trivial), 1 (via |X−Y|), or 2 (via X+Y). Uses `mpqs::math::gcd()` (`__host__ __device__`).
 
-**Per-solution nontrivial-GCD rate (`--sqrt_diagnostic`).** After `BatchedGCD` downloads
+**Per-solution nontrivial-GCD rate (unconditional).** After `BatchedGCD` downloads
 `d_factor_status`, the host counts how many of the `n` Block-Wiedemann solutions yielded a
 nontrivial factor and logs the rate `k/n` (with the distinct factor pairs found) at `LOG_DEBUG_1`
-(`sqrt_step.cu:1474`). This is the diagnostic for the high-LP collapse: an unobstructed run sits
-near the ~50% theoretical cap, whereas an obstructed (2-cycle-dominated) run collapses to 0%.
-Capture it with `--sqrt_diagnostic --log_file <path>` (it is suppressed at the default `--verbose`/
-info level).
+(statistics block `sqrt_step.cu:1478-1545`). This block runs unconditionally on every `BatchedGCD`
+call — it is **not** gated by `--sqrt_diagnostic`. This is the diagnostic for the high-LP collapse:
+an unobstructed run sits near the ~50% theoretical cap, whereas an obstructed (2-cycle-dominated) run
+collapses to 0%. Capture it with `--debug --log_file <path>` (or `--log_level 1`) — it is suppressed
+at the default `--verbose`/info level. (`--sqrt_diagnostic` instead gates a separate
+solution-diversity diagnostic, logged at `LOG_INFO` in `orchestrator.cpp:2302-2320`.)
 
 #### `RefineFactorsKernel` (M10)
 Extracts finest factorization from BatchedGCDKernel output via coprime refinement.
@@ -111,6 +113,14 @@ Three-phase single-block kernel (`<<<1, 128>>>`):
 For semiprimes (N = pq): m = 1, zero refinement rounds → ~2μs.
 
 Grid: `<<<1, 128>>>`. Shared memory: `MAX_POOL × 4 × sizeof(uint512) + 12` bytes ≈ 16.4 KB.
+
+### `ApplyLPCorrectionKernel` (M5)
+
+One thread per solution (`<<<ceil(n/256), 256>>>`). Multiplies `d_Y[sol]` (standard form,
+post-reduce) by a precomputed Montgomery-domain correction value: transform → `mont.mul` →
+reduce. Used by the expanded-matrix path where LP Y-contributions are precomputed on the CPU and
+uploaded, bypassing the standard LP accumulation pipeline. Exposed via the public
+`ApplyLPCorrection(d_correction_mont, n_solutions)` method.
 
 ### Legacy Kernels (behind `#ifdef SQRT_LEGACY_KERNELS`)
 
@@ -161,8 +171,10 @@ Pre-allocated device buffer pool, defined in `sqrt_step.h`. Allocated lazily on 
 | `ComputeXBatchedGPU` | `void(const BWKernelSolutionView& solutions, const HostRelationBatch& batch)` | 3-phase GPU pipeline: TransformSqrtQ → ComputeX_ChunkReduce → FinalReduce. Results on device, retrieve via `getDeviceX()`. |
 | `ComputeYBatchedGPU` | `void(const BWKernelSolutionView& solutions, const HostRelationBatch& batch, const vector<FBType>& fb)` | GPU pipeline: LP transform/reduce, AccumExponents_Parallel, HalveExponents, BatchedExponentiateY. Results on device, retrieve via `getDeviceY()`. Templated on `FBType`. |
 | `BatchedGCD` | `pair<uint512,uint512>(const uint512* d_X, const uint512* d_Y, int n)` | Launches BatchedGCDKernel + RefineFactorsKernel (M10). Host-side statistics, coprimality verification, product-divides-N check. Returns `{factor, cofactor}`. |
+| `ApplyLPCorrection` | `void(const uint512* d_correction_mont, uint32_t n_solutions)` | Multiplies each `d_Y[sol]` by a precomputed Montgomery-domain LP correction (M5, expanded-matrix path). |
 | `getDeviceX` | `const uint512*() const` | Device pointer to X results (valid after ComputeXBatchedGPU). |
 | `getDeviceY` | `const uint512*() const` | Device pointer to Y results (valid after ComputeYBatchedGPU). |
+| `getDeviceValid` | `const uint8_t*() const` | Device pointer to per-solution validity flags (`d_valid`, set by HalveExponents). |
 | `allocateDeviceBuffers` | `void(uint32_t max_K, uint32_t max_nnz, uint32_t max_fb, uint32_t max_n)` | Pre-allocate device buffer pool. Called automatically by GPU methods; may be called explicitly with complete sizing to avoid mid-pipeline reallocation. |
 
 ### Private Methods
@@ -232,6 +244,17 @@ The sqrt stage consumes the output of the Block Wiedemann linear algebra solver 
 2. **Batched GPU path (`ComputeXBatchedGPU` / `ComputeYBatchedGPU` / `BatchedGCD`):** accepts a `BWKernelSolutionView` — a device-resident packed bit-matrix where row _j_ is solution _j_ and column _i_ is relation _i_. This enables processing all kernel vectors (≤ 64) simultaneously in a single kernel launch.
 
 The orchestrator calls the batched GPU path for all solutions simultaneously, falling back to the `Perform()` CPU loop if no nontrivial factors are found.
+
+## Failure Modes (mathematical, not bugs)
+
+- **High-LP 2-cycle cliff:** when the large-prime graph becomes dominated by isolated degree-2
+  cycles, the genus/class-group character enters the matrix row space and *every* BW dependency
+  becomes trivial (X ≡ ±Y) — the per-solution nontrivial-GCD rate collapses near-discontinuously
+  from ~49% to 0%. Mitigation is operational: keep the LP bound below the cliff (character columns
+  do not fix it). Diagnose with the per-solution nontrivial-GCD rate diagnostic (above, via
+  `--debug --log_file`).
+- **LP below ~85 digits:** 100% sqrt failure from a-factor/sieve-prime structural dependence.
+- **`--sqrt_only` mode is broken** (no kernel-vector loader exists) — use `--linalg_only` instead.
 
 ## Dependencies
 

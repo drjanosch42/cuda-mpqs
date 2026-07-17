@@ -279,10 +279,9 @@ void MPQSOrchestrator::Run() {
                 }
                 if (M_changed) {
                     f_data_.M = aa_result.sieve_bound;
-                    // Recompute a_target = sqrt(2N) / M
-                    mpqs::uint512 twoN = config_.N;
-                    twoN.lshift(1);
-                    mpqs::uint512 sqrt2N = twoN.sqrt();
+                    // Recompute a_target = sqrt(2N) / M. isqrt_2N avoids the 2N
+                    // overflow at N >= 2^511 (RSA-155); STRICT NO-OP for N < 2^511.
+                    mpqs::uint512 sqrt2N = mpqs::isqrt_2N(config_.N);
                     sqrt2N.div_uint32_inplace(f_data_.M);
                     f_data_.a_target = sqrt2N;
                 }
@@ -367,13 +366,14 @@ void MPQSOrchestrator::Run() {
                 uint32_t recv_batch_size;
                 uint64_t recv_threshold, recv_lp1_bound;
                 uint64_t recv_poly_start, recv_poly_count, recv_target;
+                uint64_t coord_fb_hash = 0;
                 mpqs::sieve::AFactorsSnapshot recv_snapshot;
 
                 if (!cluster::deserializeWorkAssign(
                         wa_msg.payload.data(), wa_msg.payload.size(),
                         f_data_, recv_batch_size, recv_threshold,
                         recv_lp1_bound, recv_poly_start, recv_poly_count,
-                        recv_target, &recv_snapshot)) {
+                        recv_target, coord_fb_hash, &recv_snapshot)) {
                     LOG(LOG_ERROR_CRITICAL) << "Worker: WORK_ASSIGN deserialization failed";
                     comm_backend_->finalize();
                     return;
@@ -383,6 +383,29 @@ void MPQSOrchestrator::Run() {
                 uint32_t coord_M    = f_data_.M;
                 uint32_t coord_F    = f_data_.F;
                 uint32_t coord_size = f_data_.size;
+
+                // 3b. Regenerate the factor base from the coordinator's (N, F).
+                // WORK_ASSIGN no longer ships the FB arrays (they blow past the
+                // 64 MiB frame cap at high F); generateFactorBase is a pure
+                // deterministic function of (N, F), so the regenerated FB must be
+                // byte-identical to the coordinator's. This REPLACES the
+                // TuningStage FB (which used the worker's own --fb_bound).
+                // Hash-verify before use: relation column indices == FB indices,
+                // so a divergent FB would silently corrupt LP matching and matrix
+                // columns — fail loud instead.
+                generateFactorBase(&f_data_);
+                uint64_t local_fb_hash = cluster::computeFactorBaseHash(f_data_);
+                if (local_fb_hash != coord_fb_hash || f_data_.size != coord_size) {
+                    LOG(LOG_ERROR_CRITICAL) << "Worker: factor-base hash mismatch vs coordinator"
+                        << " (local size=" << f_data_.size
+                        << " hash=0x" << std::hex << local_fb_hash
+                        << "; coord size=" << std::dec << coord_size
+                        << " hash=0x" << std::hex << coord_fb_hash << std::dec
+                        << "). Refusing to sieve — check that all nodes run the "
+                        << "same build and the same N/F.";
+                    comm_backend_->finalize();
+                    return;
+                }
 
                 // 4. Derive remaining f_data_ fields
                 mpqs::sieve::determineParams(&f_data_);
@@ -1563,6 +1586,38 @@ void MPQSOrchestrator::Run() {
         if (!skip_downstream &&
             (config_.mode == ExecutionMode::FULL_PIPELINE || config_.mode == ExecutionMode::LINALG_ONLY
              || config_.mode == ExecutionMode::MATRIX_ONLY)) {
+
+            // Optional legacy-path row cap (--matrix_max_rows, default 0 = off).
+            // Suffix-drops host_relations_soa_ to the FIRST matrix_max_rows relations
+            // BEFORE matrix construction (hence before pad_to_square). This keeps the
+            // padded square dimension max(rows,cols) <= 2^24-1, so the SpMM autotuner's
+            // TiledCOO-256 column guard (col_bits=24) stays admissible. Row i remains
+            // relation i (pure prefix keep), so the sqrt stage's
+            // row <-> relation <-> FB-column-index alignment is preserved. Operates on
+            // the relation batch only — matrix_A_ is untouched. Guarded by > 0, so an
+            // absent/0 flag is byte-identical to prior behavior.
+            if (config_.matrix_max_rows > 0 &&
+                host_relations_soa_.num_relations > config_.matrix_max_rows) {
+                auto& b = host_relations_soa_;
+                const size_t n_before = b.num_relations;
+                const size_t n_keep   = static_cast<size_t>(config_.matrix_max_rows);
+                // factor_offsets has num_relations+1 entries; offset[n_keep] is the end
+                // of the last kept relation = factor count of the kept prefix.
+                const uint64_t f_keep = b.factor_offsets[n_keep];
+                b.sqrt_Q.resize(n_keep);
+                b.signs.resize(n_keep);
+                b.val_2_exps.resize(n_keep);
+                b.large_primes.resize(n_keep);
+                if (b.char_bits.size() > n_keep) b.char_bits.resize(n_keep);
+                b.factor_offsets.resize(n_keep + 1);
+                b.factor_indices.resize(static_cast<size_t>(f_keep));
+                b.factor_counts.resize(static_cast<size_t>(f_keep));
+                b.num_relations = n_keep;
+                b.num_factors   = static_cast<size_t>(f_keep);
+                LOG(LOG_INFO) << "matrix_max_rows: capping " << n_before << " -> "
+                              << n_keep << " rows (dropped " << (n_before - n_keep) << ").";
+            }
+
             // Count sanity check — skip for preprocess mode (singleton removal
             // reduces effective column count, so underdetermined is expected).
             if (config_.matrix_mode != MatrixMode::PREPROCESS &&
@@ -2682,6 +2737,103 @@ void MPQSOrchestrator::TuningStage() {
         }
     }
 
+    // --- Forced hypercube dimension override (--sieve_hc_dim) ---
+    // Authoritative: runs AFTER the small-N (<4) and Jetson (<5) shc_dim floor
+    // guards so an explicit operator request is honoured last. init_a_factors()
+    // auto-derives shc_dim from a sliding window whose product ≈ a_target; this
+    // block instead FIXES the number of a-primes to exactly k and selects the
+    // step-2 window {s, s+2, …, s+2(k-1)} whose product is closest to a_target.
+    // Diagnostic intent: reveal whether shc_dim is an independent lever on the
+    // magnitude of 'a' or merely re-factors the same a_target into a different
+    // prime count.
+    if (config_.sieve_hcube_dimension > 0) {
+        const uint32_t k = config_.sieve_hcube_dimension;
+        const uint32_t fb_size = static_cast<uint32_t>(f_data_.factorBase.size());
+        const uint32_t band_start = 150;  // mirror init_a_factors small-prime skip
+        if (k < 4 || k > static_cast<uint32_t>(mpqs::sieve::MAX_SHC_DIM)) {
+            LOG(LOG_WARNING) << "--sieve_hc_dim=" << k << " out of range [4,"
+                             << mpqs::sieve::MAX_SHC_DIM
+                             << "]; ignoring (auto shc_dim retained).";
+        } else if (band_start + 2u * (k - 1u) >= fb_size) {
+            LOG(LOG_WARNING) << "--sieve_hc_dim=" << k
+                             << ": factor base too small (fb_size=" << fb_size
+                             << ", need start window to fit); ignoring (auto retained).";
+        } else {
+            const mpqs::uint512& target = f_data_.a_target;
+            // Highest even start s with the window {s,…,s+2(k-1)} inside the FB.
+            uint32_t s_max = fb_size - 1u - 2u * (k - 1u);
+            if (s_max % 2u != 0u) s_max--;            // keep step-2 / even indexing
+
+            // product(s) is strictly increasing in s (drops the smallest prime,
+            // adds a larger one), so the closest window brackets the a_target
+            // crossover. Scan upward, record the closest, stop at first overshoot.
+            uint32_t best_start = band_start;
+            mpqs::uint512 best_diff;
+            bool have_best = false;
+            for (uint32_t s = band_start; s <= s_max; s += 2u) {
+                mpqs::uint512 product((uint32_t)1);
+                for (uint32_t j = 0; j < k; j++)
+                    product.mult_uint32(f_data_.factorBase[s + 2u * j]);
+                mpqs::uint512 diff = (product >= target) ? (product - target)
+                                                         : (target - product);
+                if (!have_best || diff < best_diff) {
+                    have_best  = true;
+                    best_diff  = diff;
+                    best_start = s;
+                }
+                if (product > target) break;          // monotone: closest is here
+            }
+
+            std::vector<uint32_t> forced(k);
+            for (uint32_t j = 0; j < k; j++) forced[j] = best_start + 2u * j;
+            f_data_.a_factors       = std::move(forced);
+            f_data_.max_a_index     = 1u << k;
+            f_data_.current_a_index = 0;
+
+            // Pivots exactly as init_a_factors (prime_algorithms.cu:769-775).
+            if (k % 2u == 0u) {
+                f_data_.lowerHalfStart = best_start + k - 2u;
+                f_data_.upperHalfStart = best_start + k;
+            } else {
+                f_data_.lowerHalfStart = best_start + k - 2u;
+                f_data_.upperHalfStart = best_start + k + 2u;
+            }
+            recalc_a(&f_data_);
+
+            // CRITICAL DIAGNOSTIC (LOG_INFO so it is visible without DEBUG):
+            // show whether k primes hit a_target or over/undershoot it.
+            const int a_bits = f_data_.a.msb() + 1;
+            const int t_bits = target.msb() + 1;
+            LOG(LOG_INFO) << "Forced shc_dim=" << k
+                          << " a=" << f_data_.a.to_string() << " (" << a_bits << " bits)"
+                          << " a_target=" << target.to_string() << " (" << t_bits << " bits)"
+                          << " a/a_target_bit_delta=" << (a_bits - t_bits)
+                          << " " << (f_data_.a >= target ? "(a>=target)" : "(a<target)")
+                          << " lowest_a_prime=" << f_data_.factorBase[best_start]
+                          << " highest_a_prime="
+                          << f_data_.factorBase[best_start + 2u * (k - 1u)]
+                          << " a_factor_indices=[" << best_start << ".."
+                          << (best_start + 2u * (k - 1u)) << " step2]";
+        }
+    }
+
+    // --- shc_dim summary (diagnostic-only, unconditional) ---
+    // Logs the FINAL shc_dim/|a| state regardless of whether the block above
+    // forced it or left the auto (init_a_factors-derived) value in place, so a
+    // sweep script can read the AUTO shc_dim (no --sieve_hc_dim passed) from
+    // the same log line format as a forced run. Visible under --verbose.
+    {
+        const uint32_t final_shc_dim = static_cast<uint32_t>(f_data_.a_factors.size());
+        const mpqs::uint512& target = f_data_.a_target;
+        const int a_bits = f_data_.a.msb() + 1;
+        const int t_bits = target.msb() + 1;
+        LOG(LOG_STATS) << "[shc_dim summary] mode="
+                       << (config_.sieve_hcube_dimension > 0 ? "forced" : "auto")
+                       << " shc_dim=" << final_shc_dim
+                       << " a_bits=" << a_bits << " a_target_bits=" << t_bits
+                       << " bit_delta=" << (a_bits - t_bits);
+    }
+
     if (config_.target_relations == 0) {
         // Heuristic: FB Size + 5% margin + 64 (for Block Wiedemann blocking)
         config_.target_relations = f_data_.size + (f_data_.size / 20) + 64;
@@ -2914,6 +3066,28 @@ void MPQSOrchestrator::logSieveProgress(
         LOG(LOG_STATS) << "ETA: " << std::fixed << std::setprecision(1)
                       << tracker.current_eta_sec << "s | Total est. time for stage 2: "
                       << FormatDuration((tracker.current_eta_sec + elapsed_sec) * 1000.0);
+    }
+
+    // --- Wide-accumulator bucket-overflow telemetry (host-side, read-only) ---
+    // Surfaces the silent large-prime bucket-overflow discard (root cause: the
+    // 2026-07-10 A100 uint16 degenerate-baseline analysis): the SCATTER
+    // kernel drops hits past globalBucketSize and the GATHER masks the overflow flag
+    // (bit 31 of dev_globalBucketCounts) off, so under-accumulation is otherwise
+    // invisible. WIDE-ONLY (u16 + u8sat) — getBucketOverflowStats() returns false on the
+    // narrow path, so the narrow production hot path takes no extra DtoH sync. A high
+    // fraction on the u16 leg (bucket 16384) vs ~0 on u8sat (bucket 32768) confirms the
+    // degenerate-baseline mechanism.
+    if (siever_) {
+        mpqs::sieve::DeviceSievingController::BucketOverflowStats bo;
+        if (siever_->getBucketOverflowStats(bo)) {
+            LOG_SET_SUBMODULE("BucketOverflow");
+            LOG(LOG_STATS) << "  overflowed buckets: "
+                << std::fixed << std::setprecision(2) << (100.0 * bo.fraction)
+                << "% (" << bo.overflowed_buckets << "/" << bo.total_buckets
+                << ") | globalBucketSize=" << bo.global_bucket_size
+                << " | max_fill=" << bo.max_fill
+                << "  [silent large-prime discard; high => under-accumulation]";
+        }
     }
 
     // --- Buffer fill snapshot (--verbose) ---
@@ -3940,6 +4114,11 @@ void MPQSOrchestrator::SieveStage() {
     cudaStream_t sieve_stream;
     CUDA_CHECK(cudaStreamCreate(&sieve_stream));
     siever_ = std::make_unique<mpqs::sieve::DeviceSievingController>(config_.device_id, sieve_stream);
+    siever_->setAccumulatorMode(config_.sieve_accumulator_mode);  // S1: override known before predicate runs
+    siever_->setWideAccumMode(config_.sieve_wide_accum_mode);     // Option A: wide-accumulator width override
+    siever_->setMetaCycleCap(config_.sieve_meta_cycle_cap);  // A2: SCATTER meta-cycle cap (0 = off)
+    siever_->setGatherBlockDim(config_.sieve_gather_block_dim);  // GATHER blockDim A/B knob (0 = off)
+    siever_->setBucketSizeFactor(config_.sieve_bucket_size_factor);  // bucket-overflow ablation knob (0 = legacy SB/2)
     siever_->initiate(f_data_);
     // M3: wire external_stop for sub-batch stop latency (cluster mode)
     if (config_.cluster_mode != ClusterMode::SOLO && siever_) {
@@ -5659,6 +5838,11 @@ MPQSOrchestrator::TruncatedSieveResult MPQSOrchestrator::TruncatedSieveRun(
         CUDA_CHECK(cudaStreamCreate(&sieve_stream));
         siever_ = std::make_unique<mpqs::sieve::DeviceSievingController>(config_.device_id, sieve_stream);
     }
+    siever_->setAccumulatorMode(config_.sieve_accumulator_mode);  // S1: override known before predicate runs
+    siever_->setWideAccumMode(config_.sieve_wide_accum_mode);     // Option A: wide-accumulator width override
+    siever_->setMetaCycleCap(config_.sieve_meta_cycle_cap);  // A2: SCATTER meta-cycle cap (0 = off)
+    siever_->setGatherBlockDim(config_.sieve_gather_block_dim);  // GATHER blockDim A/B knob (0 = off)
+    siever_->setBucketSizeFactor(config_.sieve_bucket_size_factor);  // bucket-overflow ablation knob (0 = legacy SB/2)
     siever_->initiate(f_data_);
     if (config_.lp1_bound > 0)
         siever_->setThresholdOverride(config_.lp1_bound);
@@ -6113,7 +6297,25 @@ void MPQSOrchestrator::LinearAlgebraStage() {
     bw_conf.solve_transposed = true; // (Left Kernel of A)
     bw_conf.nrows = matrix_A_.n_rows;
     bw_conf.device_id = config_.device_id;
-    bw_conf.checkpoint_prefix = config_.work_dir + "/bw";
+    // BW stage-boundary checkpointing (opt-in via --bw_checkpoint_dir). When a dir is
+    // given, save each stage's output (S / Pi / solutions) there; load (resume) ONLY when
+    // --bw_resume is set. Loading never happens implicitly — this closes the latent hazard
+    // where a default work_dir prefix + stage1_load_checkpoints=true could silently consume
+    // stale checkpoints from a prior run.
+    if (!config_.bw_checkpoint_dir.empty()) {
+        bw_conf.checkpoint_prefix = config_.bw_checkpoint_dir + "/bw";
+        bw_conf.stage1_save_checkpoints = true;
+        bw_conf.stage2_save_checkpoints = true;
+        bw_conf.stage3_save_checkpoints = true;
+        bw_conf.stage1_load_checkpoints = config_.bw_resume;
+        bw_conf.stage2_load_checkpoints = config_.bw_resume;
+        bw_conf.stage3_load_checkpoints = config_.bw_resume;
+    } else {
+        bw_conf.checkpoint_prefix = config_.work_dir + "/bw";
+        bw_conf.stage1_load_checkpoints = false;
+        bw_conf.stage2_load_checkpoints = false;
+        bw_conf.stage3_load_checkpoints = false;
+    }
     // Diagnostic (strictly opt-in via --dump_kernel_vectors): reuse the existing
     // BW solution writer (BWIOSystem::save_solutions). It emits <prefix>_W.bin and
     // <prefix>_sol_<i>.bin in the BW solver's ROW SPACE (= reduced rows on the
@@ -6125,6 +6327,7 @@ void MPQSOrchestrator::LinearAlgebraStage() {
     }
     bw_conf.m_block = (int)config_.bw_m;
     bw_conf.n_block = (int)config_.bw_n;
+    bw_conf.stage3_max_solutions = config_.bw_max_solutions;
     bw_conf.block_size_pinned = config_.isPinned("bw_m") || config_.isPinned("bw_n");
     bw_conf.stage1_gpu_batch_size = 8;
 
@@ -6651,6 +6854,43 @@ void MPQSOrchestrator::networkLoop() {
     uint64_t last_sample_rels = 0;
     auto     last_log_time    = sieve_start;
 
+    // --- P0.c: Thread-A occupancy telemetry (permanent, always-on) ---
+    // Thread A is the coordinator's sole consumer of all cluster relation traffic and is
+    // serial: recv → deserialize → buffer partials → dedup → LP match. These counters
+    // attribute its wall-clock across those stages, so a saturating LP table (per-witness
+    // cost growing with table size) is separable from a falling physical yield — the two
+    // hypotheses that both predict the observed late-run rate decay.
+    // Cost: one steady_clock pair per stage per MESSAGE — never per witness — i.e. ~1e3
+    // reads/s against ~1e3 batches/s of work, each batch ~1e3 relations.
+    // Scope: the steady-state loop below. The one-shot resume re-injection above and the
+    // post-STOP flush drains are excluded; no stats line is emitted during either.
+    struct ThreadAOccupancy {
+        uint64_t recv_us         = 0;  ///< comm_backend_->recv() drain, incl. per-frame CRC32
+        uint64_t deser_us        = 0;  ///< deserializeIncrementalBatch
+        uint64_t bufpart_us      = 0;  ///< bufferClusterPartials (raw-partial buffer growth)
+        uint64_t addrel_us       = 0;  ///< RelationAccumulator::addRelations (dedup)
+        uint64_t insmatch_us     = 0;  ///< CPULargePrimeTable::insertAndMatch (LP matching)
+        uint64_t ctl_us          = 0;  ///< control-message dispatch (chunk/heartbeat/straggler)
+        uint64_t sleep_us        = 0;  ///< idle back-off: Thread A had no work ⇒ not the wall
+        uint64_t insmatch_max_us = 0;  ///< longest single insertAndMatch (rehash-stall detector)
+        uint64_t insmatch_calls  = 0;  ///< insertAndMatch call count
+    } occ;
+
+    /// Accumulate µs elapsed since t0 into acc; returns the sample.
+    auto occTick = [](uint64_t& acc, std::chrono::steady_clock::time_point t0) -> uint64_t {
+        uint64_t us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+        acc += us;
+        return us;
+    };
+    /// occTick for insertAndMatch: cumulative + max-single-call + call count.
+    auto occMatch = [&](std::chrono::steady_clock::time_point t0) {
+        uint64_t us = occTick(occ.insmatch_us, t0);
+        if (us > occ.insmatch_max_us) occ.insmatch_max_us = us;
+        ++occ.insmatch_calls;
+    };
+
     /// Sample current progress, update ETA model, and emit a throttled (~5s) status line.
     auto sampleProgress = [&]() {
         auto     now     = std::chrono::steady_clock::now();
@@ -6693,6 +6933,39 @@ void MPQSOrchestrator::networkLoop() {
                            << " | " << comb << " combines ("
                            << std::fixed << std::setprecision(1) << comb_rate << "/s)"
                            << " | yield " << std::fixed << std::setprecision(1) << yield << "%";
+
+            // P0.c Thread-A occupancy — PARSER CONTRACT (stable field order; extend only
+            // by APPENDING). Space-separated key=value pairs; every value is a raw plain
+            // uint64 decimal. NEVER fmtSize() here: its K/M truncation above 1,000 silently
+            // froze a whole campaign's witness extraction (fixed b7ff2ce/2504647).
+            //   elapsed_us       wall-clock since sieve start — the occupancy denominator
+            //   recv_us          TCP drain + CRC32
+            //   deser_us         batch deserialization
+            //   bufpart_us       raw-partial buffering (cluster_raw_partials_ growth)
+            //   addrel_us        accumulator dedup
+            //   insmatch_us      LP insert/match
+            //   ctl_us           control-message dispatch (chunk/heartbeat/straggler)
+            //   sleep_us         idle back-off (Thread A starved for work)
+            //   insmatch_max_us  longest single insertAndMatch call (rehash stall)
+            //   insmatch_calls   insertAndMatch call count
+            //   buckets          LP table bucket_count() (steps at each rehash)
+            //   witnesses        LP table size() (load factor = witnesses/buckets)
+            // All counters are cumulative and monotonic — differentiate consecutive samples
+            // for an interval rate. Thread-A busy fraction = (elapsed_us - sleep_us)/elapsed_us;
+            // per-stage share = <stage>_us/elapsed_us. Saturation ⇒ sleep_us stops growing.
+            LOG(LOG_STATS) << "[Cluster] LPocc:"
+                           << " elapsed_us=" << static_cast<uint64_t>(elapsed * 1e6)
+                           << " recv_us=" << occ.recv_us
+                           << " deser_us=" << occ.deser_us
+                           << " bufpart_us=" << occ.bufpart_us
+                           << " addrel_us=" << occ.addrel_us
+                           << " insmatch_us=" << occ.insmatch_us
+                           << " ctl_us=" << occ.ctl_us
+                           << " sleep_us=" << occ.sleep_us
+                           << " insmatch_max_us=" << occ.insmatch_max_us
+                           << " insmatch_calls=" << occ.insmatch_calls
+                           << " buckets=" << cluster_cpu_lp_->bucketCount()
+                           << " witnesses=" << wit;
         }
     };
 
@@ -6873,18 +7146,27 @@ void MPQSOrchestrator::networkLoop() {
     // chunk pool / scheduler do not touch the LP table or accumulator partial path).
     auto processIncrementalBatch = [&](const cluster::RecvMessage& m) {
         structures::HostRelationBatch full_batch, partial_batch;
-        if (cluster::deserializeIncrementalBatch(
+        auto t_ds = std::chrono::steady_clock::now();
+        const bool deser_ok = cluster::deserializeIncrementalBatch(
                 m.payload.data(), m.payload.size(),
-                full_batch, partial_batch)) {
+                full_batch, partial_batch);
+        occTick(occ.deser_us, t_ds);
+        if (deser_ok) {
             if (full_batch.num_relations > 0) {
+                auto t_ar = std::chrono::steady_clock::now();
                 cluster_accumulator_->addRelations(
                     full_batch, /*source_id=*/m.sender_id);
+                occTick(occ.addrel_us, t_ar);
             }
             if (cluster_cpu_lp_ && partial_batch.num_relations > 0) {
+                auto t_bp = std::chrono::steady_clock::now();
                 bufferClusterPartials(partial_batch);  // M6
+                occTick(occ.bufpart_us, t_bp);
                 uint64_t lp_before = cluster_accumulator_->relationsFrom(255);
+                auto t_im = std::chrono::steady_clock::now();
                 cluster_cpu_lp_->insertAndMatch(
                     partial_batch, *cluster_accumulator_);
+                occMatch(t_im);
                 node_telemetry[0].lp_combined +=
                     cluster_accumulator_->relationsFrom(255) - lp_before;
             }
@@ -6918,7 +7200,9 @@ void MPQSOrchestrator::networkLoop() {
             cluster::DirectChannel::Payload payload;
             while (cluster_channel_->tryPop(payload)) {
                 if (payload.full.num_relations > 0) {
+                    auto t_ar = std::chrono::steady_clock::now();
                     cluster_accumulator_->addRelations(payload.full, /*source_id=*/0);
+                    occTick(occ.addrel_us, t_ar);
                     // Telemetry: node 0 full relations
                     double elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - sieve_start).count();
@@ -6928,11 +7212,15 @@ void MPQSOrchestrator::networkLoop() {
                     t0.last_relation_time = elapsed;
                 }
                 if (cluster_cpu_lp_ && payload.partials.num_relations > 0) {
+                    auto t_bp = std::chrono::steady_clock::now();
                     bufferClusterPartials(payload.partials);  // M6
+                    occTick(occ.bufpart_us, t_bp);
                     // Telemetry: node 0 partials + LP-combined
                     node_telemetry[0].partial_relations += payload.partials.num_relations;
                     uint64_t lp_before = cluster_accumulator_->relationsFrom(255);
+                    auto t_im = std::chrono::steady_clock::now();
                     cluster_cpu_lp_->insertAndMatch(payload.partials, *cluster_accumulator_);
+                    occMatch(t_im);
                     node_telemetry[0].lp_combined +=
                         cluster_accumulator_->relationsFrom(255) - lp_before;
                 }
@@ -6945,9 +7233,18 @@ void MPQSOrchestrator::networkLoop() {
             cluster::RecvMessage msg;
             auto now = std::chrono::steady_clock::now();
             deferred_batches.clear();
-            while (comm_backend_->recv(msg)) {
+            // P0.c: the drain is split recv-vs-dispatch so the two stages attribute
+            // separately. ctl_us covers every case below EXCEPT the deferred batch replay
+            // (which is timed per-stage inside processIncrementalBatch); INCREMENTAL_BATCH
+            // contributes only its O(1) move-push onto the deferred FIFO.
+            for (;;) {
+                auto t_rv = std::chrono::steady_clock::now();
+                const bool got = comm_backend_->recv(msg);
+                occTick(occ.recv_us, t_rv);
+                if (!got) break;
                 if (!msg.valid) continue;
 
+                auto t_ctl = std::chrono::steady_clock::now();
                 switch (msg.type) {
                 case cluster::MsgType::INCREMENTAL_BATCH: {
                     // Chunk-assignment latency fix: defer the heavy LP-match work so
@@ -7131,6 +7428,7 @@ void MPQSOrchestrator::networkLoop() {
                                      << " from " << (int)msg.sender_id;
                     break;
                 }
+                occTick(occ.ctl_us, t_ctl);
             }
 
             // Chunk-assignment latency fix: now that every control message in this
@@ -7145,6 +7443,7 @@ void MPQSOrchestrator::networkLoop() {
 
             // --- M3: Heartbeat timeout check (every 5 seconds) ---
             if (now - last_timeout_check > std::chrono::seconds(5)) {
+                auto t_hb = std::chrono::steady_clock::now();  // P0.c: also chunk-mgmt
                 last_timeout_check = now;
                 for (auto& [wid, wt] : worker_trackers) {
                     if (!wt.alive) continue;
@@ -7196,6 +7495,7 @@ void MPQSOrchestrator::networkLoop() {
                                             /*is_redispatch=*/true);
                     }
                 }
+                occTick(occ.ctl_us, t_hb);
             }
         }
 
@@ -7405,7 +7705,9 @@ void MPQSOrchestrator::networkLoop() {
         }
 
         // 5. Brief sleep to avoid busy-wait
+        auto t_sl = std::chrono::steady_clock::now();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        occTick(occ.sleep_us, t_sl);
     }
 
     LOG(LOG_INFO) << "[Thread A] Network loop exiting"

@@ -49,6 +49,10 @@ public:
                         RelationAccumulator& accumulator);
 
     uint64_t witnesses() const { return table_.size(); }
+    /// Current bucket count. P0.c rehash detector: the ctor reserves 1<<20 buckets, so a
+    /// growing table rehashes (stop-the-world rebuild of every node) at each doubling —
+    /// a step in this value between two stats samples dates the stall exactly.
+    uint64_t bucketCount() const { return table_.bucket_count(); }
     uint64_t totalInserts() const { return total_inserts_; }
     uint64_t totalMatches() const { return total_matches_; }
     uint64_t totalCombines() const { return total_combines_; }
