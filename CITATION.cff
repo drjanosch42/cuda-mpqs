@@ -8,10 +8,13 @@ abstract: >-
   across a small cluster of GPUs, combining a fully on-device sieve with a
   packed sparse GF(2) preprocessor and a Block Wiedemann linear algebra solver.
 authors:
-  - family-names: Heinrichs
-    given-names: Christoph
   - family-names: Januszewski
     given-names: Fabian
+    affiliation: "Paderborn University"
+    orcid: "https://orcid.org/0000-0002-3184-237X"
+  - family-names: Heinrichs
+    given-names: Christoph
+    affiliation: "Paderborn University"
 version: "1.0.5"
 date-released: "2026-07-17"
 license: LGPL-3.0-only
