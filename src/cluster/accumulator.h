@@ -158,7 +158,7 @@ public:
         return std::move(accumulated_);
     }
 
-    /// Non-consuming const view of the accumulated deduped smooths (S3 coordinator
+    /// Non-consuming const view of the accumulated deduped smooths (coordinator
     /// checkpoint, M3). Unlike extractFinal() — which std::moves accumulated_ out and
     /// leaves the accumulator empty — peek() leaves it intact so the live cluster run
     /// continues unperturbed. Thread A is the sole mutator, so a read taken at the

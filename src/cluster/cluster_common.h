@@ -57,14 +57,14 @@ enum class MsgType : uint8_t {
     WORK_MORE       = 0x11,  ///< Coordinator -> Worker: additional poly range (Stage 2)
     WORK_REQUEST    = 0x12,  ///< Worker -> Coordinator: request more work (Stage 2)
 
-    // S5: Dynamic chunked distribution
+    // Dynamic chunked distribution
     CHUNK_ASSIGN    = 0x13,  ///< Coordinator -> Worker: chunk of a-values
     CHUNK_COMPLETE  = 0x14,  ///< Worker -> Coordinator: chunk done + stats
     CHUNK_REQUEST   = 0x15,  ///< Worker -> Coordinator: re-request work (NO stats; recovers a
                              ///< dropped/failed CHUNK_ASSIGN — distinct from CHUNK_COMPLETE so
                              ///< the retry never re-applies relation/partial counts)
 
-    // S8: Straggler recall
+    // Straggler recall
     CHUNK_RECALL    = 0x17,  ///< Coordinator -> Worker: stop current chunk, report partial progress
 
     // Relation transfer

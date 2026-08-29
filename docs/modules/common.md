@@ -16,7 +16,7 @@ Static library `mpqs_common`. Separable CUDA compilation ON. Links `cudampqs_bui
 | `uint128_helper.cuh` | Safe 64-bit modular arithmetic (`add_mod`, `sub_mod`, `mul_mod`, `pow_mod`) via `__int128` intermediates. |
 | `mpqs_structures.h` | AoS `Relation` struct (`mpqs::structures`): polynomial coefficients (a, b, x), factor list (max 64 entries), large prime cofactor, `char_bits`; `Hash128` functor for `unsigned __int128` map keys. |
 | `mpqs_soa.h` | SoA containers (`mpqs::structures`): `HostRelationBatch` (host), `RelationBatch` (device), `RelationBatchView` (kernel-passable). |
-| `mpqs_soa.cu` | SoA batch operations: resize, append, validation kernel, D-to-H/H-to-D transfer (incl. managed-memory path), counter management. |
+| `mpqs_soa.cu` | SoA batch operations: resize, append, validation kernel, D-to-H/H-to-D transfer (incl. managed-memory path), counter management. Carries the module's one NVCC workaround: `__device__ __noinline__ square_uint512()` (`mpqs_soa.cu:618-623`), split out to stop NVCC 13.0 miscompiling the inlined `mult` at `-O3` on SM 12.0 (Blackwell). |
 | `relation_hash.h` | `mpqs::computeRelationHash()` — SINGLE SOURCE OF TRUTH for the 64-bit relation dedup hash, byte-for-byte identical to the GPU `compute_relation_hashes_soa`; shared by the cluster `RelationAccumulator` and the solo checkpoint dedup. |
 | `logger/hpc_logger.h` | `HPCLogger` singleton + `LogMessage` proxy. Severity levels, multi-sink `SinkConfig`, stage/module/submodule context, macros. |
 | `logger/hpc_logger.cpp` | Logger implementation: thread-safe writes, console/file/error-file sinks, CSV mode. |
@@ -39,13 +39,13 @@ Free helpers in `mpqs` namespace: `clz32(uint32_t)`, `ctz32(uint32_t)` — porta
 | Factory | `static max_value()` — returns 2^512 - 1 |
 | Arithmetic | `add`, `sub`, `mult`, `div`, `mod`, `div_mod_core(divisor, remainder_out*)` |
 | Small-type arithmetic | `add_uint32(uint32_t)`, `mult_uint32(uint32_t)`, `mul_uint64_inplace(uint64_t)` → returns overflow carry, `div_uint32_inplace(uint32_t)` → returns remainder, `div_uint64_inplace(uint64_t)` → returns remainder, `div_uint32_const(uint32_t)` → non-destructive quotient, `mod_uint32(uint32_t)` → const read-only remainder, `mod_uint64(uint64_t)` → const read-only 64-bit remainder (limb-by-limb `__int128`; used by branch char-bit capture to compute `|ax+b| mod q`) |
-| Modular | `add_mod`, `sub_mod`, `double_mod`, `mul_mod`, `negate_mod_inplace`, `additive_inverse_mod_n` — `add_mod` is the overflow-safe `(X+Y) mod N` used by the sqrt stage before `gcd(X+Y, N)` (a plain 512-bit add would wrap for N ≥ 2^511) |
+| Modular | `add_mod`, `sub_mod`, `double_mod`, `mul_mod`, `negate_mod_inplace` (`additive_inverse_mod_n` was **removed**, `uint512.cuh:636-637` — use `negate_mod_inplace`, which assumes `*this < N`) — `add_mod` is the overflow-safe `(X+Y) mod N` used by the sqrt stage before `gcd(X+Y, N)` (a plain 512-bit add would wrap for N ≥ 2^511) |
 | Specialized | `mul_add_mod_signed(int64_t x, b, N)` — computes `(a*x + b) mod N` for polynomial evaluation |
 | Bit ops | `lshift`, `rshift`, `msb()`, `countr_zero()`, `msb_is_set()` |
 | Queries | `is_zero()`, `is_one()`, `fits_in_128()`, `to_uint128()` |
 | Number theory | `sqrt()` — Newton-Raphson integer square root, exact `floor(sqrt(n))` (see below) |
 | Signed helpers | `abs_twos_complement(int8_t& sign)` — interprets as two's complement, returns magnitude and sign |
-| Conversion | `to_string()` (decimal, host only), `to_hex_string()` (host only), `print()` (device-compatible) |
+| Conversion | `to_string()` (decimal, host only, `uint512.cuh:904`), `to_hex_string()` (host only, `:938`) |
 | Operators | Full set: `+`, `-`, `*`, `/`, `%`, comparisons. Mixed-type overloads for `uint32_t` and `uint64_t`. |
 
 #### `uint512::sqrt()` — seed-from-above fix (v1.0.4c)
@@ -128,6 +128,24 @@ Namespace: `mpqs::structures`. Device-resident SoA with atomic dual-counters and
 | `getLargePrimesData()` / `getFactorOffsetsData()` | Raw device pointer accessors (for Thrust) |
 | `getDeviceCountPtr()` | Device pointer to the relation-count atomic (telemetry kernels) |
 | `getCapacityRels()` / `getCapacityFactors()` | Allocated capacity (not fill count) |
+
+**⚠ `append()` overflow discard is a live trigger for a latent defect downstream (noted 2026-08-25).**
+When the destination is full, `append()` clamps the copy and emits
+`[RelationBatch] Append DISCARDING data. Buffer Full. Added <k>/<N> relations.`
+(`mpqs_soa.cu:375`, `LOG_WARNING`; the method itself is at `mpqs_soa.cu:293`). The discard is safe
+*here* — counters and CSR offsets stay consistent — but a run of these warnings is the documented
+**trigger precondition** for an unfixed uint32 length underflow in post-dedup compaction:
+`postprocessing.cu:1435` reads the last row length as a `uint32_t`, `:1444` forms
+`total_new_factors = last_offset + last_len`, and `:1454` hands the wrapped value straight to
+`resize()`. Observed once (A100 job 34116294: `Total new factors: 4294967272` = 2^32−24 →
+illegal memory access), only under `ncu` serialization, never in a production run. Nothing in
+`src/common/` needs to change for this — the fix belongs in `src/postprocessing/` — but treat these
+warnings as a real signal rather than benign backpressure.
+
+> **Note on the "silent" characterisation:** this path is sometimes described as a *silent* `Append
+> DISCARDING` path, with "give it a `LOG_WARNING`" listed as a fix direction. Against live source
+> that is **stale** — the path has already logged at `LOG_WARNING` since before v1.0.5, and this is
+> its only occurrence in the tree. Only the uint32 arithmetic remains unfixed.
 
 ### RelationBatchView (kernel-passable)
 

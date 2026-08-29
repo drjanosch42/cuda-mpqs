@@ -3,15 +3,14 @@
 // This file is part of cuda-mpqs (GPU-accelerated SIQS/MPQS factorization).
 // See LICENSE at the repository root for licensing terms, including the NVIDIA CUDA Toolkit exception.
 //
-// Committed regression test for the WIDE (uint16) num_polys apply-path clamp (S1
-// of the wide-autotune foundation).
+// Committed regression test for the WIDE (uint16) num_polys apply-path clamp.
 //
 // It exercises the REAL production helper clampWideNumPolys() from
 // src/sieve/sieve_memory_model.h — the single source of truth the custom apply
 // path (device_sieving_controller.cpp::loadPartialCustomConfig, the
 // autotune / pinned-tuple / AutoApply route) now runs to cap
-// num_polysPerSieveCall at kWideNumPolysCap (512) on the wide path. Before S1
-// that path set num_polysPerSieveCall directly from the tuned tuple, so an
+// num_polysPerSieveCall at kWideNumPolysCap (512) on the wide path. Before the
+// clamp that path set num_polysPerSieveCall directly from the tuned tuple, so an
 // autotune winner could re-inflate polys and re-introduce the ~8-16x bucket-write
 // traffic the 27f810e wide-geometry fix removed.
 //

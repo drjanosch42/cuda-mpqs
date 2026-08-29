@@ -15,8 +15,8 @@ Namespace: `mpqs::autotune`.
 | `autotune_projection.cpp` | 488 | 4-tier projection cascade: exact match, interpolation, extrapolation, theory fallback |
 | `kernel_param_optimizer.h` | 120 | `optimizeKernelLaunchParams()`, candidate value arrays (narrow + wide), heuristic defaults, wide probe constants |
 | `kernel_param_optimizer.cpp` | 464 | Seeded coordinate descent over 8 kernel launch parameters; wide (uint16) survivors/sec search with floor gate |
-| `kernel_launch_validator.h` | 159 | `KernelLaunchValidator` class, `PreflightResult`, `Params8`, `ParamIndex` enum |
-| `kernel_launch_validator.cpp` | 456 | 6-check validation pipeline, enumeration, preflight with LP-aware auto-correction |
+| `kernel_launch_validator.h` | 192 | `KernelLaunchValidator` class (device-id **and** explicit-`DeviceLimits` constructors), `PreflightResult`, `Params8`, `ParamIndex` enum, `SieveConstants` (incl. `allow_nonpow2_geometry`), `admissibleSasGridDim()` |
+| `kernel_launch_validator.cpp` | 551 | 6-check validation pipeline (**per-parameter** power-of-two policy since v1.0.6), enumeration, preflight with LP-aware auto-correction |
 | `runtime_estimator.h` | 37 | `estimateRuntime()` free function |
 | `runtime_estimator.cpp` | 273 | Truncated sieve probe via ephemeral orchestrator, ETA extrapolation, confidence scoring |
 | `sieve_optimizer.h` | 185 | `SieveParameterOptimizer` class with joint (F,L) convex optimizer |
@@ -33,7 +33,16 @@ Namespace: `mpqs::autotune`.
 | `memory_estimator.h` | 53 | `memory_costs` namespace (per-element byte costs for on-device buffers), `kMinPartialBufferSize` floor constant |
 | `CMakeLists.txt` | 29 | Static library `mpqs_autotune`, links `mpqs_common`, `mpqs_sieve` |
 
-Total: ~6,400 lines across 23 source files.
+Total: ~6,500 lines across 23 source files (`wc -l src/autotune/*` = 6,539 including `CMakeLists.txt`, 2026-08-25).
+
+Three committed unit tests live outside this directory but test only this module — all registered in
+`tests/CMakeLists.txt` and all pure host arithmetic (no sieve kernel is launched):
+
+| Source (`tools/autotune/`) | Lines | ctest target | Covers |
+|---|---|---|---|
+| `test_admissible_geometry.cu` | 220 | **`admissible_geometry`** (`tests/CMakeLists.txt:240-248`) | the v1.0.6 per-parameter pow2 policy + `admissibleSasGridDim`. Drives the real `KernelLaunchValidator` through its explicit-`DeviceLimits` constructor, so it needs no CUDA device. |
+| `test_oom_guard.cu` | 216 | **`oom_guard`** (`:204-212`) | the Stage-1 total-footprint OOM guard: no-regression at pinned `M = 131,072`, and the guard firing (candidate skip + seed clamp) against a synthetic tiny free-VRAM budget. Reads device properties only. |
+| `test_wide_num_polys_clamp.cu` | 116 | **`wide_num_polys_clamp`** (`:222-230`) | `clampWideNumPolys()` — the wide `num_polys <= kWideNumPolysCap = 512` cap on the `loadPartialCustomConfig` apply path (autotune / pinned tuple / AutoApply). |
 
 ## Architecture Overview
 
@@ -141,7 +150,23 @@ High confidence (1.0) -> 5% radius; zero confidence -> 50% radius.
 | 6 | `sasGridDim` | P_SAS_GRID_DIM | `ss_conf.num_threadBlocks` | {32, 128, 256, 512} |
 | 7 | `sasBlockDim` | P_SAS_BLOCK_DIM | `ss_conf.num_threadsPerBlock` | {256, 512, 1024} |
 
-All values must be powers of 2.
+**Power-of-two policy (statement updated 2026-08-25; the pre-v1.0.6 sentence "All values must be
+powers of 2" is superseded as a blanket rule, but remains exactly true of everything the autotuner
+itself can produce).**
+
+*The search space above is unchanged.* `CANDIDATE_VALUES_0..7` and `HEURISTIC_DEFAULTS`
+(`kernel_param_optimizer.h:38-47`) are byte-for-byte identical to v1.0.5 (`7c154c9`) — verified by
+`git diff 7c154c9..HEAD -- src/autotune/kernel_param_optimizer.h` returning empty — and every value
+in them is a power of two. Nothing under `src/autotune/` proposes, projects, or auto-applies an
+SM-aligned (non-power-of-two) tuple; leaving the autotuner alone was a deliberate v1.0.6 decision.
+**The autotuner cannot find a non-power-of-two geometry.** Automatic discovery is parked, unscheduled.
+
+What v1.0.6 changed is only the *validator's* rule set: on the **narrow batch** sieve path the
+`KernelLaunchValidator` will now ACCEPT a non-power-of-two `subCubeSize` (0), `metaGridDim` (4) and
+`sasGridDim` (6) **if a caller supplies one**. The only such caller is a pinned `--params` on the
+command line (`tests/cuda-mpqs.cpp:738-760` parses the 8-tuple with no power-of-two check) — or an
+`autotune_history.json` entry that recorded one. See
+[SM-Aligned (Non-Power-of-Two) Geometry](#sm-aligned-non-power-of-two-geometry-v106) below.
 
 ### Algorithm
 
@@ -155,25 +180,27 @@ All values must be powers of 2.
 
 **Post-optimization:** Clears sticky CUDA errors (`cudaDeviceSynchronize()` + `cudaGetLastError()`) that may accumulate from failed kernel launches during benchmarking. Runs a defense-in-depth preflight check on the winning config before applying to the pipeline.
 
-**Stage-1 OOM guard:** the controller passes `non_sieve_bytes` = `computePostprocessingLpBytes()` (postprocessing/LP device footprint + CUDA-context reserve, computed from `memory_estimator.h` per-element costs) into `optimizeKernelLaunchParams()`; when > 0 the optimizer skips/clamps any candidate — and gates its own seed eval — whose complete footprint exceeds 0.80 of free VRAM.
+**Stage-1 OOM guard:** the controller passes `non_sieve_bytes` = `computePostprocessingLpBytes()` (postprocessing/LP device footprint + CUDA-context reserve, computed from `memory_estimator.h` per-element costs) into `optimizeKernelLaunchParams()`; when > 0 the optimizer skips/clamps any candidate — and gates its own seed eval — whose complete footprint exceeds 0.80 of free VRAM (`fitsTotalFootprint()`, `kernel_launch_validator.cpp:295-314`, over `estimateSieveFootprint()` + `sieveBucketBudget()`).
 
-### Wide-Path (uint16) Autotune (S0–S5)
+*Root cause it fixed (commits `62043ed` / `04e1ab6`):* the historical bucket-memory expression multiplied **three `uint32_t` fields** (`num_polysPerSieveCall * num_sievingBlocksPerSieveCall * globalBucketSize`) in 32-bit **before** the trailing `* sizeof(uint64_t)` promoted to 64-bit, so for buckets ≥ 4 GB the product **wrapped** — at the `M = 262K` seed it wrapped to 0, which made the "halve `num_polys` until the bucket fits" reduction loop a **no-op** and let an over-budget config through unremarked. The formula had been hand-rolled in five drifted copies; it now lives once in `src/sieve/sieve_memory_model.h` (`bucketEntriesBytes()` / `estimateSieveFootprint()` / `sieveBucketBudget()` / `reduceNumPolysToBudget()`), all products promoted to `uint64_t`, and every site — `loadStandardConfig`'s reduction loop, `validateConfigs`' `LEQ_CHECK`, `checkGlobalMem`, its `diagnose()` message, `printBufferRecommendations` **and** this guard — reads the same `kSieveBudgetNum/kSieveBudgetDen = 4/5` constant, so the autotuner can never pick a config the production checks then reject. Regression test: ctest **`oom_guard`**.
+
+### Wide-Path (uint16) Autotune
 
 When the siever resolved to the wide accumulator (`siever.isWideAccumulator()`, i.e. the
-RSA-150/155 uint16 — or Option-A saturating-uint8 — regime), Stage 1 switches from the
+RSA-150/155 uint16 — or saturating-uint8 — regime), Stage 1 switches from the
 narrow µs-timing objective to a **survivors/sec rate objective** that actually drives the
 committed `sieveAndScanBatchKernelWide` geometry (`loadPartialCustomConfig`-wide, matched to
 u8sat when selected). The narrow (uint8) path is byte-for-byte unchanged. All discriminators
 live in `KernelParamResult`: `objective_is_rate` (true ⇒ `timing_us` is survivors/sec,
 HIGHER is better), `beats_floor`, `floor_score`.
 
-- **Survivors/sec harness (S3):** each candidate re-sieves the same staged polynomial sample
+- **Survivors/sec harness:** each candidate re-sieves the same staged polynomial sample
   (`--autotune_probe_polys`, 0 = auto-scale by N) over a wall-clock window
   (`WIDE_PROBE_WINDOW_SEC` = 10 s, shrinking toward `WIDE_PROBE_WINDOW_FLOOR_SEC` = 6 s under a
   tight `probe_budget_sec`), after a discarded `WIDE_PROBE_WARMUP_SEC` = 2.5 s warm-up (JIT,
   clock ramp, caches). When the budget is exhausted the search stops adding candidates but the
   floor is ALWAYS still timed.
-- **Floor gate (S4):** `loadStandardConfig`-wide is timed as candidate #0
+- **Floor gate:** `loadStandardConfig`-wide is timed as candidate #0
   (`sieveMiniStandardWide()`, the `floor_score`); the tuned winner is applied only if its rate
   ≥ `floor · (1 + WIDE_FLOOR_MARGIN)` (margin 0.05). Otherwise the controller keeps the
   loadStandardConfig defaults (`useParams = false`) — provable parity; closes the −73%
@@ -182,7 +209,7 @@ HIGHER is better), `beats_floor`, `floor_score`.
   off / too-tight threshold at this scale) means the autotune got no signal: warn and keep
   loadStandardConfig instead of silently reverting to a meaningless floor
   (`stages[1].notes = "wide no-signal: keeping loadStandardConfig"`).
-- **Occupancy-seeded search (S5):** the search is seeded AT the known-good wide default (not
+- **Occupancy-seeded search:** the search is seeded AT the known-good wide default (not
   descended from `HEURISTIC_DEFAULTS`, whose geometry region is wrong for wide); the GATHER
   blockDim seed comes from `siever.wideGatherOccupancyBlockDim()` (cudaOccupancy API; falls
   back to the standard value when unavailable). The wide sweep uses its own index lists —
@@ -194,7 +221,7 @@ HIGHER is better), `beats_floor`, `floor_score`.
   `2M/SB_wide`) and is excluded from both lists.
 
 Validated on RTX 5070 Ti: floor gate fired on the −73% regression scenario; +38.5% wide efficacy
-at RSA-100; narrow byte-identical (RSA-100 ~85 s record reproduced on the S0–S5 binary).
+at RSA-100; narrow byte-identical (RSA-100 ~85 s record reproduced on the same binary).
 
 ### Skip Logic
 
@@ -210,24 +237,151 @@ Ordered from cheapest to most expensive:
 
 | Check | Rule | Source |
 |-------|------|--------|
-| 1. Power-of-2 | All 8 params are powers of 2 | `validateConfigs:864-872` |
-| 2. Arithmetic | `subCubeSize <= 2^(shc_dim-1)`, `blocksPerCycle <= numIntervals`, `metaGridDim * polyBlockSize <= subCubeSize`, derived `num_polyBlocksPerTB` is pow2, exact decomposition equalities | `validateConfigs:874-885` |
-| 3. Shared memory | `blocksPerCycle * polyBlockSize * 4B <= maxSharedMem`, `sievingBlockSize + 3*1024*4B <= maxSharedMem` | `validateConfigs:889-890` |
-| 4. Global memory | `subCubeSize * numIntervals * globalBucketSize * 8B <= 3/4 * totalGlobalMem` | `validateConfigs:888` |
+| 1. Power-of-2 | **Per parameter** (`pow2Required(idx)`, `kernel_launch_validator.cpp:166-169`): every index must be **non-zero**; all 8 must be pow2 in the legacy/wide regime; on the narrow batch path indices 0/4/6 (`subCubeSize`, `metaGridDim`, `sasGridDim`) are exempt. *(Superseded 2026-08-25: the old "all 8 params are powers of 2" was unconditional.)* | `validateConfigs` `POW2_CHECK` / `POW2_UNLESS_CHECK`, `device_sieving_controller.cpp:1900,2029,2054-2069` |
+| 2. Arithmetic | `subCubeSize <= 2^(shc_dim-1)`, `blocksPerCycle <= numIntervals`, `metaGridDim <= subCubeSize`, `metaGridDim * polyBlockSize <= subCubeSize`; **G3** `sasGridDim <= subCubeSize`; **G1** `sasGridDim` divides `subCubeSize`; **G2** the GATHER chunk `subCubeSize/sasGridDim` is a power of two; **SCATTER exact partition** `metaGridDim*polyBlockSize` divides `subCubeSize` — checked **before** deriving `num_polyBlocksPerTB`; derived `num_polyBlocksPerTB > 0`, and pow2 **only when `pow2Required` holds** (legacy/wide); exact decomposition equalities | `validateConfigs` G1/G2/G3 + V5, `device_sieving_controller.cpp:2071-2087,2093-2102` |
+| 3. Shared memory | `blocksPerCycle * polyBlockSize * 4B <= maxSharedMem`; `sievingBlockSize * accumulatorBytes + 3 * bigPrimeStartIndex * 4B <= maxSharedMem`, where `bigPrimeStartIndex = sievingBlockSize / 32` and `accumulatorBytes` = 1 (narrow / u8sat) or 2 (uint16 wide). *(Corrected 2026-08-26: the old second term `sievingBlockSize + 3*1024*4B` hardcoded a `bigPrimeStartIndex` of 1024 and omitted the accumulator width; neither has been constant since the wide fork.)* | `checkSharedMem`, `kernel_launch_validator.cpp:260-269`; `bigPrimeStartIndex`/`accumulatorBytes` set in `buildSieveConstants`, `:437-444`. Mirrored production-side by `validateConfigs`' `EQUAL_CHECK` on `ss_conf.sharedMemReq` + `LEQ_CHECK` vs `maxSharedMemPerBlock`, `device_sieving_controller.cpp:2097-2100,2120-2121` |
+| 4. Global memory | `bucketEntriesBytes(subCubeSize, numIntervals, globalBucketSize)` = `subCubeSize * numIntervals * globalBucketSize * 8B` `<= sieveBucketBudget(totalGlobalMem, 0, kSieveBudgetNum, kSieveBudgetDen)` = **0.80 × totalGlobalMem**. *(Corrected 2026-08-26: the documented `3/4` is superseded — `kSieveBudgetNum/kSieveBudgetDen` flipped 3/4 → 4/5 in the memory-model refactor, `src/sieve/sieve_memory_model.h:64-65`. The comparison is integer-exact by design; a `double` 0.80 can flip the seed reduction loop's last halving.)* | `checkGlobalMem`, `kernel_launch_validator.cpp:277-289`; production twin `validateConfigs` `LEQ_CHECK`, `device_sieving_controller.cpp:2119` |
 | 5. Device limits | `metaBlockDim`, `sasBlockDim <= maxThreadsPerBlock`; grid dims <= `maxGridSize[0]` | CUDA runtime |
-| 6. Non-zero derived | `num_sievingBlockBatches > 0`, `num_subCubes > 0`, `num_polyBlocksPerTB > 0`, `num_metaSieveCycles > 0` | `validateConfigs:892-895` |
+| 6. Non-zero derived | **Exactness first** (v1.0.6): `metaGridDim*polyBlockSize != 0` and divides `subCubeSize`; `blocksPerCycle != 0` and divides `numIntervals`; then `num_sievingBlockBatches > 0`, `num_subCubes > 0`, `num_polyBlocksPerTB > 0`, `num_metaSieveCycles > 0` (`checkNonZeroDerived`, `kernel_launch_validator.cpp:339-366`) | `validateConfigs` |
 
-**`enumerateValidConfigs()`:** Brute-force over all candidate value combinations (~50k iterations), filtering through the validator. Returns valid configs in < 1 ms.
+**`enumerateValidConfigs()`:** Brute-force over all candidate value combinations, filtering through the validator. Returns valid configs in < 1 ms. The trip count is **4·6·6·6·4·3·4·3 = 124,416**, not the ~50k previously documented (corrected 2026-08-26). ⚠ The eight value lists are written out **inline** in the loop nest (`kernel_launch_validator.cpp:400-407`) rather than read from `CANDIDATE_VALUES_0..7`; they currently agree value-for-value with `kernel_param_optimizer.h:40-47`, but the duplication is unguarded and would drift silently.
 
 ### Preflight Check
 
-`preflightKernelLaunch()` is the entry point for runtime validation. Two overloads:
+`preflightKernelLaunch()` is the entry point for runtime validation. Two overloads, **both of which
+gained a trailing `bool allow_nonpow2_geometry = false` in v1.0.6** (`kernel_launch_validator.h:156-172`):
 
 1. **Raw `Params8` overload:** Builds `SieveConstants` from device properties and factoring dimensions, validates via `KernelLaunchValidator`.
+   Signature: `(params, shc_dim, M, device_id, use_wide = false, use_u8sat = false, allow_nonpow2_geometry = false)`.
 
-2. **`MPQSConfig&` overload (mutating):** Includes two auto-correction passes before validation:
-   - **LP-aware sasGridDim floor:** When `lp1_bound > 0`, computes `min_sas = ceil_pow2(subCubeSize * numIntervals / 64)` to prevent candidate buffer overflow. Auto-corrects `params[6]` upward if needed.
+2. **`MPQSConfig&` overload (mutating):** `(config, shc_dim, M, allow_nonpow2_geometry = false)`. Includes three auto-correction passes before validation:
+   - **LP-aware sasGridDim floor:** When `lp1_bound > 0`, computes `min_sas = ceil(subCubeSize * numIntervals / 64)` and then rounds it up to the smallest **admissible** grid via `admissibleSasGridDim(subCubeSize, min_sas)` — see below. Auto-corrects `params[6]` upward if needed. *(Superseded 2026-08-25: before v1.0.6 this step was an inline bit-smear "round up to the next power of two"; it is now the `admissibleSasGridDim` call at `kernel_launch_validator.cpp:511-513`. On a power-of-two `subCubeSize` the new call reproduces the old behaviour byte-for-byte.)*
+   - **sasGridDim > subCubeSize clamp:** clamps `params[6]` down to `subCubeSize` with a `LOG_WARNING` (zero-work sieve iterations otherwise).
    - **sasBlockDim `__launch_bounds__` cap:** When `sieve_batch_size == 0` (legacy mode), caps `params[7]` at 1024 to match the `__launch_bounds__(1024)` annotation on `sieveAndScanKernel`.
+
+   Note the raw-overload delegation at `kernel_launch_validator.cpp:545-547` passes `use_wide = false, use_u8sat = false` explicitly — the `MPQSConfig&` overload has always been a **narrow-path** preflight.
+
+### SM-Aligned (Non-Power-of-Two) Geometry (v1.0.6)
+
+Added in v1.0.6; the entire `src/autotune/` delta between v1.0.5 and v1.0.6 is confined to `kernel_launch_validator.{h,cpp}` (`git diff --numstat 7c154c9..HEAD -- src/autotune/`
+= +123/-28 in the `.cpp`, +36/-3 in the `.h`; every other file in this directory is untouched).
+The motivation is the sieve, not the autotuner: setting the SCATTER/GATHER grids to the device's
+SM count exactly requires non-power-of-two values, which the validator previously rejected
+outright.
+
+**The consequence of leaving the autotuner pow2.** `CANDIDATE_VALUES_4` tops out at
+`metaGridDim = 256` and every entry is a power of two, so on a 108-SM A100 the pow2 winner
+`metaGridDim = 64` runs SCATTER at **0.590 waves/SM — 44 of 108 SMs idle**, for a kernel that is
+~34 % of GPU time. The exact-wave alternative (1.000 waves/SM) is reachable **only by hand**, via a
+pinned `--params` tuple such as `864,8,8,8,108,1024,864,1024`; the autotuner will never propose,
+project or auto-apply it, and SM counts appear nowhere in `src/autotune/` as a geometry input
+(`DeviceLimits::multiProcessorCount` is populated at `kernel_launch_validator.cpp:31` and then read
+by nothing). Automatic discovery is a named but **unscheduled** follow-up; leaving the autotuner
+alone was a deliberate decision, not an oversight. (The waves/SM figures are a measurement result,
+not a source fact.)
+
+**Gate.** `SieveConstants::allow_nonpow2_geometry` (default `false`, `kernel_launch_validator.h:37-42`).
+`buildSieveConstants(shc_dim, M, maxSharedMemPerBlock, use_wide, use_u8sat, allow_nonpow2_geometry)`
+stores `allow_nonpow2_geometry && !use_wide` — the relaxation is **force-disabled on the wide path
+whatever the caller asks** (`kernel_launch_validator.cpp:445-448`).
+
+**Per-parameter policy.** `KernelLaunchValidator::pow2Required(uint32_t idx)` (private,
+`kernel_launch_validator.cpp:166-169`) returns `true` for every index unless
+`allow_nonpow2_geometry`, in which case it frees exactly
+`{P_SUB_CUBE_SIZE (0), P_META_GRID_DIM (4), P_SAS_GRID_DIM (6)}`. `checkPow2()` now rejects **0 for
+every index** (previously folded into the same test) and applies pow2 per parameter. `diagnose()`
+carries matching messages, including a distinct `param[i]=0 (must be > 0)`.
+
+**What replaces the pow2 guarantee.** In the power-of-two world, divisibility was free; the
+relaxed world must state it. `checkArithmeticConstraints()` (`kernel_launch_validator.cpp:203-251`)
+now enforces, mirroring `validateConfigs`:
+
+| Id | Invariant | Why |
+|----|-----------|-----|
+| G1 | `sasGridDim` divides `subCubeSize` | a non-divisor GATHER grid overlaps `polyIdPrefix`es AND leaves a polynomial tail ungathered — silently wrong relations, no error |
+| G2 | chunk `= subCubeSize / sasGridDim` is a power of two | the batch GATHER composes `polyIdPrefix \| gray(poly)`; the OR equals addition only for a pow2 chunk |
+| G3 | `sasGridDim <= subCubeSize` | otherwise a zero trip count = silent zero-relation sieve |
+| — | `metaGridDim * polyBlockSize` divides `subCubeSize`, **checked before** deriving `num_polyBlocksPerTB` | SCATTER has a fixed trip count and no `if (id < n)` guard; a floored quotient silently under- or over-covers |
+
+`num_polyBlocksPerTB` must still be a power of two **in the legacy/wide regimes only**
+(`pow2Required(P_SUB_CUBE_SIZE)`); on the narrow batch path no kernel reads its log2, so exactness
+is the whole requirement. G1/G2/G3 are tautologies for power-of-two tuples, so **no previously
+valid tuple changes verdict**.
+
+**`admissibleSasGridDim(uint32_t np, uint32_t min_sas)`** — new free function
+(`kernel_launch_validator.cpp:378-390`). The admissible GATHER grids are exactly
+`{ np / 2^j : 2^j | np }` (G1 + G2). It walks that set from the smallest upward and returns the
+first value `>= min_sas`, clamping to `np` (chunk 1) when `min_sas` exceeds every admissible grid;
+`np == 0` returns 0. For a power-of-two `np` the admissible set *is* the power-of-two ladder
+`{1, 2, ..., np}`, so it reproduces "round up to the next power of two, then clamp to `np`" exactly.
+Example from the source comment: `np = 864, min_sas = 108 -> 108`, not 128.
+
+**Explicit-`DeviceLimits` constructor.** `KernelLaunchValidator(const DeviceLimits&, const SieveConstants&)`
+(`kernel_launch_validator.h:77-80`, header-inline) performs identical checks with **no CUDA call**, so
+the policy can be unit-tested deterministically on a machine with no GPU. This is what the
+`admissible_geometry` ctest target uses.
+
+**Who passes `true` — the caller matrix (verified 2026-08-25):**
+
+| Call site | `allow_nonpow2_geometry` |
+|-----------|--------------------------|
+| `SieveStage()`, `src/orchestrator/orchestrator.cpp:4320-4325` | `(config_.sieve_batch_size > 0) && !siever_->isWideAccumulator()` — the **only** `true` |
+| `TruncatedSieveRun()`, `src/orchestrator/orchestrator.cpp:6403-6404` | not passed -> default `false` |
+| `estimateRuntime()` probe, `src/autotune/runtime_estimator.cpp:87-89` | not passed -> default `false` |
+| Stage-1 winner preflight, `src/autotune/autotune.cpp:623-625` | not passed -> default `false` |
+| `optimizeKernelLaunchParams()`'s own validator, `src/autotune/kernel_param_optimizer.cpp:103-106` | `buildSieveConstants(...)` called without the argument -> `false` |
+
+The predicate in `SieveStage()` is exactly `validateConfigs`' `relaxed_geometry`
+(`src/sieve/device_sieving_controller.cpp:1960-1962`), which gates the `POW2_UNLESS_CHECK` macro
+(`:2029-2031`) and the SM-aligned narrow launch-feasibility/occupancy block (`:2170`).
+
+⚠ **Caveat — the autotune probe paths run under the mandatory-pow2 rule set.** Neither
+`TruncatedSieveRun()` nor `estimateRuntime()` forwards the flag, so a pinned SM-aligned tuple fails
+preflight there: `TruncatedSieveRun` emits `LOG_WARNING "Preflight failed: ... -- returning zero
+relations"` and returns an empty result, and `estimateRuntime` returns the
+`confidence = 0.0 / total_est_sec = 1e9` sentinel. In practice this is **self-consistent rather than
+a bug**, because `estimateRuntime` unconditionally forces `cfg.sieve_batch_size = 0`
+(`runtime_estimator.cpp:64`) and its ephemeral orchestrator is the only caller of
+`TruncatedSieveRun`, so the probe genuinely runs in legacy mode, where mandatory pow2 is correct.
+The practical consequence is that **combining a pinned SM-aligned `--params` with `--autotune`
+makes every Stage-2/3 probe return the 1e9 sentinel.** Do not do it — see [Pinning, Determinism and History Caveats](#pinning-determinism-and-history-caveats) below.
+
+## Pinning, Determinism and History Caveats
+
+Three operational facts that follow from the code above and matter whenever this module's output
+is benchmarked or transported between binaries.
+
+**1. In-run Stage 1 is NON-DETERMINISTIC — pin `--params` for any A/B.** Identically-configured
+runs (`--autotune_stage1 --autotune_no_history --autotune_max_iter 2`, empty `mpqs_work`) can
+explore different numbers of configurations and land on **different winners**. Measured on A100 at
+RSA-100: five identically-configured arms explored **16 / 17 / 18** configurations and produced
+**two** winners — `512,8,8,8,64,1024,512,1024` (probe 67.3 ms) and `512,8,4,8,128,1024,512,1024`
+(71.5 ms), differing **only** in `polyBlockSize` and `metaGridDim`. In the real run the loser
+sieves **SCATTER 15.5 % slower** (3.915 vs 3.390 ms) with GATHER identical to 0.03 % — up to ~7.8 s
+of RSA-100 sieve wall, larger than most effects such arms are built to measure. Any benchmark,
+probe or roofline A/B must therefore pin
+`--params` rather than re-autotune per arm. Note also that `AutoApplyController` can freeze either
+winner into `autotune_history.json`. *(This is an empirical measurement result, not a property
+readable from the source.)*
+
+**2. History files are not version-portable across the v1.0.6 geometry change.** `saveHistory()`
+copies `pipeline_config_.params[0..7]` into the entry verbatim
+(`autotune.cpp:873-875`), and no load-time quality filter tests for powers of two — F1
+(`autotune_history.cpp:324-327`) only rejects the degenerate `128,4,4,4` prefix. `AutoApplyController`
+then re-applies a matching entry's tuple verbatim and sets `useParams = true`
+(`auto_apply.cpp:71-81`). So an `autotune_history.json` written by a v1.0.6-or-newer binary can carry a
+non-power-of-two tuple; an older binary that auto-applies it will fail its all-8-pow2 preflight and
+abort **loudly** (`SieveStage` throws on `!pf.feasible`). Escape when downgrading: delete the
+history file, or pass `--autotune_no_history`.
+
+**3. The v1.0.6 narrow-batch sieve geometry overrides are forbidden with autotune, by design.**
+`--sieve_block_size` and `--sieve_big_prime_start` are rejected at the CLI with `exit(1)` if
+combined with `--autotune` / `--autotune_stage*` (`tests/cuda-mpqs.cpp:1123-1130`); they also
+require `--params` and reject legacy mode (`:1107-1137`). The reasons given in-source: the
+autotuner re-enters `loadPartialCustomConfig` per probe with tuple-derived interval counts that the
+override would silently desynchronise from `SB`, and the autotune-side `KernelLaunchValidator`
+derives its own `sievingBlockSize` in `buildSieveConstants` and never sees the override at all.
+**Nothing in `src/autotune/` is aware of these knobs.**
 
 ## Stage 2: Runtime Estimation (`runtime_estimator.cpp`)
 
@@ -338,9 +492,14 @@ Log-space gradient descent over (F, L):
 
 ### Budget Controls
 
-- `max_total_probes = 40` (raised from 12 for the joint optimizer)
+- `max_total_probes = 40` (raised from 12 for the joint optimizer; `sieve_optimizer.h:45`)
 - `wall_clock_timeout_sec` = remaining autotune budget (skips if < 30s)
 - Convergence penalty: if not converged, `confidence *= 0.5`
+
+⚠ **Known issue — the probe budget is not honoured as a hard cap.** In practice the joint (F,L)
+optimizer issues **~160 truncated-sieve probes against the ~40 target, a 2.5–3.6× overhead**. This
+is a standing measured defect, not a source-readable one — nothing in `sieve_optimizer.cpp` states
+it — so treat `max_total_probes = 40` as a *nominal* budget when sizing `--autotune_timeout`.
 
 ### Search Bounds (`deriveSieveSearchBounds()`)
 
@@ -527,9 +686,45 @@ The orchestrator applies several small-N and performance adaptations that comple
 | `history_file` | string | "" | Path to per-GPU JSON history file |
 | `benign_history_file` | string | "" | Path to cross-GPU benign history (empty = auto) |
 | `load_history` / `save_history` | bool | true | Enable history I/O |
-| `verbose` | bool | false | Extra logging |
 | `candidates_file` | string | "" | Path to candidates.txt for bootstrap |
 | `bootstrap` | bool | false | Bootstrap mode (--autotune_bootstrap) |
+
+*(Corrected 2026-08-26: a `verbose` row was listed here; `AutotuneConfig` has no such field —
+`autotune.h:22-40` is the complete struct.)* `thorough` has **no CLI flag**, so Phase 2.5 never
+runs in a shipped build; its only reader is `autotune.cpp:540`.
+
+`autotune_probe_polys` is **not** an `AutotuneConfig` field — it lives on `MPQSConfig`
+(`include/orchestrator.h:250`) and reaches the siever via
+`setAutotuneProbePolys()` (`autotune.cpp:405`).
+
+### CLI Flags (parser: `tests/cuda-mpqs.cpp`)
+
+Verified against the live parser 2026-08-26. The ✓ column marks the flags that set
+`config.autotune_enabled = true` — that field, not the stage selection, is what the v1.0.6
+geometry-override guard tests (see
+[Pinning, Determinism and History Caveats](#pinning-determinism-and-history-caveats)).
+
+| Flag | Line | Sets | Enables autotune |
+|------|------|------|------------------|
+| `--autotune` | 968 | `config.autotune_enabled` | ✓ |
+| `--autotune_only` | 971-973 | `mode = AUTOTUNE_ONLY` + enabled | ✓ |
+| `--autotune_stage0` | 975-979 | `enable_stage0` (explicit) | ✓ |
+| `--autotune_stage1` | 980-984 | `enable_stage1` (explicit) | ✓ |
+| `--autotune_stage2` | 985-989 | `enable_stage2` (explicit) | ✓ |
+| `--autotune_stage3` | 990-994 | `enable_stage3` (explicit) | ✓ |
+| `--autotune_max_iter <N>` | 995-997 | `max_iterations` | — |
+| `--autotune_timeout <sec>` | 998-1000 | `timeout_sec` | — |
+| `--autotune_history <path>` | 1001-1003 | `history_file` | — |
+| `--autotune_benign_history <path>` | 1004-1006 | `benign_history_file` | — |
+| `--autotune_no_history` | 1007-1010 | `load_history = save_history = false` | — |
+| `--autotune_candidates <path>` | 1011-1013 | `candidates_file` | — |
+| `--autotune_bootstrap` | 1014-1016 | `bootstrap` | — |
+| `--autotune_probe_polys <N>` | 850-855 | `MPQSConfig::autotune_probe_polys` (wide probe sample; 0 = auto-scale by N) | — |
+
+⚠ **`--autotune_stage*` are SELECTIVE, not additive.** Naming any one of them sets
+`has_explicit_autotune_stages`, and the post-parse fixup (`tests/cuda-mpqs.cpp:1095-1101`) then
+assigns **all four** `enable_stageN` from the explicit flags — so `--autotune_stage1` alone
+*disables* Stages 0, 2 and 3 rather than adding Stage 1 to the defaults.
 
 ## Recent Fixes (Debug Campaign, March 2026)
 
@@ -563,7 +758,15 @@ Resolution: `__launch_bounds__(1024)` annotation on both `sieveAndScanKernel` an
 
 ### Fix 6: sasGridDim Auto-Correction
 
-When LP is active, preflight auto-corrects `sasGridDim` to `ceil_pow2(subCubeSize * numIntervals / 64)` to prevent per-block candidate buffer overflow (`maxRelationsPerBlock=64`).
+When LP is active, preflight auto-corrects `sasGridDim` upward to prevent per-block candidate
+buffer overflow (`maxRelationsPerBlock=64`).
+
+*(Refined 2026-08-25, v1.0.6 — the original wording `ceil_pow2(subCubeSize * numIntervals / 64)`
+is superseded.)* The floor is still `min_sas = ceil(subCubeSize * numIntervals / 64)`, but the
+rounding is now `admissibleSasGridDim(subCubeSize, min_sas)` — the smallest divisor of
+`subCubeSize` whose quotient is a power of two. On a power-of-two `subCubeSize` this is
+byte-for-byte the old `ceil_pow2`-then-clamp; on an SM-aligned `subCubeSize` it lands on a grid the
+GATHER decomposition can actually use.
 
 ### Fix 7: LinAlg Cost Model (commit `26267cc`)
 

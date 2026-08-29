@@ -57,7 +57,7 @@ std::vector<char> serializeTrailer(const CheckpointTrailer& t) {
     return buf;
 }
 
-/// Append the variable-size cluster block (S3) to `buf` (field-by-field, little-endian).
+/// Append the variable-size cluster block to `buf` (field-by-field, little-endian).
 /// Form: completed_prefix_cursor (u64), node_count (u32), initial_high_water[node_count] (u64).
 void serializeClusterBlock(std::vector<char>& buf, const CheckpointClusterBlock& cb) {
     put<uint64_t>(buf, cb.completed_prefix_cursor);
@@ -184,12 +184,12 @@ bool writeCheckpointAtomic(const std::string& ckpt_dir,
         return false;
     }
 
-    // 2. Build trailer (+ optional S3 cluster block) + fixed EOF footer, then append + fsync.
+    // 2. Build trailer (+ optional cluster block) + fixed EOF footer, then append + fsync.
     std::vector<char> tail = serializeTrailer(trailer);
-    // S3: append the variable-size cluster block between the trailer and the footer, iff the
+    // Append the variable-size cluster block between the trailer and the footer, iff the
     // trailer advertises it. The footer's trailer_len then spans trailer + cluster block, so
     // the reader can recover both by seeking. A solo file (cluster_section_present == 0, or a
-    // null cluster ptr from S1) appends nothing → trailer_len == trailer bytes.
+    // null cluster ptr on the solo path) appends nothing → trailer_len == trailer bytes.
     if (trailer.cluster_section_present && cluster) {
         serializeClusterBlock(tail, *cluster);
     }
@@ -292,7 +292,7 @@ bool readCheckpoint(const std::string& path, CheckpointLoadResult& out) {
         return false;
     }
 
-    // 2b. Variable-size cluster block (S3) immediately after the trailer, iff advertised.
+    // 2b. Variable-size cluster block immediately after the trailer, iff advertised.
     //     The stream is positioned exactly at the trailer's end (readTrailer consumes only
     //     the trailer bytes). After reading, the position must land at trailer_offset +
     //     trailer_len (the trailer region exactly spans trailer + cluster block).

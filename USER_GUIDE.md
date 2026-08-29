@@ -121,12 +121,17 @@ These parameters control the core SIQS algorithm. When set to 0 (the default), t
 | Flag | Type | Default | Description | Pinned |
 |------|------|---------|-------------|--------|
 | `--fb_bound <N>` | uint32 | Auto | Factor base bound F. All primes p <= F with Legendre symbol (N/p) = 1 form the factor base. Larger F means more primes to sieve with (slower per polynomial but more likely to find smooth values). | Yes |
-| `--sieve_bound <N>` | uint32 | Auto (262144) | Sieve interval half-width M. Each polynomial Q(x) is evaluated for x in [-M, M]. Larger M explores more candidates per polynomial but increases memory and reduces smoothness probability. | Yes |
+| `--sieve_bound <N>` | uint32 | Auto (262144) | Sieve interval half-width M. Each polynomial Q(x) is evaluated for x in [-M, M]. Larger M explores more candidates per polynomial but increases memory and reduces smoothness probability. ⚠ **M is snapped to the nearest power of two** (ties round down), so e.g. `3145728` becomes `2097152`; a warning is printed, and the run's own log is the place to confirm the M actually used. | Yes |
 | `--lp1_bound <N>` | uint64 | `0` (disabled) | Large prime bound. When > 0, enables the single large prime variant: partially smooth values with one cofactor prime <= `lp1_bound` are kept and matched pairwise via a GPU hash table. Dramatically increases relation yield for larger inputs. Typical values: 100M-500M. | Yes |
-| `--target_rels <N>` | uint32 | Auto (FB_size + 128) | Target number of relations to collect before proceeding to matrix construction. When unset, defaults to factor-base size + 128 to give the Block Wiedemann solver sufficient overdetermination. | Yes |
+| `--target_rels <N>` | uint32 | Auto (FB size + 5 % + 64) | Target number of relations to collect before proceeding to matrix construction. When unset, the tuning stage sets it to the factor-base size plus a 5 % margin plus 64, giving the Block Wiedemann solver sufficient overdetermination. The sieve then collects `target x --dedup_safety_factor` to absorb duplicate loss. | Yes |
 | `--dedup_safety_factor <F>` | double | `1.05` (auto `1.35` for <80d) | Dedup oversample margin: the sieve collects `target * factor` relations to absorb duplicate loss. Values outside `[1.0, 2.0]` trigger a warning but are still applied. | Yes |
-| `--lp_interval <N>` | uint32 | `0` (auto) | LP processing frequency. When 0, the pipeline uses adaptive scheduling (processes LP matches when the partial buffer fills sufficiently). When N > 0, forces LP processing every N sieve batches. Useful for tuning the trade-off between LP matching latency and overhead. | Yes |
+| `--lp_interval <N>` | uint32 | `1` (every batch) | LP processing frequency. `N > 0` forces LP processing every N sieve batches; the default `1` processes every batch. `0` selects adaptive scheduling (LP runs when the partial buffer has filled sufficiently). Useful for tuning the trade-off between LP matching latency and overhead. When the LP pipeline is captured into a CUDA graph, in-graph cadence is set by `--cuda_graph_lp_stride` instead and this flag governs only the non-graph tail. | Yes |
 | `--params <p1,...,p8>` | 8x uint32 | Auto | Manually specify the 8-parameter sieve kernel configuration tuple. Parentheses around the list are optional and stripped. See [Parameter Tuple Format](#parameter-tuple-format) below. | Yes |
+
+`--fb_bound`, `--lp1_bound`, `--target_rels`, `--sieve_bound`, `--sieve_max_relations`,
+`--matrix_lp1_bound` and `--matrix_max_rows` accept an optional `K`/`M`/`B`/`T` suffix,
+**base-1000** (`1M` = 1,000,000). This is a different base from the buffer-sizing flags
+below, which use `K`/`M` base-1024.
 
 #### Auto-Calculated Factor Base Bound (F)
 
@@ -164,7 +169,31 @@ The `--params` flag accepts 8 comma-separated uint32 values controlling the GPU 
 
 Example: `--params 32,16,128,4,64,256,32,512`
 
-**Safety adjustments:** When LP is active (`--lp1_bound > 0`) and custom params are set, `sasGridDim` (index 6) is automatically raised to a minimum floor derived from `subCubeSize * numIntervals / 64` (rounded to next power of 2) to prevent candidate buffer overflow. The legacy kernel `sasBlockDim` (index 7) is capped at 1024 to match `__launch_bounds__`.
+**Power-of-two rules.** Every entry must be non-zero. On the legacy
+(`--sieve_batch_size 0`) and wide accumulator paths all eight must be powers of two,
+and a violating tuple is rejected before sieving. On the **narrow batch** path
+indices 0, 4 and 6 (`subCubeSize`, `metaGridDim`, `sasGridDim`) are exempt, so those
+grids can be aligned to the device's multiprocessor count and run exact waves — the
+measured win behind the pinned tuples quoted in `README.md`. Such a tuple is derived
+from one device's multiprocessor count: recompute it per GPU, never copy it. The
+autotuner never proposes, projects or auto-applies a non-power-of-two tuple; they are
+reachable only by pinning `--params`.
+
+Where the relaxation applies, the exactness constraints are checked instead of
+assumed: `metaGridDim x polyBlockSize` must divide `subCubeSize` exactly, `sasGridDim`
+must divide `subCubeSize` with a power-of-two quotient, and `subCubeSize` must not
+exceed `2^(hypercube dimension - 1)`. A violating tuple aborts before sieving, naming
+the clause it failed — nothing is silently floored to make it fit.
+
+**Interval coverage.** `numIntervals` (index 1) and the sieving block size must satisfy
+`numIntervals x sieveBlockSize >= 2M`. Every shipped tuple satisfies it exactly; it
+matters when overriding the block size (see *Narrow-Batch Geometry Overrides*).
+
+**Safety adjustments:** When LP is active (`--lp1_bound > 0`) and custom params are set, `sasGridDim` (index 6) is automatically raised to a minimum floor derived from `subCubeSize * numIntervals / 64`, rounded up to the smallest admissible grid (on a power-of-two `subCubeSize` that is the next power of two, as before), to prevent candidate buffer overflow. The legacy kernel `sasBlockDim` (index 7) is capped at 1024 to match `__launch_bounds__`.
+
+**Rollback note.** An `autotune_history.json` written by 1.0.6 or later can hold a
+non-power-of-two tuple that an older binary rejects — loudly, not silently. When
+downgrading, delete the history file or run with `--autotune_no_history`.
 
 ### Buffer Sizing
 
@@ -176,7 +205,7 @@ All buffer size flags accept an optional `K` or `M` suffix for base-1024 scaling
 | `--partial_buf_size <SIZE>` | uint64 | `= accum_buf_size` | Partial (LP staging) buffer. Holds 1-partial relations awaiting LP matching. Only used when `--lp1_bound > 0`. Defaults to 1x the accumulation buffer size; user values below the accumulation buffer size are floor-clamped up to it (with a warning). | Yes |
 | `--persistent_buf_size <SIZE>` | uint64 | `target * 2 + accum` | Persistent relation store capacity. Must be >= target_relations or the pipeline will fail. Holds all confirmed full relations on the GPU. | Yes |
 | `--lp1_combined_buf <SIZE>` | uint64 | `32K` (32768) | LP match output buffer. Holds the combined full relations produced by LP hash table matching in each LP processing round. | Yes |
-| `--lp1_max_witnesses <SIZE>` | uint64 | `1M` (1048576) | LP witness hash table capacity (number of unique large prime slots). Rounded up to the next power of 2. Minimum: 16. The hash table uses open addressing with slab-based collision resolution. | Yes |
+| `--lp1_max_witnesses <SIZE>` | uint64 | `1M` (1048576) | LP witness hash table capacity (number of unique large prime slots). Snapped to the *nearest* power of 2 (ties round down), so a non-power-of-two request can land below what was asked for. Minimum: 16. The hash table uses open addressing with slab-based collision resolution. | Yes |
 | `--lp1_hash_bits <N>` | uint32 | Auto | Number of bits for the LP hash table directory. Default: `log2(witness_capacity) - 4`. Recommended range: 10-28. Controls the number of hash buckets (2^hash_bits). | Yes |
 
 **Small-N down-scaling:** When `--accum_buf_size` is left at its default and `target_relations < 16384`, the accumulation buffer is shrunk to `max(4096, target_relations * 4)` rounded up to the next power of 2. This prevents a single sieve batch from overshooting a small target by hundreds of thousands of relations.
@@ -194,16 +223,70 @@ All buffer size flags accept an optional `K` or `M` suffix for base-1024 scaling
 | Flag | Type | Default | Description | Pinned |
 |------|------|---------|-------------|--------|
 | `--sieve_batch_size <N>` | uint32 | `0` (legacy) | Number of `a`-values per sieve batch. When 0, uses the legacy single-step sieve loop. When > 0, enables the double-buffered zero-sync batch pipeline that overlaps sieve and postprocessing kernels. | Yes |
-| `--cuda_graph_unroll <N>` | uint32 | `0` (disabled) | Capture N sieve batches as a CUDA graph and replay it, reducing per-batch launch overhead. Must be even (odd values are rounded up with a warning); capped at 16. Recommended: 2 or 4 for production runs. | Yes |
+| `--cuda_graph_unroll <N>` | uint32 | `0` (disabled) | Capture N sieve batches as a CUDA graph and replay it, reducing per-batch launch overhead. Must be even: odd values **above 1** are rounded up with a warning (`1` is accepted as-is), and the value is capped at 16. `0` disables capture entirely. Recommended: 2 or 4 for production runs; `0` is competitive, and on some geometries faster, at RSA-100 scale. See `--cuda_graph_capture` for what the graph contains. | Yes |
+| `--cuda_graph_capture <MODE>` | string | `full` (solo) / `postproc` (cluster) | How much of the per-batch pipeline the CUDA graph holds. `sieve` captures only the sieving kernels — the pre-1.0.6 body, kept as a rollback path; `postproc` additionally captures batch trial division; `full` additionally captures the GPU large-prime pipeline and is **solo only** — requesting it in a cluster run is downgraded to `postproc` with a warning, never silently. Inert at `--cuda_graph_unroll 0`. | Yes |
+| `--cuda_graph_lp_stride <K>` | uint32 | `1` | In-graph large-prime cadence: one LP dispatch every `K`-th captured batch. `1` dispatches per batch, matching what `--cuda_graph_unroll 0` has always done. `0`, or any `K` at or above the unroll factor, collapses to one dispatch per replay — the pre-1.0.6 graph cadence. Only meaningful when LP is actually captured (solo, capture scope `full`). ⚠ The cadence changes the LP fraction of the relation set by a fraction of a percent, which is enough to move a marginal configuration across the high-large-prime square-root cliff; if a run at a given `--lp1_bound` produces only trivial factors, lowering `L` is the documented fix, and pinning this to the unroll factor reproduces the older cadence. | Yes |
 | `--sieve_max_relations <N>` | uint64 | `0` (disabled) | Stop the sieve after collecting N relations. Accepts a K/M/B/T suffix (base-1000). 0 disables the cap. | Yes |
 | `--sieve_max_batches <N>` | uint64 | `0` (disabled) | Stop the sieve after N batch iterations. 0 disables the cap. | Yes |
 | `--sieve_truncate_continue` | boolean | `false` | When a sieve-truncation cap (`--sieve_max_relations`/`--sieve_max_batches`) fires, continue the pipeline (matrix, BW, sqrt) with the relations collected so far instead of stopping. | No |
 | `--sieve_gms_blocks <N>` | uint32 | Auto (64) | Number of CUDA blocks for the globalMetaSieve kernel. | Yes |
 | `--sieve_hc_dim <N>` | uint32 | Auto | Hypercube dimension for polynomial construction (number of prime factors in the `a` coefficient). | Yes |
 | `--wide_accum <MODE>` | string | `auto` | Wide-accumulator kernel selection for large inputs (>~150 digits): `auto` (size-gate driven), `u8sat` (saturating-uint8, restores narrow throughput when the exactness gate holds), or `u16` (uint16). No effect on smaller inputs, which always use the narrow (uint8) accumulator. See `docs/modules/sieve.md`. | Yes |
-| `--bucket_size_factor <F>` | double | `0` (legacy SB/2) | Meta-sieve bucket capacity as a multiple of the sieving block size (`globalBucketSize = F × SB`). `1.0` un-clamps the default bucket for large-`M` wide-path runs (eliminates bucket overflow). Charged against the VRAM budget before allocation — an over-large factor degrades poly count or is rejected, never an OOM. | Yes |
+| `--sieve_accumulator <MODE>` | string | `auto` | Selects the sieve accumulator **path**: `auto` (size-gated), `u8` (force the narrow path), `u16` (force the wide path). Distinct from `--wide_accum`, which selects the *width* once the wide path is active. ⚠ Forcing `u8` on an input large enough to need the wide path re-enters the accumulator-overflow failure the wide path exists to avoid — full smooths accumulate past the 255 cap and are silently rejected. Do not force `u8` at RSA-150 scale or beyond. | Yes |
+| `--sieve_bucket_overflow_stats` | boolean | `false` | Also emit the bucket occupancy / overflow statistics line on the **narrow** path (the wide path always emits it). Costs one device-to-host copy and a synchronization on the sieving stream per statistics tick (~5 s); measured at most 0.09 % of the sieve wall at production geometry. Needs `--verbose`. Diagnostic; use it symmetrically across both arms of an A/B. | No |
+| `--bucket_size_factor <F>` | double | `0` (legacy SB/2) | Meta-sieve bucket capacity as a multiple of the sieving block size (`globalBucketSize = F × SB`). `1.0` un-clamps the default bucket; on the wide path at large `M` this is what eliminates bucket overflow. The knob is width-agnostic — it is live on the narrow path too, where at production geometry it is free (no measured wall or relation-count effect) but becomes **a correctness requirement** on any configuration that lowers `--sieve_big_prime_start`, and on devices whose default bucket already runs near full. Charged against the VRAM budget before allocation — an over-large factor degrades poly count or is rejected, never an OOM. Pair with `--sieve_bucket_overflow_stats` to see the actual fill. | Yes |
 | `--sieve_gather_block_dim <N>` | uint32 | `0` (off) | Overrides the GATHER kernel block dimension (power of two in `[32,1024]`). Result-invariant occupancy A/B knob. | Yes |
 | `--sieve_meta_cycle_cap <N>` | uint32 | `0` (off) | Caps the meta-sieve (SCATTER) active-blocks-per-cycle to shrink the bucket-write window. A write-locality ablation knob, not a speedup lever (capping multiplies factor-base re-reads). | No |
+
+#### Narrow-Batch Geometry Overrides (experimental)
+
+Two further flags override derivations that are otherwise fixed by the device's
+shared-memory budget. They exist to trade the gathering kernel's shared-memory
+footprint for multiprocessor co-residency, and they are **experimental**: they are
+default-off, reachable only with a pinned `--params`, rejected in combination with
+any autotune flag, and easy to misconfigure.
+
+| Flag | Type | Default | Description | Pinned |
+|------|------|---------|-------------|--------|
+| `--sieve_block_size <N>` | uint32 | `0` (off) | Overrides the sieving block size `SB`, otherwise derived as `min(M, largest power of two <= 3/4 x opt-in shared memory per block)`. Admissible: `0`, or a **power of two >= 256** (the gather kernel masks positions with `SB - 1`). The upper bounds — `N <= M`, and the shared-memory sum `SB x 1 + 3 x bigPrimeStart x 4` fitting the per-block budget — are not checkable at parse time and are enforced before sieving. | Yes |
+| `--sieve_big_prime_start <N>` | uint32 | `0` (off) | Overrides the large-prime transition index, otherwise coupled unconditionally to `SB / 32`. Admissible: `0`, or **strictly greater than 32**; a power of two is *not* required. At `N <= 32` the mid-prime range inverts and an entire factor-base band is dropped with no error. | Yes |
+
+**Constraints, all enforced with a loud abort before any sieving:**
+
+- Both require a pinned `--params`. Without it they would be accepted and then do
+  nothing at all, because only the pinned-tuple configuration path consumes them.
+- Both are rejected in combination with `--autotune` or any `--autotune_stageN`.
+  The autotuner is deliberately blind to these knobs and must never propose,
+  project or auto-apply one. If a stale history is being auto-applied, add
+  `--autotune_no_history`.
+- Both are narrow-**batch** only: rejected with `--sieve_batch_size 0` (legacy)
+  and on the wide accumulator path.
+
+**Hazard — interval coverage.** Lowering `SB` shrinks how much of the interval one
+launch covers, so `numIntervals` (`--params` field 2) must rise in step to keep
+
+```
+numIntervals x sieve_block_size >= 2M
+```
+
+A configuration that violates this sieves only half the interval. This binary
+aborts loudly and names the interval count it needs; **releases before 1.0.6 accept
+it silently**, lose roughly half the yield, and can even report a *higher* relation
+count while doing so, because a smaller region suffers less per-block relation
+truncation. Never carry such a tuple back to an older binary.
+
+**Second hazard — bucket capacity.** Lowering `--sieve_big_prime_start` raises the
+meta-sieve bucket fill sharply. Pass `--bucket_size_factor 1.0` alongside it;
+without that, the legacy bucket runs near capacity and large-prime hits are
+discarded silently. `--sieve_bucket_overflow_stats` makes the fill visible.
+
+**Whether it pays is configuration-dependent.** The win is co-residency in the
+gather kernel; the price is paid in the meta-sieve, which walks the whole factor
+base once per meta-sieve cycle (`numIntervals / blocksPerCycle`) and repeats its
+per-prime setup each time. At one cycle the halved geometry has measured a net
+win on one device at RSA-100; at two cycles it is a net loss on the same device,
+and it has not reproduced as a win elsewhere. Treat it as something to measure,
+not as a recommended default.
 
 ### Checkpoint / Resume Options
 
@@ -215,8 +298,8 @@ All buffer size flags accept an optional `K` or `M` suffix for base-1024 scaling
 | `--resume` | boolean | `false` | If a valid `sieve.ckpt` exists in `--checkpoint_dir`, resume the sieve from that checkpoint; otherwise start fresh (a warning is logged). Coordinator-only in cluster mode — workers are stateless and reconnect normally. | No |
 
 **Batch vs. Legacy sieving:**
-- **Legacy** (`--sieve_batch_size 0`, default): Single-step loop. The CPU drives each sieve step sequentially. Simpler, well-tested. LP processing happens every 10 steps.
-- **Batch** (`--sieve_batch_size N`): Double-buffered GPU pipeline. Sieving and postprocessing overlap via CUDA events. Higher throughput on modern GPUs. LP processing is periodic (adaptive interval).
+- **Legacy** (`--sieve_batch_size 0`, default): Single-step loop. The CPU drives each sieve step sequentially. Simpler, well-tested. LP processing is dispatched whenever the accumulation buffer fills.
+- **Batch** (`--sieve_batch_size N`): Double-buffered GPU pipeline. Sieving and postprocessing overlap via CUDA events. Higher throughput on modern GPUs. LP processing is periodic, every `--lp_interval` batches (default: every batch); `--lp_interval 0` selects the adaptive interval instead.
 
 ### Matrix Options
 
@@ -230,11 +313,16 @@ These flags control the matrix construction and preprocessing stage, which conve
 | `--truncation_factor <F>` | double | `1.05` | Post-GF(2) row truncation enable flag: `> 0` enables truncation, `0` disables it. The actual kept-row target is excess-based (see `--matrix_truncation_excess`), not a direct multiple of this value. | No |
 | `--matrix_truncation_excess <N>` | uint32 | `200` | Number of excess rows to keep above `(n_cols + n_extra_cols)` when truncation is enabled. Controls overdetermination of the truncated matrix. | No |
 | `--compact_cycles <N>` | uint32 | `5` | Maximum compact-merge cycles for the GPU preprocessing backend. `0` runs a single merge pass with no compaction. | No |
-| `--matrix_gf2_floor_factor <F>` | double | `0.5` | M12-S2 GF(2) column-diversity floor: stop compact-merge cycles when GF(2)-alive columns fall below `factor * initial_gf2_cols`. Range `[0.0, 1.0]`. | No |
-| `--matrix_gf2_min_floor <N>` | uint32 | `8192` | M12-S2 absolute minimum GF(2) column floor; compact-merge stops if alive GF(2) columns drop below this value. | No |
+| `--matrix_gf2_floor_factor <F>` | double | `0.5` | GF(2) column-diversity floor: stop compact-merge cycles when GF(2)-alive columns fall below `factor * initial_gf2_cols`. Range `[0.0, 1.0]`. | No |
+| `--matrix_gf2_min_floor <N>` | uint32 | `8192` | Absolute minimum GF(2) column floor; compact-merge stops if alive GF(2) columns drop below this value. | No |
 | `--partial_subsample <F>` | double | `1.0` | Fraction of partial / LP-combined relations to retain (for `--matrix_only` experiments). Range `[0.0, 1.0]`. | No |
 | `--smooth_subsample <F>` | double | `1.0` | Fraction of pure smooth relations to retain (LP-combined relations are always kept) for `--matrix_only` experiments. Range `[0.0, 1.0]`. | No |
 | `--lp_preprocess_threshold <F>` | double | `0.55` | **Deprecated / inert.** Formerly the LP-fraction threshold for auto-selecting `preprocess` mode; AUTO no longer auto-selects preprocess from LP fraction (use `--matrix_mode preprocess` to opt in). Retained as a no-op for backwards compatibility. (`--lp_matrix_threshold` is a deprecated alias.) | No |
+| `--matrix_lp1_bound <L>` | uint64 | `0` (disabled) | `--matrix_only` replay filter: drop every LP-combined relation whose stored large prime exceeds `L` (and the corresponding partials), reproducing the relation set a sieve at bound `L` would have produced. Pure smooths are never dropped. Accepts a K/M/B/T suffix (base-1000). This is the way to trial a lower effective large-prime bound without re-sieving — the primary lever for stepping below the high-large-prime square-root cliff on stored relations. Composes with `--partial_subsample` (this filter runs first). No effect on the sieve stage. | No |
+| `--truncation_min_rows <N>` | uint32 | `5000000` | Size gate for CPU-preprocess truncation: skip truncation when the reduced matrix has at most `N` rows. Above `N`, truncation row selection is a known limitation and can confine the kernel to the trivial subspace. | No |
+| `--preprocess_lp_materialize_max <F>` | double | `0.45` | Preprocess-path gate: above this combined-smooth LP fraction, raw 1-partial 2-cycle rows are not materialized, because past the cliff they capture the genus character and drive the nontrivial rate to zero. `1.0` never skips (pre-fix behaviour); `0.0` always skips. | No |
+| `--merge_max_weight <K>` | uint32 | `10` | **Diagnostic.** Maximum column weight for higher-weight merges on the preprocess CPU path. `K = 2` disables weight >= 3 multi-cycle merges, leaving singleton plus weight-2 merges only (legacy-like 2-cycles). | No |
+| `--force_preprocess` | boolean | `false` | **Diagnostic.** Force the preprocess expand+merge path even with zero partials, where the orchestrator would otherwise force legacy. Runs the preprocess reduction on a smooths-only relation set. | No |
 | `--matrix_max_rows <N>` | uint64 | `0` (off) | Cap the legacy relation batch at `N` rows (suffix-drop) before matrix build, preserving row↔relation↔FB-column alignment. Keeps the padded column count admissible for the packed SpMM formats and can reduce VRAM on very large matrices. Optional performance/memory lever for the largest inputs. | No |
 
 **GPU preprocessing pipeline (V2, `--matrix_backend gpu`):**
@@ -285,6 +373,7 @@ The autotune system performs a multi-stage parameter optimization before sieving
 | `--autotune_timeout <sec>` | double | `300.0` | Wall-clock timeout for the entire autotune process (seconds). |
 | `--autotune_history <P>` | string | `<work_dir>/autotune_history.json` | Path to the GPU-specific autotune history file. Used for projection (Stage 0) and saving results. |
 | `--autotune_benign_history <P>` | string | `<work_dir>/benign_history.json` | Path to the benign (cross-GPU) history file. Contains parameter data that transfers across different GPUs. |
+| `--autotune_probe_polys <N>` | uint32 | `0` (auto) | Wide-path autotune probe sample size: the number of distinct polynomials staged for the survivors-per-second measurement. `0` auto-scales it from N. Set it directly for A/B work and diagnostics. |
 | `--autotune_no_history` | boolean | `false` | Disable both loading and saving of parameter history. Also disables the auto-apply feature (zero-probe history-based parameter selection). |
 | `--autotune_candidates <P>` | string | — | Path to a candidates file for bootstrap mode. One decimal number per line; blank lines and `#` comments are skipped. |
 | `--autotune_bootstrap` | boolean | `false` | Bootstrap mode: read candidates from `--autotune_candidates`, factor each one using the full pipeline (sorted smallest to largest by bit-length), and accumulate history. Requires `--autotune_candidates`. |
@@ -338,6 +427,17 @@ Even without `--autotune`, when history files exist, the pipeline automatically 
 | `LOG_DEBUG_3` | 3 | Developer trace (no active call sites; retained for forward compatibility) |
 
 A console message is shown when its urgency is at least as urgent as the threshold (i.e. its numeric level is `<=` the configured `--log_level`). `LOG_ERROR_MAJOR` is now a backward-compatible alias for `LOG_WARNING` (-2), not a distinct level.
+
+### Diagnostic Dump Options
+
+Always available. Each writes into the working directory (`--dir`) and is default-off; the
+dumps are large at production scale.
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--dump_matrix` | boolean | Dump the finalized GF(2) matrix as `matrix.csr` plus a `matrix_columns.txt` column map. |
+| `--dump_kernel_vectors` | boolean | Dump the Block Wiedemann solutions (`bw_*.bin`, reduced-row space) and the final `kernel_vectors.bin` / `.txt` in original-relation space. |
+| `--dump_combine_provenance` | boolean | Capture the constituents of every LP-combined relation (probe and witness roots, signs, exponents, large prime) to `combine_provenance.bin`. |
 
 ### Debug Options (Compile-Time)
 
@@ -515,6 +615,7 @@ Multiple GPU nodes can cooperatively sieve smooth relations over a LAN. The coor
 | `--cluster_init_timeout` | Init window in seconds: worker retries + coordinator accept (default 300) |
 | `--cluster_node_weights` | Comma-separated per-node throughput weights (overrides SM*clock auto-weighting) |
 | `--cluster_headroom` | Per-node headroom percent (default 10) |
+| `--cluster_pool_oversize` | Coordinator-only `a`-value overflow-pool over-provisioning multiplier; `> 1` enlarges the on-demand pool (default 1.0) |
 
 The transport backend is fixed to TCP. It is exposed only as the config field `MPQSConfig::transport` (default `"tcp"`); there is **no `--transport` CLI flag**.
 
@@ -527,16 +628,11 @@ The transport backend is fixed to TCP. It is exposed only as the config field `M
 
 ### Launch Scripts
 
-Pre-configured launch scripts are available in `tools/cluster/`:
-
-| Script | Description |
-|--------|-------------|
-| `rtx_cluster_default_launch.sh` | 2-node RTX, default ~80d validation |
-| `rtx_cluster_launch.sh` | 2-node RTX, RSA-100 |
-| `jetson_cluster_launch.sh` | 2-node Jetson, RSA-100 |
-| `rtx_4node_rsa100_launch.sh` | 4-node heterogeneous, RSA-100 |
-| `rtx_4node_rsa110_launch.sh` | 4-node heterogeneous, RSA-110 |
-| `jetson_rsa110_overnight_launch.sh` | 2-node Jetson overnight RSA-110 |
+A ready-to-edit 2-node launch template ships at `tools/cluster/example_2node.sh`.
+It starts the coordinator locally in the background and one worker on a remote
+host over SSH; edit the coordinator IP, the worker SSH target, the binary paths
+and the per-node parameters before use. Adapt it for additional workers,
+heterogeneous topologies and per-node tuning.
 
 For detailed configuration, troubleshooting, and architecture, see [CLUSTER.md](CLUSTER.md).
 
@@ -552,7 +648,7 @@ For detailed configuration, troubleshooting, and architecture, see [CLUSTER.md](
 
 4. **Watch buffer fill warnings.** The pipeline logs warnings when buffers approach capacity. If you see `witness_near_full` or overflow warnings, increase `--lp1_max_witnesses` or `--accum_buf_size`.
 
-5. **Batch sieving** (`--sieve_batch_size N`) can improve throughput by overlapping GPU sieving and postprocessing. Try values of 64-256.
+5. **Batch sieving** (`--sieve_batch_size N`) can improve throughput by overlapping GPU sieving and postprocessing. Useful values are small: every validated configuration in this project uses 8, 16 or 32. Larger batches raise the accumulation-buffer peak without a measured throughput gain.
 
 6. **Pin important parameters.** When using `--autotune`, explicitly set parameters you know are good (e.g., `--fb_bound`, `--lp1_bound`) and let autotune optimize the rest. Pinned parameters are preserved by autotune.
 

@@ -9,7 +9,7 @@
 /// @brief Abstract communication backend for cluster sieve.
 ///
 /// Decouples coordinator/worker logic from transport implementation.
-/// Concrete implementations: TCPBackend (S4), future MPIBackend.
+/// Concrete implementations: TCPBackend, future MPIBackend.
 
 #include "cluster_common.h"
 #include <cstdint>

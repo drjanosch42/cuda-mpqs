@@ -192,7 +192,7 @@ target_link_libraries(test_packed_char_device_parity PRIVATE
     mpqs_matrix mpqs_sieve mpqs_common cudampqs_build_flags)
 add_test(NAME packed_char_device_parity COMMAND test_packed_char_device_parity)
 
-# Autotune OOM-guard regression test (plan decision §6.5). Exercises the guard's
+# Autotune OOM-guard regression test. Exercises the guard's
 # pure-host decision logic (sieve_memory_model.h estimator + 0.80 budget +
 # KernelLaunchValidator::fitsTotalFootprint + the seed-reduction loop) — NO sieve
 # kernels are launched, so it cannot OOM and is deterministic. Asserts (a) at pinned
@@ -211,7 +211,7 @@ target_link_libraries(test_oom_guard PRIVATE
     mpqs_autotune mpqs_sieve mpqs_common cudampqs_build_flags)
 add_test(NAME oom_guard COMMAND test_oom_guard)
 
-# WIDE (uint16) num_polys apply-path clamp (S1, wide-autotune foundation): the
+# WIDE (uint16) num_polys apply-path clamp (wide-autotune foundation): the
 # custom apply path (loadPartialCustomConfig) now routes num_polysPerSieveCall
 # through the shared clampWideNumPolys() helper so an autotune/pinned winner can
 # never re-inflate polys past 512 on the wide path (the ~8-16x bucket-traffic the
@@ -229,7 +229,46 @@ target_link_libraries(test_wide_num_polys_clamp PRIVATE
     mpqs_sieve mpqs_common cudampqs_build_flags)
 add_test(NAME wide_num_polys_clamp COMMAND test_wide_num_polys_clamp)
 
-# Mid-sieve checkpoint I/O contract (S1): (A) m-trailer-test — deserialize_v2 ignores
+# SM-aligned launch geometry (v1.0.6): the per-parameter power-of-two policy,
+# the exact-partition / GATHER-decomposition invariants (G1/G2/G3) and the admissible-set
+# rounding of sasGridDim. Runs the REAL KernelLaunchValidator through its explicit-DeviceLimits
+# constructor, so it is deterministic and needs no CUDA device. Asserts (A) the legacy/wide rule
+# set is bit-identical to the power-of-two-only predicate over a pow2 sweep, (B) the SM-aligned
+# tuples are accepted on the narrow batch path and rejected in legacy/wide mode, (C) every
+# deliberately-broken tuple is rejected in BOTH modes with a diagnostic naming the real
+# invariant, (D) admissibleSasGridDim reproduces next-pow2-then-clamp on pow2 np.
+add_executable(test_admissible_geometry
+    ${CMAKE_SOURCE_DIR}/tools/autotune/test_admissible_geometry.cu)
+set_target_properties(test_admissible_geometry PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(test_admissible_geometry PRIVATE
+    mpqs_autotune mpqs_sieve mpqs_common cudampqs_build_flags)
+add_test(NAME admissible_geometry COMMAND test_admissible_geometry)
+
+# v1.0.6 narrow-batch sieve geometry overrides (--sieve_block_size / --sieve_big_prime_start)
+# and the narrow-batch interval-coverage invariant they make reachable. Runs the REAL production
+# helpers from src/sieve/sieve_memory_model.h (narrowBatchCoverageOk, admissibleSieveBlockSize,
+# admissibleBigPrimeStart) -- the same functions validateConfigs() and the CLI call -- so the
+# test cannot drift from the shipped rule. Pure host arithmetic: no kernels, no device
+# allocation, no CUDA device required (compiled as .cu only for the math headers). Asserts
+# (A) the coverage guard is a NO-OP on every shipped narrow-batch geometry, (B) the half-sieve
+# case (intervals=8, SB=32768, M=262144) is rejected and its numIntervals=16 fix accepted,
+# (C) over-coverage (SB == M, the autotune M-sweep) stays legal, (D) the admissible sets accept
+# the intended values and reject 0-adjacent / non-pow2 / <= midPrimeStartIndex inputs,
+# (E) the coverage arithmetic is 64-bit and cannot wrap into a false pass.
+add_executable(test_sieve_geometry_overrides
+    ${CMAKE_SOURCE_DIR}/tools/sieve/test_sieve_geometry_overrides.cu)
+set_target_properties(test_sieve_geometry_overrides PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(test_sieve_geometry_overrides PRIVATE
+    mpqs_sieve mpqs_common cudampqs_build_flags)
+add_test(NAME sieve_geometry_overrides COMMAND test_sieve_geometry_overrides)
+
+# Mid-sieve checkpoint I/O contract: (A) m-trailer-test — deserialize_v2 ignores
 # appended trailing bytes; (B) writeCheckpointAtomic/readCheckpoint round-trip; (C) .prev
 # retention + torn-footer rejection + loadLatestCheckpoint fallback. CPU-only host test
 # (no kernels). Links mpqs_common (relation_io + sieve_checkpoint + uint512).
@@ -242,7 +281,7 @@ set_target_properties(test_checkpoint_io PROPERTIES
 target_link_libraries(test_checkpoint_io PRIVATE mpqs_common cudampqs_build_flags)
 add_test(NAME checkpoint_io COMMAND test_checkpoint_io)
 
-# WorkPool completed-prefix cursor (S3, B2): completedPrefixCursor() returns the COMPLETED
+# WorkPool completed-prefix cursor: completedPrefixCursor() returns the COMPLETED
 # contiguous prefix = min(next_, min start over in_flight_ ∪ returned_), NOT nextCursor().
 # Compiles work_pool.cpp directly (no CUDA kernels, no cluster-library link). CPU-only host test.
 add_executable(test_work_pool_cursor
@@ -256,7 +295,7 @@ target_include_directories(test_work_pool_cursor PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_link_libraries(test_work_pool_cursor PRIVATE cudampqs_build_flags)
 add_test(NAME work_pool_cursor COMMAND test_work_pool_cursor)
 
-# Cluster coordinator RESUME (S4): (A) computeResumeTrim — per-node initial-range trim incl.
+# Cluster coordinator RESUME: (A) computeResumeTrim — per-node initial-range trim incl.
 # the count==0 -> re-sieve-last-hypercube guard + the eff_hw+count==orig_count invariant;
 # (B) clusterResumeTopologyOk — N2 node-count/overflow-geometry guard; (C) re-inject ordering
 # (addRelations rebuilds seen_ before partial combines, m-dedup-order). CPU-only host test.
@@ -296,6 +335,19 @@ target_include_directories(test_work_assign_hash PRIVATE
 target_link_libraries(test_work_assign_hash PRIVATE
     cudampqs_cluster mpqs_sieve mpqs_common cudampqs_build_flags)
 add_test(NAME work_assign_hash COMMAND test_work_assign_hash)
+
+# Scope resolution for --cuda_graph_capture. Pure-logic host test over plain scalars: the
+# resolver is a free inline function in include/graph_capture_scope.h, so this links
+# mpqs_common only (no orchestrator/cluster/sieve pull-in). Enforces the operator constraint
+# that cluster mode NEVER captures GPU large-prime matching.
+add_executable(test_graph_capture_scope
+    ${CMAKE_SOURCE_DIR}/tools/sqrt_failure/test_graph_capture_scope.cu)
+set_target_properties(test_graph_capture_scope PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(test_graph_capture_scope PRIVATE mpqs_common cudampqs_build_flags)
+add_test(NAME graph_capture_scope COMMAND test_graph_capture_scope)
 
 # Optional Sqrt specific benchmark (EXCLUDE_FROM_ALL: uses AoS Relation API, needs M2 update for SoA)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sqrt_benchmark.cpp")

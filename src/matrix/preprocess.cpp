@@ -264,7 +264,7 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
     //    Merges reduce the matrix first; truncation selects rows by coverage-greedy
     //    policy on the clean binary CSR from GF(2) extraction. Truncation runs
     //    *before* product char cols are appended, so the target accounts for the
-    //    32 char cols via `n_extra_cols=32` (M12-S1).
+    //    32 char cols via `n_extra_cols=32`.
     HostMatrixCSR* active_csr = &gf2.gf2_csr;
     std::vector<uint32_t>* active_row_map = &gf2.row_map;
     TruncationResult truncation;

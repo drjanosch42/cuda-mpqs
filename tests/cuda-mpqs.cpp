@@ -23,6 +23,7 @@
 #include "uint512.cuh"
 #include "autotune_history.h"
 #include "runtime_estimator.h"
+#include "sieve_memory_model.h"   // admissibleSieveBlockSize / admissibleBigPrimeStart (v1.0.6)
 #include "version.h"
 
 #include <iostream>
@@ -234,7 +235,7 @@ void print_usage(const char* prog_name) {
               << "  --char_mode <MODE>      Character-column aux-prime selection: norm, branch, none [Default: none]\n"
               << "                            none = append ZERO character columns (scientific null control).\n"
               << "  --sieve_accumulator <MODE>  Sieve accumulator width: auto, u8, u16 [Default: auto]\n"
-              << "  --wide_accum <MODE>  Wide-path accumulator (Option A): auto, u8sat, u16 [Default: auto].\n"
+              << "  --wide_accum <MODE>  Wide-path accumulator: auto, u8sat, u16 [Default: auto].\n"
               << "                       auto = saturating-uint8 when the exactness gate holds, else uint16.\n"
               << "  --lp_preprocess_threshold <F>  DEPRECATED/INERT: AUTO no longer auto-selects preprocess from LP fraction; use --matrix_mode preprocess to opt in [Default: 0.55]\n"
               << "  --lp_matrix_threshold <F>  DEPRECATED: alias for --lp_preprocess_threshold (kept for backwards compatibility)\n"
@@ -255,9 +256,9 @@ void print_usage(const char* prog_name) {
               << "  --force_preprocess      DIAGNOSTIC: force the preprocess expand+merge path even with 0\n"
               << "                            partials (else orchestrator force-legacies). Runs preprocess's\n"
               << "                            reduction on a smooths-only relation set. Default off.\n"
-              << "  --matrix_gf2_floor_factor <F>   M12-S2: stop compact-merge when GF(2) cols fall below\n"
+              << "  --matrix_gf2_floor_factor <F>   Stop compact-merge when GF(2) cols fall below\n"
               << "                                  factor x initial_gf2_cols [0.0-1.0, default: 0.5]\n"
-              << "  --matrix_gf2_min_floor <N>      M12-S2: absolute minimum GF(2) col floor [Default: 8192]\n"
+              << "  --matrix_gf2_min_floor <N>      Absolute minimum GF(2) col floor [Default: 8192]\n"
               << "  --compact_cycles <N>    Max compact-merge cycles (GPU backend; default 5; 0=single pass)\n"
               << "  --matrix_backend <B>    Preprocessing backend: cpu, gpu, auto (gpu if available + >10K rows) [Default: cpu]\n"
               << "  --sqrt_legacy    Use CPU sqrt path (debug; default: GPU batched)\n"
@@ -279,6 +280,10 @@ void print_usage(const char* prog_name) {
               << "  --sieve_batch_size <N> Sieving batch size (Default 0 = legacy sieving)\n"
               << "  --cuda_graph_unroll <N> Capture N batches as CUDA graph (0=disabled, default=0)\n"
               << "                          Must be even. Recommended: 2 or 4. Max: 16.\n"
+              << "  --cuda_graph_capture <MODE> CUDA-graph capture scope: sieve, postproc, full\n"
+              << "                          (cluster never captures LP) [Default: full (solo) / postproc (cluster)]\n"
+              << "  --cuda_graph_lp_stride <K> In-graph LP cadence: dispatch LP every K-th captured batch\n"
+              << "                          (0 or >=unroll = once per replay) [Default: 1]\n"
               << "  --sieve_max_relations <N> Stop sieve after N relations (K/M/B/T suffix) [0=disabled]\n"
               << "  --sieve_max_batches <N>   Stop sieve after N batch iterations [0=disabled]\n"
               << "  --sieve_truncate_continue Continue pipeline (matrix/BW/sqrt) after truncation\n"
@@ -287,6 +292,15 @@ void print_usage(const char* prog_name) {
               << "                          rounded down to a power of two; 0 = off (legacy) [Default: 0]\n"
               << "  --sieve_gather_block_dim <N> GATHER (sieve-and-scan) blockDim A/B knob; result-invariant\n"
               << "                          occupancy override; power of two in [32,1024]; 0 = off (256) [Default: 0]\n"
+              << "  --sieve_block_size <N>  NARROW BATCH --params-only override of sievingBlockSize;\n"
+              << "                          power of two >= 256 and <= M; numIntervals*N >= 2M is enforced;\n"
+              << "                          0 = off (derive from the smem budget) [Default: 0]\n"
+              << "  --sieve_big_prime_start <N> NARROW BATCH --params-only override of bigPrimeStartIndex\n"
+              << "                          (GATHER/SCATTER factor-base split); N > 32, need not be a power\n"
+              << "                          of two; 0 = off (derive as sievingBlockSize/32) [Default: 0]\n"
+              << "  --sieve_bucket_overflow_stats  Also emit the [BucketOverflow] stats line on the NARROW\n"
+              << "                          path (wide always emits it). Costs one DtoH sync on the siever\n"
+              << "                          stream per ~5 s stats tick; needs --verbose [Default: off]\n"
               << "  --bucket_size_factor <F> Wide-path bucket-overflow ablation: globalBucketSize = F*SB\n"
               << "                          (F=0.5 == legacy SB/2; F=1.0 doubles the bucket); 0 = off/legacy [Default: 0]\n"
               << "  --autotune_probe_polys <N> Wide-autotune survivors/sec probe sample size (# distinct\n"
@@ -775,6 +789,50 @@ ParsedArgs parse_args(int argc, char** argv) {
                 }
             }
             args.mark("sieve_gather_block_dim");
+        } else if (arg == "--sieve_block_size" && i+1 < argc) {
+            if (!parse_uint32(argv[++i], args.config.sieve_block_size)) exit(1);
+            // v1.0.6: NARROW BATCH --params-only override of gs_conf.sievingBlockSize.
+            // 0 = off (loader derivation, byte-identical). N>0 must be a POWER OF TWO in
+            // [256,1<<30]: pow2 because the GATHER offset mask is (SB-1) (kernel.cu:1006) and
+            // validateConfigs POW2_CHECKs sievingBlockSize; >= 256 because SB below one warp-
+            // tile of accumulator is degenerate. The upper bound N <= M and the shared-memory
+            // sum are NOT checkable here (M, shc_dim and maxSharedMemPerBlock are unknown at
+            // parse time) and are enforced downstream by the loader's std::min-free assignment,
+            // LEQ_CHECK(ss_conf.sharedMemReq, maxSharedMemPerBlock) and the narrow-batch
+            // occupancy preflight. The predicate itself lives in sieve_memory_model.h so the CLI and
+            // the host unit test share ONE statement of the rule. NEVER silently floored or clamped.
+            if (!mpqs::sieve::admissibleSieveBlockSize(args.config.sieve_block_size)) {
+                std::cerr << "Error: --sieve_block_size must be 0 (off) or a power of two >= 256; got "
+                          << args.config.sieve_block_size << "\n";
+                exit(1);
+            }
+            args.mark("sieve_block_size");
+        } else if (arg == "--sieve_big_prime_start" && i+1 < argc) {
+            if (!parse_uint32(argv[++i], args.config.sieve_big_prime_start)) exit(1);
+            // v1.0.6: NARROW BATCH --params-only override of gs_conf.bigPrimeStartIndex.
+            // 0 = off (loader derives SB/32, byte-identical). N>0 must be STRICTLY greater than
+            // midPrimeStartIndex = 32 (device_sieving_controller.cpp): the mid-prime loops run
+            // [midPrimeStart, bPSI) (kernel.cu:1293, :1371), so N <= 32 inverts the range and
+            // silently drops the entire mid-prime band -- a yield loss with no error. Power-of-
+            // two is deliberately NOT required (every consumer is a grid-stride loop and the
+            // GATHER smem layout is plain pointer arithmetic). N <= fb_size and the shared-memory
+            // sum are enforced downstream (fb_size is unknown at parse time).
+            if (!mpqs::sieve::admissibleBigPrimeStart(args.config.sieve_big_prime_start)) {
+                std::cerr << "Error: --sieve_big_prime_start must be 0 (off) or > 32 "
+                             "(= midPrimeStartIndex; at N<=32 the mid-prime range inverts and "
+                             "the band is silently dropped); got "
+                          << args.config.sieve_big_prime_start << "\n";
+                exit(1);
+            }
+            args.mark("sieve_big_prime_start");
+        } else if (arg == "--sieve_bucket_overflow_stats") {
+            // v1.0.6: enable the [BucketOverflow] stats line on the NARROW path. Default off,
+            // because the reader costs a cudaMemcpyAsync + cudaStreamSynchronize on the SIEVER
+            // stream at the ~5 s stats cadence, and narrow production is a zero-sync
+            // double-buffered pipeline. Boolean, no argument. Inert on the wide path, which
+            // always reports. Symmetric across A/B arms is the intended usage.
+            args.config.sieve_bucket_overflow_stats = true;
+            args.mark("sieve_bucket_overflow_stats");
         } else if (arg == "--bucket_size_factor" && i+1 < argc) {
             double val;
             if (!parse_double(argv[++i], val)) exit(1);
@@ -809,6 +867,22 @@ ParsedArgs parse_args(int argc, char** argv) {
             }
             args.config.cuda_graph_unroll = val;
             args.mark("cuda_graph_unroll");
+        }
+        else if (arg == "--cuda_graph_capture" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "sieve")          args.config.graph_capture_scope = GraphCaptureScope::SIEVE;
+            else if (mode == "postproc")  args.config.graph_capture_scope = GraphCaptureScope::POSTPROC;
+            else if (mode == "full")      args.config.graph_capture_scope = GraphCaptureScope::FULL;
+            else {
+                std::cerr << "Error: unknown --cuda_graph_capture '" << mode
+                          << "'. Valid values: sieve, postproc, full\n";
+                exit(1);
+            }
+            args.mark("cuda_graph_capture");
+        }
+        else if (arg == "--cuda_graph_lp_stride" && i + 1 < argc) {
+            if (!parse_uint32(argv[++i], args.config.graph_lp_stride)) exit(1);
+            args.mark("cuda_graph_lp_stride");
         }
 
         // --- Truncated Sieve ---
@@ -1024,6 +1098,43 @@ ParsedArgs parse_args(int argc, char** argv) {
         args.config.autotune_config.enable_stage1 = explicit_stage1;
         args.config.autotune_config.enable_stage2 = explicit_stage2;
         args.config.autotune_config.enable_stage3 = explicit_stage3;
+    }
+
+    // ---- v1.0.6: cross-flag guards for the narrow-batch geometry overrides ----
+    // Evaluated after the whole argv sweep because they are RELATIONS between flags, and argv
+    // order must not matter. All three exit(1) with the reason named — never a silent floor,
+    // clamp or downgrade (the exactness-checked config loader is the precedent).
+    if (args.config.sieve_block_size != 0 || args.config.sieve_big_prime_start != 0) {
+        // (1) --params is required. Both overrides are consumed ONLY inside
+        //     loadPartialCustomConfig; loadStandardConfig is deliberately untouched, so without
+        //     --params the flags would be accepted and then do nothing at all.
+        if (!args.config.useParams) {
+            std::cerr << "Error: --sieve_block_size / --sieve_big_prime_start require --params "
+                         "(they override derivations that only run on the pinned-tuple config "
+                         "path; without --params they would be silently inert).\n";
+            exit(1);
+        }
+        // (2) --autotune* is forbidden. The autotuner is deliberately blind to these knobs
+        //     (the same rule as SM-aligned geometry, which stays --params-only and nothing
+        //     proposes, projects or auto-applies it). An autotune run re-enters
+        //     loadPartialCustomConfig per probe with tuple-derived interval counts, which the
+        //     override would silently desynchronise from SB — and the separate autotune-side
+        //     KernelLaunchValidator derives its own SB and never sees the override at all.
+        if (args.config.autotune_enabled) {
+            std::cerr << "Error: --sieve_block_size / --sieve_big_prime_start cannot be combined "
+                         "with --autotune / --autotune_stage*. These knobs are --params-only by "
+                         "design and the autotuner must never propose, project or auto-apply "
+                         "them. Drop the autotune flag (add --autotune_no_history if a stale "
+                         "history is being auto-applied).\n";
+            exit(1);
+        }
+        // (3) Legacy mode. Also re-asserted in validateConfigs because --sieve_batch_size
+        //     can be forced to 0 downstream; catching it here names the flag the user typed.
+        if (args.set_flags.count("sieve_batch_size") && args.config.sieve_batch_size == 0) {
+            std::cerr << "Error: --sieve_block_size / --sieve_big_prime_start are NARROW-BATCH "
+                         "ONLY and cannot be combined with --sieve_batch_size 0 (legacy mode).\n";
+            exit(1);
+        }
     }
 
     // Copy pin tracking flags into config for downstream consumers

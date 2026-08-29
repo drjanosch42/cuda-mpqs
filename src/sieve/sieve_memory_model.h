@@ -47,9 +47,9 @@ namespace sieve {
 // The budget is `(vram * num) / den`, truncating integer arithmetic — see
 // sieveBucketBudget() for the load-bearing reason this must NOT use `double`.
 //
-//   S1: 3/4 = 0.75 everywhere — byte-identical to the pre-refactor hand-rolled
-//       `3*totalGlobalMem/4` at every site.
-//   S2 (this stage): flipped to 4/5 = 0.80 in this ONE place. Every in-tree
+//   Originally: 3/4 = 0.75 everywhere — byte-identical to the pre-refactor
+//       hand-rolled `3*totalGlobalMem/4` at every site.
+//   Now: flipped to 4/5 = 0.80 in this ONE place. Every in-tree
 //       sizing site (loadStandardConfig loop, validateConfigs LEQ_CHECK,
 //       checkGlobalMem, its diagnose() message, printBufferRecommendations) AND
 //       the autotune OOM guard read this single constant, so the autotune and
@@ -145,7 +145,7 @@ inline __host__ SieveDeviceFootprint estimateSieveFootprint(
 // its diagnose() message) — none of them included the small dev_globalBucketCounts
 // term. Those sites route through THIS helper to stay byte-identical; the COMPLETE
 // bucket footprint (entries + counts) lives in SieveDeviceFootprint::bucket_bytes
-// and is consumed only by the S2 total-footprint guard.
+// and is consumed only by the total-footprint guard.
 // -----------------------------------------------------------------------------
 inline __host__ uint64_t bucketEntriesBytes(uint64_t num_polysPerSieveCall,
                                             uint64_t num_sievingBlocksPerSieveCall,
@@ -165,9 +165,9 @@ inline __host__ uint64_t bucketEntriesBytes(uint64_t num_polysPerSieveCall,
 // VRAM sizes and flip the reduction loop's LAST halving -> a different seed
 // num_polys. So this stays in exact integer arithmetic and the comparisons that
 // consume it are same-type uint64_t. The operative budget is now num=4, den=5
-// (= 0.80, S2); the general path `(v*num)/den` is integer-exact for it.
+// (= 0.80); the general path `(v*num)/den` is integer-exact for it.
 //
-// The num==3&&den==4 special-case below is now dormant (S1 used 3/4) but is kept:
+// The num==3&&den==4 special-case below is now dormant (legacy used 3/4) but is kept:
 // it documents that the legacy call reduced bit-for-bit to `3*v/4`, and any future
 // caller passing 3/4 still gets that exact value.
 //
@@ -218,7 +218,7 @@ inline __host__ uint32_t reduceNumPolysToBudget(uint32_t start_num_polys,
 }
 
 // -----------------------------------------------------------------------------
-// WIDE (uint16) accumulator num_polys cap (S1, wide-autotune foundation).
+// WIDE (uint16) accumulator num_polys cap (wide-autotune foundation).
 //
 // The wide-path default geometry fix (commit 27f810e) caps num_polysPerSieveCall
 // at kWideNumPolysCap in loadStandardConfig to keep the per-launch bucket-write
@@ -238,6 +238,81 @@ inline __host__ uint32_t clampWideNumPolys(uint32_t num_polys, bool wide)
 {
     return wide ? (num_polys < kWideNumPolysCap ? num_polys : kWideNumPolysCap)
                 : num_polys;
+}
+
+// -----------------------------------------------------------------------------
+// v1.0.6 — NARROW BATCH interval-coverage invariant.
+//
+// On the narrow BATCH path a single sieve launch must cover ALL of [-M, M).
+// DeviceSievingController::runSievingBatch() — the production batch entry — never
+// touches ds_params.startIndex (only updateState(), sieveFullCube(),
+// benchmarkSievingConfig() and the debug/probe save-restore pairs do), and the batch
+// GATHER loop runs `for (sieveBlock = 0; sieveBlock < num_sievingBlocksPerSieveCall;
+// ++sieveBlock)` from that single origin. So gs_conf.num_sievingBlockBatches — which the
+// loader's own [C1] guard multiplies into its coverage test — is a FICTION on this path:
+// nothing advances the origin between "batches", and a config with
+// num_sievingBlocksPerSieveCall * sievingBlockSize == M passes that guard while silently
+// sieving only the half-interval [-M, 0). That is a ~50 % yield loss with no error, and it
+// can even present as a HIGHER relation count (less maxRelationsPerBlock = 64 truncation
+// over a smaller region), i.e. a signature that reads like a win.
+//
+// The invariant is therefore stated on the PER-LAUNCH coverage:
+//
+//     num_sievingBlocksPerSieveCall * sievingBlockSize  >=  2 * M
+//
+// >= and not ==: OVER-coverage is legitimate and already blessed by the loader (the full
+// autotune M-sweep drives sievingBlockSize = min(M, ...) == M with the tuple's interval
+// count held fixed, giving intervals*SB > 2M). Only UNDER-coverage is the silent half-sieve.
+//
+// Latent in every binary up to v1.0.5: it is a no-op for every config loadStandardConfig
+// produces (it derives num_sievingBlocksPerSieveCall = 2M/SB itself) and for every shipped
+// --params tuple on A100/H100/RTX 5070 Ti, but NOT for a device whose shared-memory budget
+// yields SB < 2M/numIntervals — the loader's own comment names Turing intervals=8/SB=32768
+// at M=262144. Such a config half-sieved there silently; from v1.0.6 it is
+// rejected LOUDLY instead (a deliberate, recorded behaviour change). The escape is
+// numIntervals, which is --params field 2.
+//
+// uint64 arithmetic: intervals*SB overflows uint32 at M >= 2^31, which is reachable in
+// principle (M is uint32) and would wrap the product into a FALSE pass.
+// -----------------------------------------------------------------------------
+inline __host__ bool narrowBatchCoverageOk(uint32_t num_sievingBlocksPerSieveCall,
+                                           uint32_t sievingBlockSize,
+                                           uint32_t M)
+{
+    const uint64_t coverage = (uint64_t)num_sievingBlocksPerSieveCall * (uint64_t)sievingBlockSize;
+    return coverage >= 2ull * (uint64_t)M;
+}
+
+// -----------------------------------------------------------------------------
+// v1.0.6 — admissible-set predicates for the two narrow-batch geometry overrides.
+// Shared by the CLI (tests/cuda-mpqs.cpp) and the host unit test so there is exactly ONE
+// statement of each rule. Both take 0 to mean OFF (always admissible: the loader's own
+// derivation runs and behaviour is byte-identical to v1.0.5).
+//
+// The bounds that depend on run-time quantities unknown at parse time (N <= M for SB,
+// N <= fb_size for bPSI, and the shared-memory sum SB*accumElemBytes + 3*bPSI*4 +
+// shc_dim*64 <= maxSharedMemPerBlock) are deliberately NOT checked here; they are enforced
+// downstream by validateConfigs' LEQ_CHECK on ss_conf.sharedMemReq and by the narrow-batch
+// occupancy preflight. Nothing is ever silently floored or clamped — the
+// exactness-checked config loader is the precedent.
+// -----------------------------------------------------------------------------
+
+/// --sieve_block_size. Power of two because the GATHER offset mask is (SB - 1) and
+/// validateConfigs POW2_CHECKs sievingBlockSize; >= 256 because an accumulator shorter than
+/// a warp tile is degenerate.
+inline __host__ bool admissibleSieveBlockSize(uint32_t n)
+{
+    return n == 0u || (n >= 256u && (n & (n - 1u)) == 0u);
+}
+
+/// --sieve_big_prime_start. STRICTLY greater than midPrimeStartIndex = 32: the mid-prime
+/// loops run [midPrimeStart, bigPrimeStartIndex), so n <= 32 inverts the range and silently
+/// drops the whole mid-prime band. Power-of-two is deliberately NOT required — every
+/// consumer is a grid-stride loop over [0,bPSI), [32,bPSI) or [bPSI,fb_size) and the GATHER
+/// shared-memory layout is plain pointer arithmetic.
+inline __host__ bool admissibleBigPrimeStart(uint32_t n)
+{
+    return n == 0u || n > 32u;
 }
 
 } // namespace sieve

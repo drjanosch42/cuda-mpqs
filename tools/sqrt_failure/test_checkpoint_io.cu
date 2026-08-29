@@ -4,7 +4,7 @@
 // See LICENSE at the repository root for licensing terms, including the NVIDIA CUDA Toolkit exception.
 //
 // =============================================================================
-// test_checkpoint_io — contractual tests for the mid-sieve checkpoint (S1)
+// test_checkpoint_io — contractual tests for the mid-sieve checkpoint
 // =============================================================================
 //
 // (A) m-trailer-test: make the serialize_v2 / deserialize_v2 trailing-byte tolerance
@@ -204,7 +204,7 @@ int main() {
     }
 
     // ---------------------------------------------------------------------
-    // (D) S3 cluster-block round-trip: write a checkpoint WITH a variable-size
+    // (D) Cluster-block round-trip: write a checkpoint WITH a variable-size
     //     cluster block (completedPrefixCursor + per-node initial-range high-water
     //     array) through the variable footer; read it back; assert the fields survive
     //     and the sanity invariants hold (prefix ≤ next_; per-node hw ≤ its range size).
@@ -220,7 +220,7 @@ int main() {
         tr.lp1_bound               = meta.lp_bound;
         tr.sieve_bound             = meta.sieve_bound;
         tr.N                       = meta.N;
-        tr.cluster_section_present = 1;                        // an S3 cluster block follows
+        tr.cluster_section_present = 1;                        // a cluster block follows
         tr.elapsed_sieve_sec       = 7777ull;
 
         // Synthetic cluster state: 4 nodes (coord + 3 workers). Per-node initial range

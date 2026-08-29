@@ -6,8 +6,8 @@ Central pipeline driver. Coordinates the 5-stage MPQS factorization pipeline (pl
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `include/orchestrator.h` | ~780 | `MPQSOrchestrator` class, `MPQSConfig` struct, `ExecutionMode` enum, `SieveProgressTracker`, `LPFillProjector`, `TruncatedSieveResult` |
-| `src/orchestrator/orchestrator.cpp` | ~7690 | Pipeline implementation, stage dispatch, truncated sieve probes, coordinator `networkLoop()` (Thread A), checkpoint/resume flows |
+| `include/orchestrator.h` | ~840 | `MPQSOrchestrator` class, `MPQSConfig` struct, `ExecutionMode` enum, `SieveProgressTracker`, `LPFillProjector`, `TruncatedSieveResult` |
+| `src/orchestrator/orchestrator.cpp` | ~8430 | Pipeline implementation, stage dispatch, truncated sieve probes, coordinator `networkLoop()` (Thread A), checkpoint/resume flows |
 | `src/orchestrator/CMakeLists.txt` | 29 | Static library `mpqs_orchestrator` |
 
 Relation disk I/O (`serialize_v1/v2`) lives in `src/common/relation_io.{h,cpp}`; the checkpoint
@@ -54,12 +54,17 @@ All three are ADDITIVE: when false, the standard path is byte-for-byte unchanged
 | `sieve_gms_num_blocks` | `uint32_t` | 0 (auto) | MetaSieve CUDA blocks |
 | `sieve_hcube_dimension` | `uint32_t` | 0 (auto) | Hypercube dimension for polynomial construction |
 | `sieve_accumulator_mode` | `int` | 0 (auto) | Sieve log-accumulator width: 0 = auto (`use_wide` dispatch predicate decides), 1 = force uint8, 2 = force uint16. CLI: `--sieve_accumulator auto\|u8\|u16` |
-| `sieve_wide_accum_mode` | `int` | 0 (auto) | Wide-regime accumulator variant (Option A): 0 = auto (saturating-uint8 iff the exactness gate `APV_max−threshold ≤ 254` holds, else uint16), 1 = force u8sat (gate-honoured), 2 = force uint16. Only consulted in the wide regime. CLI: `--wide_accum auto\|u8sat\|u16` |
+| `sieve_wide_accum_mode` | `int` | 0 (auto) | Wide-regime accumulator variant: 0 = auto (saturating-uint8 iff the exactness gate `APV_max−threshold ≤ 254` holds, else uint16), 1 = force u8sat (gate-honoured), 2 = force uint16. Only consulted in the wide regime. CLI: `--wide_accum auto\|u8sat\|u16` |
 | `sieve_meta_cycle_cap` | `uint32_t` | 0 (OFF) | A2 meta-sieve SCATTER locality knob: caps `num_activeBlocksPerCycle` and raises `num_metaSieveCycles` correspondingly, bounding each thread's bucket-write spread independent of M. 0 = exact legacy geometry. CLI: `--sieve_meta_cycle_cap` |
 | `sieve_gather_block_dim` | `uint32_t` | 0 (OFF) | A/B knob for the GATHER (sieve-and-scan) kernel's blockDim (`ss_conf.num_threadsPerBlock`). Result-invariant performance knob (only occupancy changes); power of two in [32, 1024]. 0 = loader-derived (currently 256). CLI: `--sieve_gather_block_dim` |
 | `sieve_bucket_size_factor` | `double` | 0.0 (OFF) | Decouples large-prime bucket capacity from the legacy `globalBucketSize = SB/2`: F>0 sizes it `F·SB` (0.5 reproduces legacy; 1.0 doubles it). VRAM budget + config validator both account for the resized bucket. CLI: `--bucket_size_factor` |
+| `sieve_block_size` | `uint32_t` | 0 (OFF) | **v1.0.6, narrow-batch + `--params` only.** Overrides `gs_conf.sievingBlockSize` **inside `loadPartialCustomConfig` only** (`device_sieving_controller.cpp:1539-1561`); `loadStandardConfig` is deliberately untouched, so without `--params` the flag would be inert — hence the CLI rejection below. 0 = OFF: the loader derives `SB = min(M, pow2leq(3·maxSharedMemPerBlock/4))`, byte-identical to v1.0.6. Admissible at the CLI: 0, or a **power of two ≥ 256** (`mpqs::sieve::admissibleSieveBlockSize`, `src/sieve/sieve_memory_model.h`); pow2 because the GATHER offset mask is `SB−1` and `validateConfigs` `POW2_CHECK`s the field. The upper bounds (`≤ M`, and the shared-memory sum) are **not** checkable at parse time and are enforced downstream by `LEQ_CHECK(ss_conf.sharedMemReq, maxSharedMemPerBlock)` + the narrow-batch occupancy preflight. `log2_sievingBlockSize` and `computeGlobalBucketSize(SB)` both follow the override automatically. ⚠ Lowering `SB` shrinks a launch's interval coverage, so `numIntervals` (`--params` field 2) must rise in step — see the coverage invariant below. CLI: `--sieve_block_size` |
+| `sieve_big_prime_start` | `uint32_t` | 0 (OFF) | **v1.0.6, narrow-batch + `--params` only.** Overrides `gs_conf.bigPrimeStartIndex` — the GATHER/SCATTER factor-base split — which the loader otherwise ties **unconditionally** to `sievingBlockSize/32` (`device_sieving_controller.cpp:1588-1610`), so an `SB` override would silently migrate primes between the two paths as a confounded second change. 0 = OFF (derived `SB/32`, byte-identical). Admissible at the CLI: 0, or **strictly greater than 32** (`admissibleBigPrimeStart`); 32 is `gs_conf.midPrimeStartIndex`, and the mid-prime loops run `[midPrimeStart, bPSI)`, so `N ≤ 32` inverts the range and drops the whole mid-prime band silently. **Power-of-two is deliberately NOT required** (every consumer is a grid-stride loop and the GATHER shared-memory layout is plain pointer arithmetic). `N ≤ fb_size` and the smem sum are enforced downstream. CLI: `--sieve_big_prime_start` |
+| `sieve_bucket_overflow_stats` | `bool` | false (OFF) | **v1.0.6, diagnostic only, no argument.** Relaxes the previously wide-only host reader `DeviceSievingController::getBucketOverflowStats()` (`device_sieving_controller.cpp:203-226`) so the **narrow** path also emits the `[BucketOverflow]` stats line (`orchestrator.cpp:3084-3095`). The device data always existed on both widths — the SCATTER kernel's bit-31 overflow flag is width-agnostic — only the host reader was gated, because it costs a `cudaMemcpyAsync` + `cudaStreamSynchronize` **on the siever stream** at the ~5 s stats cadence and narrow production is a zero-sync double-buffered pipeline. Measured cost at production geometry ≤ 0.09 % of the sieve wall. Wide behaviour is unaffected either way. Unlike the two overrides above it does **not** require `--params`. CLI: `--sieve_bucket_overflow_stats` |
 | `autotune_probe_polys` | `uint32_t` | 0 (auto) | Wide-autotune survivors/sec probe sample size (# distinct polynomials staged; every candidate re-sieves the same sample). 0 = auto-scale by N. Wide path only. CLI: `--autotune_probe_polys` |
-| `cuda_graph_unroll` | `uint32_t` | 0 (disabled) | Capture N batches as a CUDA graph for replay. Must be even (double-buffer constraint). Recommended: 2 or 4. CLI: `--cuda_graph_unroll` |
+| `cuda_graph_unroll` | `uint32_t` | 0 (disabled) | Capture N batches as a CUDA graph for replay. Only odd values **> 1** are rounded up (`tests/cuda-mpqs.cpp`: `if (val > 1 && val % 2 != 0)`); `1` is a supported, unrounded probe value; capped at 16. Recommended: 2 or 4. CLI: `--cuda_graph_unroll` |
+| `graph_capture_scope` | `GraphCaptureScope` | `AUTO` → `FULL` (solo) / `POSTPROC` (cluster) | How much of the per-batch body the graph captures: `SIEVE` (sieve kernels only — the pre-v1.0.6 body and the rollback path), `POSTPROC` (+ batch trial division), `FULL` (+ GPU LP, solo only; requested in cluster it is downgraded to `POSTPROC` with a `LOG_WARNING`). `MPQS_LP_DIAG=1` forces `SIEVE`. Inert when `cuda_graph_unroll == 0`. Resolution rules live in `include/graph_capture_scope.h`. CLI: `--cuda_graph_capture {sieve\|postproc\|full}` |
+| `graph_lp_stride` | `uint32_t` | 1 | In-graph LP cadence: one dispatch every K-th captured batch. `1` = per batch (what `--cuda_graph_unroll 0` has always done); `0` or `>= cuda_graph_unroll` = one dispatch per replay (the pre-v1.0.6 graph cadence). Honoured only when LP is actually captured. CLI: `--cuda_graph_lp_stride` |
 | `probe_timeout` | `double` | 120.0 | Hard timeout (seconds) for `TruncatedSieveRun()`. CLI: `--probe_timeout` |
 | `estimate_only` | `bool` | false | Run truncated sieve in current topology, print runtime estimate, exit. CLI: `--estimate_only` |
 | `sieve_max_relations` | `uint64_t` | 0 (disabled) | Truncation: stop sieve after N relations (coordinator-only in cluster mode — counts the pooled total). CLI: `--sieve_max_relations` |
@@ -68,6 +73,36 @@ All three are ADDITIVE: when false, the standard path is byte-for-byte unchanged
 | `useParams` | `bool` | false | Use custom sieve parameter tuple |
 | `params[8]` | `uint32_t[8]` | all 0 | Custom sieve parameters (passed to `loadPartialCustomConfig`) |
 | `pinned_params` | `map<string,bool>` | empty | Records which config fields were explicitly set via CLI. `isPinned(name)` is checked by auto-apply, autotune, and the Jetson/small-N default blocks before overriding any user-provided value |
+
+**Scope enforcement for the v1.0.6 geometry overrides — nothing is ever silently floored, clamped or downgraded.**
+`sieve_block_size` / `sieve_big_prime_start` are rejected at three levels:
+
+1. **CLI cross-flag guards** (`tests/cuda-mpqs.cpp`, the `cross-flag guards` block, evaluated after the
+   whole `argv` sweep so flag order does not matter — each `exit(1)`s naming the reason):
+   (a) without `--params` (both are consumed only inside `loadPartialCustomConfig`, so they would be
+   inert); (b) combined with any `--autotune*` (the autotuner is deliberately blind to them — it
+   re-enters `loadPartialCustomConfig` per probe with tuple-derived interval counts that the override
+   would desynchronise from `SB`, and the autotune-side `KernelLaunchValidator` derives its own `SB`
+   and never sees the override); (c) combined with `--sieve_batch_size 0` (legacy mode).
+2. **CLI admissible-set predicates** — `admissibleSieveBlockSize` / `admissibleBigPrimeStart`, both in
+   `src/sieve/sieve_memory_model.h` so the CLI and the host unit test share one statement of each rule.
+3. **`validateConfigs()` re-assertion** (`device_sieving_controller.cpp:1979-1996`): re-rejects on the
+   **wide** (uint16/u8sat) accumulator and in **legacy** mode with `LOG_ERROR_CRITICAL`. This runs after
+   `setSievingBatchSize()`, which is the first point at which the batch/legacy predicate is well-defined.
+   The loaders additionally gate both overrides on `!use_wide_accumulator_` at the point of use, so a
+   wide run cannot reach an overridden field at all; the `validateConfigs` check is what makes the
+   attempt *audible* rather than quietly inert.
+
+**Narrow-batch interval-coverage invariant (v1.0.6, `narrowBatchCoverageOk`, `device_sieving_controller.cpp:2007-2026`).**
+Independent of the overrides and **not** gated on them: on the narrow batch path
+`num_sievingBlocksPerSieveCall × sievingBlockSize ≥ 2M` is now checked in `validateConfigs()` and aborts
+pre-sieve with `LOG_ERROR_CRITICAL`, naming the required `numIntervals`. `runSievingBatch()` never
+advances `ds_params.startIndex`, so `gs_conf.num_sievingBlockBatches` — which the loader's older `[C1]`
+guard multiplies into its coverage test — does not multiply this coverage; a config with
+`intervals × SB == M` passed `[C1]` while silently sieving only `[-M, 0)`. `≥` and not `==`, because
+over-coverage is legitimate (the autotune M-sweep produces it). Latent in every binary v1.0.5 and earlier; a
+deliberate, recorded behaviour change for smaller-shared-memory devices that are half-sieving today.
+Uses `uint64` arithmetic (the product overflows `uint32` at `M ≥ 2^31`).
 
 ### Buffer Sizing Overrides
 
@@ -104,11 +139,11 @@ All three are ADDITIVE: when false, the standard path is byte-for-byte unchanged
 | `force_preprocess` | `bool` | false | DIAGNOSTIC: force the preprocess expand+merge path even with 0 raw partials (normally the orchestrator force-legacies in that case). CLI: `--force_preprocess` |
 | `preprocess_lp_materialize_max` | `double` | 0.45 | Facet-3 gate: max combined-smooth LP fraction at which the preprocess path materializes matched raw-1-partial 2-cycle rows (above it they pin the BW kernel to the trivial genus → 0% nontrivial). 1.0 = never skip (pre-fix); 0.0 = always skip. CLI: `--preprocess_lp_materialize_max` |
 | `truncation_min_rows` | `uint32_t` | 5000000 | Facet-2 size gate: skip CPU-preprocess truncation when the reduced matrix has ≤ this many rows (BW-tractable untruncated). CLI: `--truncation_min_rows` |
-| `truncation_factor` | `double` | 1.05 | Matrix truncation on/off switch: > 0 = enabled, 0 = disabled. Actual target is excess-based (M12-S1): `n_cols + n_extra_cols + matrix_truncation_excess`. Retained as backward-compatible CLI toggle. CLI: `--truncation_factor` |
+| `truncation_factor` | `double` | 1.05 | Matrix truncation on/off switch: > 0 = enabled, 0 = disabled. Actual target is excess-based: `n_cols + n_extra_cols + matrix_truncation_excess`. Retained as backward-compatible CLI toggle. CLI: `--truncation_factor` |
 | `matrix_truncation_excess` | `uint32_t` | 200 | Excess rows above `(n_cols + n_extra_cols)` after truncation; controls how overdetermined the post-augmentation matrix is. CLI: `--matrix_truncation_excess` |
 | `compact_cycles` | `uint32_t` | 5 | Max compact-merge cycles (GPU backend only). 0 = single pass (no compaction, reverts to pre-M10 behavior). CLI: `--compact_cycles` |
-| `matrix_gf2_floor_factor` | `double` | 0.5 | M12-S2 GF(2) column-diversity floor: stop compact-merge cycles when surviving GF(2) cols fall below `max(matrix_gf2_min_floor, factor × initial_gf2_cols)`. CLI: `--matrix_gf2_floor_factor` |
-| `matrix_gf2_min_floor` | `uint32_t` | 8192 | M12-S2 absolute lower bound on the GF(2) column floor; prevents early termination on small test matrices. CLI: `--matrix_gf2_min_floor` |
+| `matrix_gf2_floor_factor` | `double` | 0.5 | GF(2) column-diversity floor: stop compact-merge cycles when surviving GF(2) cols fall below `max(matrix_gf2_min_floor, factor × initial_gf2_cols)`. CLI: `--matrix_gf2_floor_factor` |
+| `matrix_gf2_min_floor` | `uint32_t` | 8192 | Absolute lower bound on the GF(2) column floor; prevents early termination on small test matrices. CLI: `--matrix_gf2_min_floor` |
 
 ### Linear Algebra Fields
 
@@ -203,6 +238,8 @@ Three private helpers are shared by `SieveStage()` and `TruncatedSieveRun()` to 
 - **`initLargePrimes()`** — Configures `LargePrimeConfig` (witness capacity, hash bits, combined output, sort mode) from `config_`, constructs `largeprime_`, and calls `initiate()`. No-op if `lp1_bound == 0`.
 - **`logBufferWarnings()`** — Emits fire-once near-full warnings (accum ≥ 90%, partial ≥ 80%, persistent ≥ 95%, witness ≥ 85%) and per-delta LP overflow warnings (slab, witness, output). Called from both batch and legacy sieve loops.
 
+**Siever-side overrides must be pushed before `initiate()`.** Both `SieveStage()` (`orchestrator.cpp:4142-4151`) and `TruncatedSieveRun()` (`orchestrator.cpp:6427-6434`) call the same setter block on the freshly constructed `DeviceSievingController` — `setAccumulatorMode`, `setWideAccumMode`, `setMetaCycleCap`, `setGatherBlockDim`, `setBucketSizeFactor`, and (v1.0.6) `setSievingBlockSizeOverride` / `setBigPrimeStartOverride` / `setNarrowOverflowStats` — because every one of them is consumed by the config loader, which runs after `initiate()`.
+
 ### Stage 2: SieveStage (three dispatch paths)
 
 **Initialization (shared):**
@@ -212,7 +249,25 @@ Three private helpers are shared by `SieveStage()` and `TruncatedSieveRun()` to 
 4. **sasGridDim auto-correction** (belt-and-suspenders): when LP is active with custom params, computes `min_sas = ceil(subCubeSize × numIntervals / 64)`, rounds up to next power-of-2, and raises `params[6]` if below minimum.
 5. **sasBlockDim cap**: in legacy mode (`sieve_batch_size == 0`), caps `params[7]` to 1024 to match `__launch_bounds__(1024)` on sieveAndScanKernel.
 6. Config loading: `loadPartialCustomConfig(params...)` if `useParams`, else `loadStandardConfig`. Validates and calls `loadData`.
-7. **Preflight kernel launch check** (`preflightKernelLaunch`): when `useParams`, rejects infeasible kernel launch configurations before entering the sieve loop. Throws `std::runtime_error` on failure.
+7. **Preflight kernel launch check** (`preflightKernelLaunch`, `orchestrator.cpp:4320-4331`): when `useParams`, rejects infeasible kernel launch configurations before entering the sieve loop. Throws `std::runtime_error` on failure.
+   **v1.0.6:** `SieveStage()` first computes `relaxed_geometry = (config_.sieve_batch_size > 0) && !siever_->isWideAccumulator()` — exactly `validateConfigs()`' own predicate, read from the siever whose wide/narrow decision was made in `initiate()` — and passes it as `preflightKernelLaunch`'s `allow_nonpow2_geometry` argument, so a pinned **SM-aligned (non-power-of-two)** `{np, metaGridDim, sasGridDim}` tuple passes preflight on the narrow batch path. Legacy and wide runs pass `false` = the mandatory-pow2 rule set.
+   **Probe paths keep the mandatory-pow2 rule set, and that is self-consistent — not a gap.**
+   `TruncatedSieveRun()` (`orchestrator.cpp:6390`) calls `preflightKernelLaunch` (`:6403`) without
+   `allow_nonpow2_geometry`, so it takes the default `false`. That is correct: its sole caller is
+   `estimateRuntime()` in `src/autotune/runtime_estimator.cpp`, which unconditionally sets
+   `cfg.sieve_batch_size = 0;  // force legacy loop` (`:64`) before constructing the probe
+   orchestrator, and `TruncatedSieveRun` correspondingly never calls `setSievingBatchSize`
+   (`orchestrator.cpp:6439`, "Force legacy loop — no batch mode for probes"). The probe genuinely
+   runs the **legacy** path, where mandatory power-of-two is the applicable rule — the same rule
+   `validateConfigs()` applies there via its own `relaxed_geometry` predicate.
+   ⚠ **Documented interaction (v1.0.6):** because the estimator's probes are legacy, a run that pins
+   an **SM-aligned (non-power-of-two)** `--params` tuple *and* uses the runtime estimator / FL-optimizer
+   probes will have every such probe skipped — `runtime_estimator.cpp` runs its own preflight
+   (`:87-89`), also without the flag, and on failure emits
+   `LOG_WARNING "[RuntimeEstimator] Skipping probe: preflight failed — …"` and returns the
+   `total_est_sec = 1e9` sentinel. SM-aligned geometry is therefore usable for the production sieve
+   but not for estimator-based runtime projection; this is a consequence of the decision to keep
+   non-pow2 geometry `--params`-only and out of the autotuner, not a defect.
 8. `initPostProcessorConfig()` builds `PostProcConfig`; persistent buffer is floor-clamped to `target_relations + accum` if undersized.
 9. `initLargePrimes()` initializes LP variant (no-op if `lp1_bound == 0`).
 
@@ -235,6 +290,18 @@ Per iteration:
 
 Post-loop: sync streams, flush stragglers (if `*pinned_counter > 0`, call `processBatchBufferedCandidates`). Final LP flush of remaining partials.
 
+**PATH 1a: CUDA graph replay** (`cuda_graph_unroll > 0`)
+
+The captured body is `graph_N` unrolled iterations of the PATH 1 body — not just the sieve kernels — with the **two accumulation buffers alternating inside the graph**: `processBatchBufferedCandidates()` toggles the host index once per captured batch **at capture time**, so batch `i` is permanently bound to buffer `(start + i) % 2` and batch `i+2`'s `safe_to_write` wait is a genuine internal graph edge. What is captured depends on the resolved scope (`sieve` / `postproc` / `full`; solo defaults to `full`, cluster to `postproc`).
+
+- **Replays are serialized.** A graph launched into a stream is one stream work item ("each launch is ordered behind both any previous work in stream and any previous launches of graphExec"), so the overlap gained is *intra*-replay: batches `0 … graph_N−2` hide their post-processing under their successors' sieve, while the last batch's post-processing is an exposed tail. In solo at scope `full` (even `graph_N`) that tail is **deferred into the next replay** as a root of the post-processing branch, and the one un-post-processed buffer is drained after the graph loop.
+- **Solo at scope `full`: no host synchronize between replays.** Solo at scope `postproc`/`sieve` keeps one (the retained between-replay LP block runs on `proc_stream`, which the graph does not order against); cluster keeps one, expressed as a wait on a completion event recorded **outside** the capture followed by `cudaStreamSynchronize(extract_stream)` — extraction needs exact counters. The predicate is `cap.keep_host_sync = is_cluster || !capture_lp`.
+- **Staging.** One device slot-set (written and read only on the launch stream, so in-stream order already separates replay `k`'s reads from replay `k+1`'s writes) but **two pinned index sets**, alternating behind a `stage_done` event, because the host `memcpy` into pinned staging would otherwise race a still-pending H2D that reads it.
+- **The host's pinned progress counters lag by at most one replay**, so the stop condition can overshoot slightly; the overshoot is bounded by the existing `relation_cap` (measured +0.33 % at RSA-100 / `graph_N = 4`, well inside the cap).
+- **After the graph loop** the launch stream is quiesced and every event the capture recorded is re-recorded from a non-capturing stream before the standard loop takes over for the final stretch — an event whose last record was inside a capture is unusable from the host until re-recorded.
+- **Skipped entirely** when `CUDA_LAUNCH_BLOCKING=1`, in legacy (non-batch) mode, when `sieve_max_batches < graph_N`, or when the target is too small; `MPQS_LP_DIAG=1` forces the scope down to `sieve` (its diagnostic block issues calls that are illegal inside a capture). A capture that fails is retried once at scope `sieve` and otherwise falls back to the standard loop.
+- **Escape hatches:** `--cuda_graph_capture sieve` restores the pre-v1.0.6 captured body per run; `--cuda_graph_unroll 0` bypasses graphs entirely and is byte-for-byte unchanged. ⚠ **The "byte-for-byte unchanged" half of that sentence is SUPERSEDED (2026-08-25):** the *code path* is unchanged, but `--cuda_graph_unroll 0` is **not** a bit-identity baseline on the solo GPU-LP path — it is **±1 nondeterministic** on `LP combined`, `Total (deduped)` and `Cumulative LP full`, measured on both an RTX 5070 Ti and an A100 and on the *pre-change* baseline binary as well as after, so it is not a v1.0.6/b/c regression. `Sieved full`, `Duplicates`, `Batches processed` and the whole `[Config]` block are exact. **Consequence: arm-to-arm work identity must be judged at ±1, never by exact equality** — an exact-equality acceptance criterion cries wolf. The jitter itself is unexplained.
+
 **PATH 2: Legacy + LP** (`sieve_batch_size == 0`, `lp1_bound > 0`)
 
 Host-driven loop: per step `siever_->updateState`, `sieveFullCube`, `postprocessor_->accumulate`. When buffer full: `processBufferedCandidates`, `consolidateToPersistent`, `largeprime_->processAndCommit`, `resetPartialBatch`. Async telemetry from `largeprime_->getTelemetry()` on generation-ticket change drives `logSieveProgress`. Exits when `getPersistentCount() >= target_relations`.
@@ -253,6 +320,19 @@ Cleanup: `siever_->clearSievingBuffers()`, `postprocessor_->clearBuffers()`, `la
 Two construction paths:
 - **Normal**: `matrix_constructor_->constructFromSoA(postprocessor_->getPersistentBatch()->get_view(), count, csr_matrix)` using the live device batch
 - **LINALG_ONLY fallback**: allocates `RelationBatch temp_batch`, calls `temp_batch.uploadFromHost(host_relations_soa_)`, then constructs from that view
+
+⚠ **Known defect (pre-existing, unfixed — re-verified against source and STILL OPEN in v1.0.6):** the
+Normal path is taken whenever `postprocessor_` exists (`orchestrator.cpp:6737-6744`) and reads the
+**device** batch, but a solo `--resume` merges loaded ∪ new ∪ cross-checkpoint combines into
+`host_relations_soa_` only (`finalizeResumeUnion`, defined `orchestrator.cpp:3995`, called from the
+end-of-sieve path at `orchestrator.cpp:6102`, reporting at `:4067`). A resumed FULL_PIPELINE run therefore matrices the new
+leg alone (measured: `final merged set: 265,639` vs `Processing 112617 relations from Device SoA` →
+112,617 × 190,999, under-determined → 0 Block-Wiedemann solutions → no factors), while the same relations
+replayed through `--sieve_only` + `--matrix_only` (which uploads the host SoA) give
+`System Overdetermined. Excess: 76083`, 205 solutions and factors. Reproduces at `--cuda_graph_unroll 0`
+and `4` and on the pre-v1.0.6 binary — it is not a graph-capture regression. Workaround: resume with
+`--sieve_only` and run the matrix stage separately. Fix direction: take the host-SoA upload path when
+`resume_active_`.
 
 CSR columns = `f_data_.size + 2` (sign + exponent-of-2). Post-construction: `ValidateHostMatrixCSR`, then `matrix_A_ = ConvertFromCSR(csr_matrix)`. Verifies system is overdetermined (`n_rows > n_cols`). Calls `postprocessor_->clearPersistentBuffer()` on success.
 
@@ -389,6 +469,18 @@ table for all four CLI flags.
                            --   ckpt_schema_version (u32)
 ```
 
+**Graph path (`cuda_graph_unroll > 0`):** the replay loop calls `checkpointWillFire()` and, only when
+that returns true, `quiesceForCheckpoint()` — `cudaStreamSynchronize` on the launch stream (which waits
+for every graph node, including the forked post-processing branch) and then on `proc_stream` — before
+`maybeCheckpoint()`. Without it the snapshot can be torn on the LP-off path, where
+`copyPersistentToHost`'s `cudaStreamSynchronize(pp_stream)` is a no-op once post-processing is a graph
+node. Gating on "checkpointing is *enabled*" instead of "a checkpoint is about to *fire*" would
+reintroduce a per-replay synchronize on every checkpoint-enabled production run, so the predicate is the
+fire condition; `maybeCheckpoint()` calls the same predicate, so there is exactly one copy of the logic.
+On the deferred-tail path (solo, scope `full`, even `graph_N`) the value handed to `maybeCheckpoint()` is
+`current_step − sieve_batch_size`, because one batch's candidates are not yet post-processed at a replay
+boundary.
+
 The footer magic at EOF is the completeness sentinel: a torn write never has it.
 Write protocol: unlink stale `.tmp` → `serialize_v2` to `.tmp` (intra-FS) → append
 trailer+cluster block+footer → `fsync` → rename live to `.prev` → rename `.tmp` to live →
@@ -406,6 +498,19 @@ On `--resume` at `SieveStage` entry with a valid `sieve.ckpt`:
 3. **Effective target:** `max(0, target_relations − loaded_smooths_raw)` — applied to all
    three termination paths (pinned-count stop test, yield-prediction `should_terminate`, and
    device target cap `setTargetCap`).
+   ⚠ **Known defect (pre-existing, unfixed — re-verified against source and STILL OPEN in v1.0.6):**
+   `loaded_smooths_raw` is the **pre-dedup device** count (`maybeCheckpoint`, defined
+   `orchestrator.cpp:3822`, trailer write at `:3872`), which mid-run with LP on runs far ahead of
+   the useful count because the live device batch still holds duplicate LP appends. Measured at
+   RSA-100 (`--cuda_graph_unroll 0`, killed at 45 s): trailer `loaded_smooths_raw = 201,197` vs
+   `loaded_smooths_dedup = 19,390` — 10.4× — against `target_relations = 200,610`, so the resume
+   short-circuits (`effective_target=0 … loaded >= target: short-circuit (finalize only)`,
+   `orchestrator.cpp:4446-4453`) and finalizes 19,390 relations in 0.4 s. LP-off checkpoints are
+   unaffected (74,919 vs 74,590). The quantity the union actually contributes is
+   `loaded_smooths_dedup`, which is what the resume should subtract.
+   Much of that 10.4× ratio came from the pinned index-staging overwrite race (a solo GPU-LP defect
+   present in every binary up to and including v1.0.5, **fixed in v1.0.6**), which re-sieved the final batch ~6×; the
+   trailer nonetheless still records the wrong quantity, so the defect stands on its own.
 4. Sieve the new leg; device `deduplicatePersistentBatch()` runs at end-of-sieve for the new
    leg only (B1: never mid-loop).
 5. **End-of-sieve union dedup:** host-merge `loaded ∪ (device-deduped new)` via the shared
@@ -450,8 +555,6 @@ All restore steps happen **before Thread A starts and before any `requestWork`/`
   $COORD_RESUME` passed to rank 0 only; workers are unchanged.
 - `relations.v2` (the Phase-2 `--matrix_only` handoff) is written only at sieve completion,
   unchanged. `sieve.ckpt` is an internal resume artifact only.
-- See `tools/cluster/rsa140_a100_4node_pc2.sbatch` (production) and
-  `tools/cluster/rsa130_a100_2node_resume_smoke_pc2.sbatch` (2-node resume smoke, ~20 min).
 
 ## Internal State
 

@@ -24,14 +24,14 @@ struct KernelParamResult {
                                ///< HIGHER is better. Positive ⇒ a valid measurement in both cases.
     uint32_t  configs_tested;  ///< number of configs evaluated
     bool      from_cache;      ///< true if result came from history DB lookup
-    // ----- S3/S4 (wide-path autotune) discriminators. Defaults keep the narrow path's
+    // ----- Wide-path autotune discriminators. Defaults keep the narrow path's
     //       existing contract byte-for-byte (rate objective off, floor trivially passed). -----
     bool      objective_is_rate = false;  ///< WIDE: `timing_us` is a survivors/sec RATE (higher=better)
-    bool      beats_floor       = true;   ///< WIDE: winner_rate ≥ floor_rate·(1+margin)? (S4 floor gate)
+    bool      beats_floor       = true;   ///< WIDE: winner_rate ≥ floor_rate·(1+margin)? (floor gate)
     float     floor_score       = 0.0f;   ///< WIDE: loadStandardConfig-wide survivors/sec (the floor)
 };
 
-/// Heuristic defaults based on convergence analysis (M2 plan §2.2).
+/// Heuristic defaults based on convergence analysis.
 /// Order: {subCubeSize, numIntervals, polyBlockSize, blocksPerCycle,
 ///          metaGridDim, metaBlockDim, sasGridDim, sasBlockDim}
 constexpr Params8 HEURISTIC_DEFAULTS = {512, 8, 4, 8, 256, 1024, 256, 1024};
@@ -51,7 +51,7 @@ constexpr uint32_t WEAK_PARAM_INDICES[]   = {6, 4, 2};
 /// Strongly-convergent parameter indices
 constexpr uint32_t STRONG_PARAM_INDICES[] = {7, 5, 1, 3, 0};
 
-// ----- S5 (WIDE / uint16 only): occupancy-seeded search space. -----------------------------
+// ----- WIDE / uint16 only: occupancy-seeded search space. -----------------------------
 // On wide, the throughput-relevant launch dims are GATHER blockDim (P_SAS_BLOCK_DIM, the
 // biggest lever — 25%→~100% occupancy), the SCATTER grid (P_META_GRID_DIM), num_polys /
 // subCubeSize (P_SUB_CUBE_SIZE), and — secondarily — the SCATTER blockDim (P_META_BLOCK_DIM).
@@ -74,14 +74,14 @@ constexpr uint32_t NUM_SUBCUBES_FINE   = 4;  ///< Phase 3 (accurate, ~0.4 ms per
 /// Convergence threshold: improvement must exceed this fraction to continue
 constexpr float EPSILON = 0.02f;
 
-// ----- S3/S4 wide-path (uint16) probe constants (unused on the narrow path) -----
+// ----- Wide-path (uint16) probe constants (unused on the narrow path) -----
 /// Wall-clock window (seconds) over which the wide probe measures survivors/sec.
 constexpr double WIDE_PROBE_WINDOW_SEC       = 10.0;
 /// Floor the window shrinks to when the autotune budget is tight (still statistically stable).
 constexpr double WIDE_PROBE_WINDOW_FLOOR_SEC = 6.0;
 /// Warm-up prefix (seconds) discarded before each wide measurement (JIT, clock ramp, caches).
 constexpr double WIDE_PROBE_WARMUP_SEC       = 2.5;
-/// S4 floor gate margin: accept the search winner only if its rate ≥ floor·(1+this).
+/// Floor-gate margin: accept the search winner only if its rate ≥ floor·(1+this).
 constexpr float  WIDE_FLOOR_MARGIN           = 0.05f;
 
 /// Run kernel launch parameter optimization via seeded coordinate descent.
@@ -97,16 +97,16 @@ constexpr float  WIDE_FLOOR_MARGIN           = 0.05f;
 /// @param f_data    Factoring data with factor base populated
 /// @param device_id CUDA device ordinal
 /// @param thorough  If true, also search strongly-convergent params
-/// @param non_sieve_bytes  OOM-guard (S2): postprocessing/LP footprint + CUDA-context
+/// @param non_sieve_bytes  OOM-guard: postprocessing/LP footprint + CUDA-context
 ///                  reserve. When > 0, the optimizer skips/clamps any candidate (and
 ///                  gates its own seed eval) whose COMPLETE footprint exceeds the 0.80
 ///                  budget of free VRAM. 0 (default) => candidate footprint guard
 ///                  inactive (the bucket-only isValid gate still applies).
-/// @param probe_budget_sec  S3/S4 (WIDE only): remaining autotune wall-clock budget for
+/// @param probe_budget_sec  WIDE only: remaining autotune wall-clock budget for
 ///                  Stage-1. Each wide candidate runs a ~warmup+window (~12.5 s) probe, so
 ///                  the optimizer shrinks the window toward WIDE_PROBE_WINDOW_FLOOR_SEC (and,
 ///                  if truly out of budget, stops adding search candidates) — but ALWAYS still
-///                  times the loadStandardConfig-wide floor (S4). 0 (default) => unbounded.
+///                  times the loadStandardConfig-wide floor. 0 (default) => unbounded.
 ///                  Ignored on the narrow path (byte-for-byte unchanged there).
 /// @return Optimal params and verified score (µs on narrow / survivors/sec on wide)
 KernelParamResult optimizeKernelLaunchParams(

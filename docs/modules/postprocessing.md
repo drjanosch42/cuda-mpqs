@@ -16,8 +16,8 @@ Namespace: `mpqs::postprocessing`. CMake target: `mpqs_postproc`.
 
 | File                | Lines | Purpose |
 |---------------------|------:|---------|
-| `postprocessing.h`  |  ~408 | `DevicePostProcessingController` class, `PostProcConfig`, `PredictionResult`, `BufferFillSnapshot`/`BufferFillHistory`/`LPFillHistory`, public API |
-| `postprocessing.cu` | ~1630 | CUDA kernels, buffer management, deduplication, adaptive prediction, buffer-fill telemetry, controller implementation |
+| `postprocessing.h`  |  ~420 | `DevicePostProcessingController` class, `PostProcConfig`, `PredictionResult`, `BufferFillSnapshot`/`BufferFillHistory`/`LPFillHistory`, public API |
+| `postprocessing.cu` | ~1665 | CUDA kernels, buffer management, deduplication, adaptive prediction, buffer-fill telemetry, controller implementation |
 | `CMakeLists.txt`    |  ~200 | Build config (standalone + integrated), links `mpqs_common`, `mpqs_sieve` |
 
 ## PredictionResult
@@ -47,11 +47,11 @@ periodic buffer-telemetry log lines and near-full warnings.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `accumulate_buffer_size` | `uint32_t` | Dense candidate buffer capacity (header recommends 65536/131072; the orchestrator default via `--accum_buf_size` is 512K) |
+| `accumulate_buffer_size` | `uint32_t` | Dense candidate buffer capacity (header recommends 65536/131072; CLI **`--accum_buf_size`**, whose `0 = auto` derivation is `max(4096, sieve_batch_size × 2048)` — `orchestrator.cpp:3327-3330` — further reduced to `pow2(max(4096, 4·target_relations))` when `target_relations < 16384`, `:3342-3353`. The "524K default" in the source comment at `:3340` describes a superseded formula). **Note (1.0.6):** with post-processing captured inside the CUDA graph (`--cuda_graph_capture postproc\|full`) trial division runs **per batch** instead of once per `graph_N` batches, so peak occupancy falls by roughly `graph_N`× (measured RSA-100, `graph_N = 4`: peak 8,025 → 2,093 of 16,384) and the near-full/contention warning no longer appears at the previous settings. ⚠ **Do NOT score the consequence as a regression:** candidates that used to be dropped on a full accumulation buffer (`expandAndAccumulateKernel`'s reserve + `clampCounterKernel`) now survive, so a run may legitimately yield **more** relations at identical settings. Solo overshoot with the per-replay host sync removed measured **+0.33 %**, well inside `relation_cap`. The sizing guidance above predates this and may be revisited. |
 | `accumulate_batch_purge_threshold` | `uint32_t` | Triggers factorization (orchestrator sets 0.8 × buffer size) |
-| `persistent_device_buffer_size` | `uint32_t` | Long-term device relation storage; 0 = disabled |
+| `persistent_device_buffer_size` | `uint32_t` | Long-term device relation storage; 0 = disabled. CLI **`--persistent_buf_size`**; `0 = auto` ⇒ `target_relations × 2 + accumulate_buffer_size` (`orchestrator.cpp:3359-3363`) |
 | `lp1_bound` | `uint64_t` | Single large prime bound; 0 = disabled |
-| `partial_buffer_size` | `uint32_t` | 1-partial buffer capacity; defaults to `accumulate_buffer_size` if 0 (and is clamped up to it if smaller) |
+| `partial_buffer_size` | `uint32_t` | 1-partial buffer capacity; CLI **`--partial_buf_size`**, defaults to `accumulate_buffer_size` if 0 and is clamped up to it if smaller (`orchestrator.cpp:3369-3378`) |
 | `shc_dim` | `uint32_t` | Hypercube dimension (number of prime factors in `a`) |
 | `device_id` | `int` | CUDA device index |
 | `char_branch` | `bool` | When true (`--char_mode branch`), capture the r-bit branch character vector at relation birth. Default false: char-bit computation is fully gated off (zero hot-path cost). |
@@ -72,7 +72,7 @@ Compacts sparse `candidateRelation` into `DenseCandidate`. Per-thread:
 
 ### `processCandidate` (device function, shared trial-division core)
 
-Both factorization kernels call this per-candidate pipeline (`postprocessing.cu:294-422`):
+Both factorization kernels call this per-candidate pipeline (`postprocessing.cu:294-424`):
 1. Compute `sqrt_Q = |ax+b|` and the sign of the signed `(ax+b)` via the 5-arg `calculate_sqrt_of_QX()`.
 2. Compute `Q = |(ax+b)² − N|` and its sign via `mpqs::abs_square_minus_N()` (`:323`) — the square is formed in a **1024-bit accumulator** because it reaches ~2N ~ 2^513 for N ≥ 2^511 (RSA-155); bit-for-bit identical to the legacy truncating path for N < 2^511.
 3. Factor out powers of 2 (`val_2_exp = countr_zero(Q)`); right-shift Q.
@@ -122,15 +122,55 @@ written as a defined 0 (zero added hot-path arithmetic). The captured vector is 
 
 | Kernel | Purpose |
 |--------|---------|
-| `compute_relation_hashes_soa` (`postprocessing.cu:509`) | 64-bit hash: `[63:48]` num_factors, `[47:32]` XOR of exponents, `[31:0]` XOR(factor_idx × 0x9e3779b9) ^ sign·2^val_2_exp. **The sign term genuinely contributes** (`:543-548`): sign is extracted via the encoding-agnostic "negative iff `signs[idx] != 1`" rule (the M12-S5 fix — the old `!= 0` check fired always). `char_bits` is **excluded** (it is a deterministic function of `(ax+b)`, so two relations with the same factorization carry identical char bits and must still dedup). The identical host-side formula lives in `src/common/relation_hash.h::computeRelationHash` (single source of truth for the cluster accumulator and checkpoint dedup). |
-| `compute_new_lengths_kernel` | Computes per-survivor factor lengths for exclusive scan |
+| `compute_relation_hashes_soa` (`postprocessing.cu:509`) | 64-bit hash: `[63:48]` num_factors, `[47:32]` XOR of exponents, `[31:0]` XOR(factor_idx × 0x9e3779b9) ^ sign·2^val_2_exp. **The sign term genuinely contributes** (`:543-548`): sign is extracted via the encoding-agnostic "negative iff `signs[idx] != 1`" rule (the old `!= 0` check fired always). `char_bits` is **excluded** (it is a deterministic function of `(ax+b)`, so two relations with the same factorization carry identical char bits and must still dedup). The identical host-side formula lives in `src/common/relation_hash.h::computeRelationHash` (single source of truth for the cluster accumulator and checkpoint dedup). |
+| `compute_new_lengths_kernel` (`postprocessing.cu:602`) | Computes per-survivor factor lengths for exclusive scan. **Emits `uint32_t`** — see the open defect below |
 | `gather_soa_relations_kernel` | Compacts SoA by copying survivors (scalars incl. `char_bits` + CSR segments) into a fresh batch |
+
+#### ⚠ OPEN DEFECT — uint32 length underflow in post-dedup compaction (found 2026-08-22, **still open in v1.0.6**)
+
+`compute_new_lengths_kernel` (`postprocessing.cu:602-613`) writes
+`out_lengths[idx] = (uint32_t)(old_offsets[old_idx+1] - old_offsets[old_idx])` into a
+`thrust::device_vector<uint32_t>` (`:1412`). If the CSR offsets are ever non-monotonic for the last
+surviving row, that 64-bit subtraction underflows and is then **truncated to 32 bits**. In
+`deduplicatePersistentBatch()` (`:1273-1491`) the tail is read back as a `uint32_t`
+(`uint32_t last_len;`, `:1435`), summed as `uint64_t total_new_factors = last_offset + last_len`
+(`:1444`), and handed **straight to** `d_clean_batch->resize(new_size, total_new_factors)` (`:1454`)
+with no capacity or sanity check. The subsequent `gather_soa_relations_kernel` (`:1467`) then reads
+and writes out of bounds; the illegal access surfaces at the next synchronising `CUDA_CHECK`
+(`cudaStreamSynchronize`, `:1487`), followed by a `thrust` `cudaErrorIllegalAddress` on free.
+
+**Trigger precondition:** a run of `[RelationBatch] Append DISCARDING data. Buffer Full. Added 0/N
+relations.` — i.e. the LP relation buffer saturates and appends are dropped, leaving
+`compute_new_lengths_kernel` a wrapped negative length for the last surviving row. That discard path
+**is already logged** at `LOG_WARNING` (`src/common/mpqs_soa.cu:375`, the only `DISCARDING` site in
+the tree; unchanged since before v1.0.5), so the precondition is **observable, not silent** — the
+warning is the signal to watch for. *(Corrected 2026-08-25: the earlier characterisation of this
+path as "silent" is **superseded**.)*
+
+**Observed once, deterministically**, on an A100 under `ncu` serialization:
+`Total new factors: 4294967272` (= 2³² − 24) → `resize(…, 4294967272)` →
+`CUDA Error: an illegal memory access was encountered`, app `rc=6`, no factors. It is **a latent
+defect in the normal LP path, not a profiling artefact** — ncu only exposed it, because its 46
+replay passes slowed the sieve until the buffer saturated.
+
+**Status: STILL OPEN in v1.0.6.** The arithmetic above is unchanged. v1.0.6 makes the precondition
+materially harder to reach — the pinned index-staging fix cut raw over-collection from 9.22 % to
+0.34 %, so the LP buffer no longer saturates under ncu replay, and the re-run under the
+byte-identical launcher saw zero `DISCARDING` lines and every ncu pass `rc=0` — but it **does not
+fix the defect**. Absence in one run is not proof it cannot recur; the `Append DISCARDING` path is a
+normal LP code path and is production-reachable.
+
+**What remains unfixed is purely the uint32 arithmetic** in the compaction (`:1435` / `:1444` /
+`:1454`). **Fix direction (not applied):** compute the lengths in `uint64_t` (or assert
+`offsets[i+1] >= offsets[i]` in the kernel), and treat a `total_new_factors` above the batch's
+capacity as a **hard error** rather than a `resize()` request.
 
 ### Yield prediction kernel
 
 | Kernel | Purpose |
 |--------|---------|
-| `yield_prediction_kernel` | Single-thread kernel: reads `global_count` and optional `SLPPinnedStats`, computes λ and μ, sets `should_terminate = 1` when `effective_R ≥ target + target/20` (5% margin). Writes to mapped pinned `PredictionResult`. `total_steps` is `uint64_t` — RSA-140-scale a-value counts exceed 2^32. |
+| `yield_prediction_kernel` | Single-thread kernel: reads `global_count` and optional `SLPPinnedStats`, computes λ and μ, sets `should_terminate = 1` when `effective_R ≥ target + target/20` (5% margin). Writes to mapped pinned `PredictionResult`. **`total_steps` is a `const uint64_t*` device pointer** (1.0.6), not a by-value host scalar: kernel arguments are baked at CUDA-graph capture time, so a host scalar would freeze and every replay would compute a wrong λ. Still `uint64_t` — RSA-140-scale a-value counts exceed 2^32. |
+| `advance_steps_kernel` | Single-thread kernel enqueued **after** the yield-prediction read in every batch: `*steps += delta` with `delta = sieve_batch_size`. Read-then-advance keeps `total_steps` equal to the a-values launched *before* the batch, matching the pre-v1.0.6 host semantics. The host seeds the counter once per sieve leg via `seedPredictionSteps()`, outside any capture; graph and non-graph paths enqueue the same nodes. |
 
 ### Utility kernels
 
@@ -174,16 +214,46 @@ written as a defined 0 (zero added hot-path arithmetic). The captured vector is 
 
 | Method | Description |
 |--------|-------------|
-| `processBatchBufferedCandidates()` | Waits on `safe_to_read_event`, launches `batchedBatchFactorizationKernelSoA` writing directly to persistent batch, commits dual counters, polls telemetry to pinned memory, optionally runs `yield_prediction_kernel`, resets device counter, records `safe_to_write_event`, toggles buffer |
+| `processBatchBufferedCandidates()` | Waits on `safe_to_read_event`, launches `batchedBatchFactorizationKernelSoA` writing directly to persistent batch, commits dual counters, polls telemetry to pinned memory, optionally runs `yield_prediction_kernel` (+ `advance_steps_kernel`), resets device counter, records `safe_to_write_event`, toggles buffer. **This method's node sequence is what the CUDA graph captures at scope `postproc`/`full`** (1.0.6); the buffer toggle at its end is *host* state and therefore executes **at capture time only**, which is precisely what bakes the alternating buffer assignment into the graph. Its opening `cudaStreamWaitEvent` on `safe_to_read_event` is also why the deferred-tail root must record that event in-capture first — a wait on an externally recorded event is `cudaErrorStreamCaptureIsolation`. See [the deferred tail](#the-deferred-tail-solo-scope-full-only) below. |
 | `toggleActiveBuffer()` | `active_accum_idx ^= 1` |
 | `getActiveAccumulationBuffer()` | Returns `&buffers[active_accum_idx]` (a `DoubleBuffer*`) |
 | `setFlushedState(bool)` | Overrides internal flush guard for device-to-device population |
+
+#### The deferred tail (solo, scope `full` only)
+
+Consecutive `cudaGraphLaunch`es into one stream are fully serialized, so the **last** captured batch's
+post-processing (+LP) would be an exposed tail at the end of every replay. It is therefore deferred into
+the **next** replay, where it is a **root** of the proc branch and overlaps that replay's `sieve(0)`.
+
+The gate is exactly (`orchestrator.cpp:4828`):
+
+```cpp
+const bool deferred_tail = (graph_N % 2 == 0) && capture_lp;
+```
+
+- **Even `graph_N`** — the root's target buffer equals the last batch's target only when `graph_N` is
+  even; for odd `graph_N` (only `graph_N == 1` survives the CLI's rounding) the root would post-process
+  a buffer the graph never fills.
+- **`capture_lp` (solo, scope `full`)** — ⚠ **the restriction is load-bearing, not conservatism.** With
+  LP left **between** replays (scope `postproc`) the deferred body **corrupts the persistent batch**:
+  the between-replay path appends through the plain counters plus a host-side
+  `resyncPersistentDualCounter()`, while the deferred trial-division node appends through the **dual**
+  counter one batch later, and the two interleave. Measured at RSA-100 scope `postproc`, **4/4 runs**:
+  a corrupted persistent factor count (**4,301,343,056 factors for 200,382 relations**) followed by an
+  illegal memory access in the subsequent `resize`, or a failed BW pre-flight SpMM `AT` verification.
+  Re-ordering the post-loop drain after the LP drain does **not** fix it — the interleaving is per
+  replay, not just at the end. At scope `full` every LP dispatch is a graph node ordered immediately
+  after its own trial division, so the hazard cannot arise (`orchestrator.cpp:4817-4827`).
+
+When the gate is closed the orchestrator logs `deferred-tail disabled (graph_N=…)` or
+`deferred-tail disabled (LP runs between replays)` at `LOG_DEBUG_1` (`:4829-4835`), and the
+non-deferred body is captured instead.
 
 ### Deduplication
 
 | Method | Description |
 |--------|-------------|
-| `deduplicatePersistentBatch()` | Hash, Thrust `sort_by_key`, `unique_by_key`, rebuild compacted SoA batch; updates atomic counters on the new batch |
+| `deduplicatePersistentBatch()` | Hash, Thrust `sort_by_key`, `unique_by_key`, rebuild compacted SoA batch; updates atomic counters on the new batch. The set it produces is the **post-dedup ground truth** the Sieve Stage Summary's `Sieved full` / `LP combined` lines are counted from (1.0.6): `LP combined` is recounted over the final relations as `large_primes[i] > 1` and `Sieved full` is the remainder, *not* `SLPPinnedStats::total_full_relations`, which is a pre-dedup cumulative and would mix scales (`orchestrator.cpp:6182-6202`). ⚠ Carries the **still-open uint32 length underflow** described under [Deduplication kernels](#deduplication-kernels) |
 
 ### Large prime support
 
@@ -197,7 +267,7 @@ written as a defined 0 (zero added hot-path arithmetic). The captured vector is 
 | Method | Description |
 |--------|-------------|
 | `setPredictionParams(target, lp_stats_device_ptr)` | Sets `prediction_target_` and the device pointer to `SLPPinnedStats` (nullable) |
-| `updatePredictionSteps(total_steps)` | Updates `prediction_total_steps_` (`uint64_t` — widened for the mid-sieve checkpoint's u64 solo cursor) for yield rate λ computation |
+| `seedPredictionSteps(initial_steps, per_batch_increment)` | Seeds the **device** sieve-step counter `d_prediction_steps_` (`s_0 = initial_steps`, resume-aware: the restored global a-index) and fixes the per-batch increment, so `s_k = s_0 + k·delta` after `k` post-processed batches. Issued once per sieve leg, **outside** any CUDA-graph capture. Replaces the removed host setter `updatePredictionSteps()`. |
 
 ### Accessors and telemetry
 

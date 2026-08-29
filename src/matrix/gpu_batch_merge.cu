@@ -974,7 +974,7 @@ BatchMergeResult gpuBatchMerge(
         uint32_t shown = 0;
         for (uint32_t c = 0; c < n_cols && shown < 5; ++c) {
             if (h_gf2_col_weight[c] > 0) {
-                LOG(LOG_DEBUG_1) << "  [S2 diag] gf2_col_weight[" << c << "] = "
+                LOG(LOG_DEBUG_1) << "  [GF2 diag] gf2_col_weight[" << c << "] = "
                                << h_gf2_col_weight[c];
                 ++shown;
             }

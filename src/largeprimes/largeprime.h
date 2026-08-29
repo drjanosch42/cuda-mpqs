@@ -193,6 +193,11 @@ public:
     /// @brief Returns the partials-ready event for orchestrator to record on postproc stream.
     cudaEvent_t getPartialsReadyEvent() const { return partials_ready_event_; }
 
+    /// @brief Returns the LP stream. Needed to re-arm LP events after a CUDA graph capture:
+    /// an event last recorded inside a capture is unusable from the host until re-recorded
+    /// from a non-capturing stream.
+    cudaStream_t getStream() const { return lp_stream; }
+
     /// @brief Returns the LP output batch (for deferred append by orchestrator).
     mpqs::structures::RelationBatch& getOutputBatch() { return *d_output_batch; }
 
@@ -296,14 +301,15 @@ private:
     // --- Non-Blocking Telemetry ---
     SLPPinnedStats* h_pinned_stats = nullptr; ///< Host-visible mapped memory
     SLPPinnedStats* d_pinned_stats = nullptr; ///< Device pointer to the same mapped memory
-    /// Tracks the witness count from the previous batch to compute deltas
-    uint64_t last_witness_count_ = 0;
-    /// Cumulative full relations produced across all LP batches
-    uint64_t cumulative_full_relations_ = 0;
 
     // --- Pinned counters for zero-sync LP output readback (Stage 1) ---
     uint64_t* h_pinned_lp_combined_count = nullptr;  // Host-visible: [0]=rels, [1]=factors
     uint64_t* d_pinned_lp_combined_count = nullptr;   // Device alias of above
+
+    // --- Device-resident telemetry state (graph-capturable; host scalars would be baked at capture) ---
+    uint64_t* d_cum_full_relations_ = nullptr;  ///< Cumulative LP relations committed (device_append_kernel).
+    uint64_t* d_last_batch_full_   = nullptr;  ///< LP relations committed by the last append.
+    uint64_t* d_last_witness_count_ = nullptr;  ///< Witness count at the previous dispatch (delta source).
 
     // --- Pinned counter for device_append_kernel telemetry (Stage 4) ---
     uint64_t* h_pinned_appended_count = nullptr;  // Host-visible: relations appended

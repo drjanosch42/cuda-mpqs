@@ -673,7 +673,7 @@ int main(int argc, char** argv) {
         std::printf("  loaded_partials          = %llu\n", (unsigned long long)tr.loaded_partials);
         std::printf("  elapsed_sieve_sec        = %llu\n", (unsigned long long)tr.elapsed_sieve_sec);
         std::printf("  cluster_section_present  = %u\n", (unsigned)tr.cluster_section_present);
-        // S3 cluster block: completedPrefixCursor (B2) + per-node initial-range high-water (M1).
+        // Cluster block: completedPrefixCursor + per-node initial-range high-water.
         if (tr.cluster_section_present) {
             const auto& cb = res.cluster;
             std::printf("  [cluster] completed_prefix_cursor = %llu\n",

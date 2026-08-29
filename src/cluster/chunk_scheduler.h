@@ -8,7 +8,7 @@
 /// @file chunk_scheduler.h
 /// @brief Per-worker EMA throughput tracker and adaptive chunk-size scheduler.
 ///
-/// S5: Maintains per-worker throughput models via exponential moving average
+/// Maintains per-worker throughput models via exponential moving average
 /// and computes next chunk sizes proportional to observed throughput.
 /// Two initial balance modes: SM_COUNT (default), MANUAL.
 ///
@@ -77,7 +77,7 @@ public:
         uint32_t Q,
         double headroom_pct = 0.0) const;
 
-    /// Compute throughput-proportional contiguous ranges (M4-S7 / SM2).
+    /// Compute throughput-proportional contiguous ranges.
     /// Formula: W_est = max(4*num_nodes, ceil(target_rels/(5*H))*2)
     ///          R_i   = ceil(W_est * T_i / T_total) * H
     /// @param throughput_weights  Relative throughput per node [coord, w1, w2, ...]

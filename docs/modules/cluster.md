@@ -21,7 +21,7 @@ Static library `mpqs_cluster`. Separable CUDA compilation ON. Namespace: `mpqs::
 | `async_network_data_tap.cpp` | 271 | I/O thread: serialization, batch coalescing (`mergeRelationBatches()`), TCP send, heartbeat, STOP/RECALL/CHUNK_ASSIGN polling (sole socket reader) |
 | `network_data_tap.h` | 9 | **Deprecated stub.** Superseded by `async_network_data_tap.h`; retained for git history only, contains no active code. |
 | `accumulator.h` | 242 | `AccumulatorQueue` (MPSC thread-safe queue), `RelationAccumulator` (single-thread dedup + counting, non-consuming `peek()` for checkpoints), `FinalBatchHandoff` (blocking condition-variable handoff) |
-| `cpu_lp.h` | 86 | `CPULargePrimeTable`: CPU hash table for single large prime matching in cluster mode |
+| `cpu_lp.h` | 90 | `CPULargePrimeTable`: CPU hash table for single large prime matching in cluster mode |
 | `cpu_lp.cu` | 170 | `CPULargePrimeTable` implementation: insert-and-match, Montgomery-based partial combination, sorted factor merge, same-`sqrt_Q` identity guard, char-bit XOR-combine |
 | `cluster_common.h` | 187 | Wire protocol: `FrameHeader`, `MsgType` enum (17 types incl. `CHUNK_REQUEST`), payload structs, protocol constants |
 | `comm_backend.h` | 136 | Abstract `CommBackend` interface: lifecycle, point-to-point, collective, info. Factory `createCommBackend()` (takes `init_timeout_ms`) |
@@ -35,7 +35,7 @@ Static library `mpqs_cluster`. Separable CUDA compilation ON. Namespace: `mpqs::
 | `work_pool.cpp` | 171 | WorkPool implementation: LIFO reclaim/return queue, linear cursor fallback, per-worker in-flight tracking |
 | `chunk_scheduler.h` | 148 | `ChunkScheduler`: EMA throughput tracker, adaptive chunk sizing, contiguous range computation, default-inert debug window cap |
 | `chunk_scheduler.cpp` | 280 | Scheduler implementation: SM-proportional initial split, quantum/hypercube alignment, confidence ramp |
-| **Total** | **~3600** | |
+| **Total** | **~3800** | |
 
 The 64-bit relation dedup hash shared with the solo path lives outside this module in
 `src/common/relation_hash.h` (see [RelationAccumulator](#relationaccumulator)).
@@ -156,7 +156,7 @@ Single-thread dedup + counting (`accumulator.h`). Owned exclusively by Thread A.
 | `addLPRelations(batch)` | Alias for `addRelations(batch, 255)`. |
 | `targetReached()` | True when `accumulated_.num_relations >= effective_target_`. |
 | `extractFinal()` | Move-extract the accumulated batch. Accumulator is empty after this. |
-| `peek()` | Non-consuming const view of the accumulated batch (S3 coordinator checkpoint). |
+| `peek()` | Non-consuming const view of the accumulated batch (coordinator checkpoint). |
 | `relationsFrom(source_id)` | Per-source breakdown for logging. |
 
 **Dedup hash:** `(len << 48) | (exp_xor << 32) | body_xor`, where `body_xor` folds
@@ -261,7 +261,9 @@ CPU-side single large prime hash table (`cpu_lp.h`, `cpu_lp.cu`). Replaces GPU `
 |--------|-------------|
 | `CPULargePrimeTable(lp1_bound, fdata)` | Initialize Montgomery context from N. |
 | `insertAndMatch(partials, accumulator)` | Insert new partials, combine matches into full relations via Montgomery multiply. |
-| `witnesses()`, `totalInserts()`, `totalMatches()`, `totalCombines()`, `totalDupDropped()` | Telemetry. |
+| `witnesses()` | Telemetry. ⚠ **Live table OCCUPANCY (`table_.size()`, `cpu_lp.h:51`), NOT cumulative partial arrivals** — a successful match `erase()`s the entry (`cpu_lp.cu:44`), so this counter *falls* on every combine. Arrivals are `P = W + 2·matches ≈ W + 2·combines` and are **never printed**. Misreading `W` as `P` produced the retracted coordinator-throughput ceiling. |
+| `bucketCount()` | `table_.bucket_count()`. The ctor `reserve()`s 1<<20 buckets (`cpu_lp.cu:21`), so a step in this value between two stats samples dates a stop-the-world rehash stall exactly. |
+| `totalInserts()`, `totalMatches()`, `totalCombines()`, `totalDupDropped()` | Cumulative counters. |
 
 **Combination:** Two partials with matching LP value p are combined: `sqrt_Q = a*b mod N` (Montgomery), sign via encoding-agnostic XOR of the "negative iff `!= 1`" booleans (M11c pattern — output encoded `{1, 0xFF}`), `val_2_exp = sum`, `char_bits = XOR` (Stage 5 branch-character combine), factors merged via sorted merge with exponent summation.
 
@@ -347,9 +349,19 @@ sides, never duplicated. `deserializeWorkAssign` does NOT populate `fdata.factor
 worker regenerates the FB locally from the coordinator's authoritative `(N, F)` via the
 deterministic `generateFactorBase()`, recomputes the hash, and verifies it (plus `fb_size`)
 before sieving — on any mismatch it logs `LOG_ERROR_CRITICAL` "factor-base hash mismatch" and
-exits rather than sieving a divergent FB (`orchestrator.cpp:397`). Raw-byte hashing assumes a
+exits rather than sieving a divergent FB (`orchestrator.cpp:399-400`). Raw-byte hashing assumes a
 homogeneous little-endian cluster (static-assert enforced). Fix commit `b220a61`; validated at
 cluster scale by the F=500M A100 valprobe (job 33466828).
+
+**`sieve_batch_size` symmetry (WORK_ASSIGN field 5).** Coordinator and worker **must** run a
+symmetric `--sieve_batch_size` — an asymmetric pair makes the coordinator the bottleneck (it carries
+the LP matching) and drops cluster throughput below single-node solo. The wire enforces this *by
+default but not unconditionally*: the worker adopts the coordinator's value only when it did not pin
+its own on the command line — `if (recv_batch_size > 0 && !config_.isPinned("sieve_batch_size"))
+config_.sieve_batch_size = recv_batch_size;` (`src/orchestrator/orchestrator.cpp:433-435`), where
+`isPinned` is set by the CLI parser (`tests/cuda-mpqs.cpp:767-769`). So a worker launched with an
+explicit `--sieve_batch_size` **keeps its own value and silently diverges** from the coordinator;
+that is the only way asymmetry arises, and there is no check for it.
 
 M3 snapshot extension is backward-compatible: v2-magic messages without snapshot fields are accepted.
 
@@ -420,23 +432,92 @@ In cluster mode, large prime matching runs on the coordinator's CPU (Thread A), 
 
 This avoids GPU LP processing on workers (which would require GPU synchronization and complicate the DataTap extraction path). GPU LP remains active in solo mode, unchanged.
 
+**Workers sieve NO-LP, structurally.** `largeprime_` is not merely unused in cluster mode, it is
+never constructed: `SieveStage()` guards the matcher's construction with
+`if (!cluster_mode) { initLargePrimes(); }` (`src/orchestrator/orchestrator.cpp:4360-4362`). This is
+what makes invariant **I1** (`include/graph_capture_scope.h:16-20`) structural rather than a policy —
+`cap.capture_lp = (achieved == FULL) && has_lp && !is_cluster` is false in cluster mode on two
+independent grounds. Cross-node LP matching requires *all* partials at one place, which is the
+coordinator.
+
+### Coordinator LP Telemetry
+
+Two `LOG_STATS` lines at the ~5 s stats cadence (`src/orchestrator/orchestrator.cpp:7520-7556`):
+
+- `[Cluster] LP: <W> witnesses (<rate>/s) | <C> combines (<rate>/s) | yield <pct>%` — note `W` is
+  table **occupancy**, not arrivals (see [CPULargePrimeTable](#cpulargeprimetable)).
+- `[Cluster] LPocc: elapsed_us=… recv_us=… deser_us=… bufpart_us=… addrel_us=… insmatch_us=…
+  ctl_us=… sleep_us=… insmatch_max_us=… insmatch_calls=… buckets=… witnesses=…` — 12
+  space-separated `key=value` pairs partitioning Thread A's wall time.
+
+**Parser contract** (stated in the source comment, `orchestrator.cpp:7526-7544`): field order is
+stable and may be extended **only by appending**; every value is a raw plain `uint64` decimal;
+all counters are cumulative and monotonic (differentiate consecutive samples for an interval rate).
+Thread-A busy fraction = `(elapsed_us − sleep_us) / elapsed_us`; per-stage share =
+`<stage>_us / elapsed_us`. **Saturation signature: `sleep_us` stops growing while `insmatch_us`
+tracks `elapsed_us`.**
+
+⚠ **`fmtSize()` is NEVER used on either line — hard rule.** Its K/M truncation above 1,000 silently
+froze a whole campaign's witness extraction (fixed `b7ff2ce` / `2504647`). Verify a binary carries
+the occupancy line with `strings <bin> | grep "\[Cluster\] LPocc:"`.
+
 ## Data Extraction
 
-Async extraction from the GPU sieve loop to the DataTap uses double-buffered host staging on a dedicated `extract_stream`. The extraction runs between CUDA graph replays (when `cuda_graph_unroll > 0`), ensuring the graph capture is not invalidated.
+Async extraction from the GPU sieve loop to the DataTap uses double-buffered host staging on a dedicated `extract_stream`. The extraction runs between CUDA graph replays (when `cuda_graph_unroll > 0`), ensuring the graph capture is not invalidated. As of 1.0.6 that between-replay ordering is established by a **completion event recorded on the launch stream outside the capture** — a graph is a single stream work item, so that event signals the whole graph including its post-processing branch — which `extract_stream` waits on before the per-replay `cudaStreamSynchronize(extract_stream)` that gives extraction its exact counters. The **partial-counter reset is gated on the launch stream, immediately before the graph is launched**: waiting on the post-processing stream would order nothing, because at replay time that stream carries no work of its own, and the next replay's in-graph trial division could then write partials while `extract_stream` was still resetting the counters (a silent partial loss with no error and no counter).
 
 **Overhead:** 0.38% at RSA-100 scale (measured). The `onBatchComplete()` callback must complete in < 50us to avoid stalling the sieve pipeline. `DirectChannel` achieves this via mutex-guarded vector copy (~50us for ~500 KB at RSA-100). `AsyncNetworkDataTap` achieves this via memcpy into an SPSC ring slot (<50us); the dedicated I/O thread handles all TCP I/O, serialization, and heartbeats asynchronously.
 
 ## CUDA Graph Compatibility
 
-CUDA graph capture (`--cuda_graph_unroll N`) is fully compatible with cluster mode. The extraction callback runs *between* graph replays, not during capture. Sequence:
+CUDA graph capture (`--cuda_graph_unroll N`) is fully compatible with cluster mode. The extraction callback runs *between* graph replays, not during capture. Step 1's "N sieve + postprocess iterations" was aspirational before 1.0.6 and is now literally true. Sequence:
 
-1. CUDA graph is captured (N sieve + postprocess iterations).
-2. Graph is replayed.
-3. After replay completes, extraction runs on `extract_stream`.
-4. `onBatchComplete()` is called with the extracted data.
+1. CUDA graph is captured: N iterations of the batch body (sieve + batch trial division), double-buffered inside the graph.
+2. The partial-reset gate (if an extraction is in flight) is issued on the launch stream, then the graph is launched and a completion event is recorded on the launch stream, outside the capture.
+3. `extract_stream` waits on that event and is synchronized, so the counters are exact.
+4. Extraction runs on `extract_stream`; `onBatchComplete()` is called with the extracted data.
 5. Next replay begins.
 
+**Cluster runs capture at scope `postproc`.** The large-prime pipeline is **never** captured in cluster mode — workers sieve without LP and the coordinator matches on the CPU — and requesting `--cuda_graph_capture full` in a cluster run is downgraded to `postproc` with a `LOG_WARNING` (`capture scope=postproc (LP excluded: cluster)`). Cluster also keeps its per-replay synchronization; only single-node runs drop it.
+
 The I/O thread in `AsyncNetworkDataTap` ensures heartbeats continue during graph capture + compilation, which can block the sieve thread for >120s on Jetson.
+
+## Sieve Geometry and the Cluster Path (v1.0.6)
+
+`src/cluster/` itself has **no source changes** since v1.0.5 (`git diff 7c154c9..HEAD -- src/cluster` is
+empty). Everything below is a property of the shared `SieveStage()` sieve that cluster ranks execute,
+recorded here so a cluster operator knows what applies.
+
+**Solo-relevant capabilities that no cluster launcher exercises.** Both v1.0.6's SM-aligned
+(non-power-of-two) `{np, metaGridDim, sasGridDim}` narrow-batch geometry and v1.0.6's
+`--sieve_block_size` / `--sieve_big_prime_start` / `--sieve_bucket_overflow_stats` knobs are reachable
+from a cluster rank in principle — they are `MPQSConfig` fields consumed by the shared sieve, not
+solo-gated — but every run that has ever pinned a non-power-of-two `--params` tuple or set the
+v1.0.6 knobs was a **single-GPU solo probe or bench**, none of them passing `--cluster_mode`.
+Nothing is claimed or measured for these geometries at cluster scale, and the production
+RSA-150/155 cluster sieves run the **wide** (u8sat) path, where the v1.0.6 overrides are rejected
+outright (`validateConfigs()`, narrow-batch only) and pow2 geometry stays mandatory.
+
+**The narrow-batch coverage invariant applies to cluster ranks.** `numIntervals × sievingBlockSize ≥ 2M`
+is checked in `DeviceSievingController::validateConfigs()` for **any** narrow batch run — coordinator,
+worker or solo — and is **not** gated on the v1.0.6 overrides. A config that violates it now aborts
+**loudly** pre-sieve (`LOG_ERROR_CRITICAL`, naming the required `numIntervals` = `--params` field 2)
+instead of silently sieving only `[-M, 0)` for a ~50 % yield loss. A cluster rank carrying a pinned
+`--params` tuple must therefore satisfy it; `loadStandardConfig` geometries and every shipped tuple
+already do. Because coordinator and worker must use symmetric `--sieve_batch_size`, they resolve the
+same batch/legacy predicate and so face the same check.
+
+**The v1.0.6 GPU `sqrt_Q` identity guard fix was solo-only — cluster was never exposed.** That fix
+added the device mirror of the guard to the solo GPU-LP `global_combine_kernel`. Cluster ranks never ran
+the defective path: workers sieve NO-LP, and the coordinator's CPU matcher has carried the canonical
+guard since 1.0.3a — still present at `src/cluster/cpu_lp.cu:69-71`, dropping a match whose two partials
+share the same `sqrt_Q` and counting it in `totalDupDropped()` (see [CPULargePrimeTable](#cpulargeprimetable)).
+
+**Still-pending validation (v1.0.6).** A **live 2-node cluster smoke** remains the only test that
+closes the silent-partial-loss risk the launch-stream partial-reset gate addresses (see
+[Data Extraction](#data-extraction)); no such run is recorded, so treat it as outstanding. The
+remaining v1.0.6 measurements that have not been made — a three-arm H100
+`capture=full` / `capture=sieve` / `cgu=0` speed and energy comparison, and a wide-path regression at
+RSA-155 scale — are not cluster-blocking.
 
 ## Protocol Constants
 
@@ -545,12 +626,10 @@ loader validates the trailer `N == config N` so a stale checkpoint from a differ
 rejected rather than silently consumed. The final `relations.v2` (Phase-2 matrix handoff) is
 written only at sieve completion, unchanged; `sieve.ckpt` is an internal resume artifact only.
 
-See `tools/cluster/rsa140_a100_4node_pc2.sbatch` (production) and
-`tools/cluster/rsa130_a100_2node_resume_smoke_pc2.sbatch` (2-node kill+resubmit smoke, ~20 min).
-
 ## Known Issues
 
 - **Thread B range enforcement:** Coordinator Thread B may slightly overshoot its assigned contiguous range due to batch quantization.
 - **Heartbeat timeout during graph capture:** `AsyncNetworkDataTap`'s I/O thread sends heartbeats independently of the sieve loop, so CUDA graph compilation does not cause timeouts. Workers must still complete their first graph replay within `kFlushTimeoutMs` (120s) for the SPSC ring not to overflow; Jetson workers with `cuda_graph_unroll=8` are near this limit.
 - **LP below 85 digits:** LP causes 100% sqrt failure below ~85 digits due to a-factor/sieve-prime structural dependence. This is a mathematical limitation, not a cluster-specific bug. LP is disabled below 85 digits.
-- **Coordinator single-threaded CPU LP-matching ceiling:** `CPULargePrimeTable::insertAndMatch` (`cpu_lp.h`/`cpu_lp.cu`) is explicitly not thread-safe (`cpu_lp.h:39`) and owns a single `std::unordered_map<uint64_t, PartialRelation> table_` (`cpu_lp.h:78`) — all cross-node LP matching runs on one coordinator CPU thread regardless of GPU count. Empirical throughput ceiling **~3,200–3,500 witnesses/s**: 32 GPU/L=200T sustains 1,731.8 witnesses/s cleanly, but 64 GPU (production scale) already shows ~8.4% sub-linear scaling off the linear projection. A **108-GPU (27-node) scale-up was evaluated and REJECTED** on this basis (2026-07-15) — it would offer ~6,060 witnesses/s, but the coordinator saturates well before that, wasting ~44 GPUs. Host RAM is the other constraint: ~110–120M accumulated witnesses ≈ ~35–50 GB coordinator RAM; **`--lp1_max_witnesses` does not bound `table_`** (it sizes the solo-mode GPU `LargePrimeVariant` capacity instead) — only lowering the LP bound `L` shrinks the coordinator's table. Future lever: hash-shard the witness table, or pool-allocate `PartialRelation` instead of its 2 per-entry `std::vector`s.
+- **Coordinator single-threaded CPU LP-matching ceiling — ⚠ SUPERSEDED (2026-07-17), retained for the structural facts:** the *throughput* claim below (~3,200–3,500 witnesses/s, and the 108-GPU rejection resting on it) was **refuted by direct measurement on the real production stream**: the matcher sustains ~753,652 arrivals/s, far above any offered load reachable here, so the real ceiling is coordinator **host RAM** (measured ~473–477 B/witness ⇒ ≈74 GB at 64-GPU production), not matching throughput. The single-threadedness, the `table_` ownership, and the `--lp1_max_witnesses` note below all remain true as stated (line refs have since drifted: the not-thread-safe contract is `cpu_lp.h:38-39`, `table_` is `cpu_lp.h:82`). Original text:
+  **Coordinator single-threaded CPU LP-matching ceiling:** `CPULargePrimeTable::insertAndMatch` (`cpu_lp.h`/`cpu_lp.cu`) is explicitly not thread-safe (`cpu_lp.h:39`) and owns a single `std::unordered_map<uint64_t, PartialRelation> table_` (`cpu_lp.h:78`) — all cross-node LP matching runs on one coordinator CPU thread regardless of GPU count. Empirical throughput ceiling **~3,200–3,500 witnesses/s**: 32 GPU/L=200T sustains 1,731.8 witnesses/s cleanly, but 64 GPU (production scale) already shows ~8.4% sub-linear scaling off the linear projection. A **108-GPU (27-node) scale-up was evaluated and REJECTED** on this basis (2026-07-15) — it would offer ~6,060 witnesses/s, but the coordinator saturates well before that, wasting ~44 GPUs. Host RAM is the other constraint: ~110–120M accumulated witnesses ≈ ~35–50 GB coordinator RAM; **`--lp1_max_witnesses` does not bound `table_`** (it sizes the solo-mode GPU `LargePrimeVariant` capacity instead) — only lowering the LP bound `L` shrinks the coordinator's table. Future lever: hash-shard the witness table, or pool-allocate `PartialRelation` instead of its 2 per-entry `std::vector`s.

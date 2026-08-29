@@ -6,10 +6,11 @@
 #include "orchestrator.h"
 #include "mpqs_structures.h"
 #include "relation_io.h"
-#include "sieve_checkpoint.h"   // atomic mid-sieve checkpoint (B1 split + write path)
+#include "sieve_checkpoint.h"   // atomic mid-sieve checkpoint (read + write path)
 #include "relation_hash.h"      // shared dedup hash (m-sharedTU)
 #include "autotune.h"
 #include "auto_apply.h"
+#include "kernel_launch_validator.h"   // admissibleSasGridDim (v1.0.6 SM-aligned geometry)
 #include "autotune_history.h"
 #include "data_tap.h"
 #include "version.h"
@@ -462,7 +463,7 @@ void MPQSOrchestrator::Run() {
                 auto t_sieve_total = clock::now();
                 uint32_t chunks_completed = 0;
                 bool worker_done = false;
-                // M4-S6: One-shot warmup before first SieveStage — triggers PTX→SASS JIT so
+                // One-shot warmup before first SieveStage — triggers PTX→SASS JIT so
                 // that graph capture on the actual sieve finds cached SASS. On Jetson cold
                 // cache this takes ~20 min once; all subsequent launches reuse the cache.
                 // data_tap is set to nullptr to discard warmup relations (not the assigned range).
@@ -507,7 +508,7 @@ void MPQSOrchestrator::Run() {
                         break;
                     }
 
-                    // S8: Check if this was a CHUNK_RECALL (partial) vs STOP/range-exhaustion
+                    // Check if this was a CHUNK_RECALL (partial) vs STOP/range-exhaustion
                     bool was_recalled = network_tap.receivedRecall();
                     if (was_recalled) {
                         LOG(LOG_INFO) << "Worker: chunk " << network_tap.currentChunkId()
@@ -933,7 +934,7 @@ void MPQSOrchestrator::Run() {
                         // but the upper bound must still be enforced via the tap.
                         if (!ranges.empty()) coord_range_count = ranges[0].count;
 
-                        // S3 (M1): capture the per-node initial contiguous ranges
+                        // Capture the per-node initial contiguous ranges
                         // {start, count} (index == node_id) so Thread A can clamp the
                         // per-node initial-range high-water marks at checkpoint-write
                         // time. Written here, BEFORE Thread A is spawned (:964) and never
@@ -944,7 +945,7 @@ void MPQSOrchestrator::Run() {
                         cluster_node0_initial_hw_.store(0, std::memory_order_relaxed);
 
                         // =====================================================
-                        // S4: coordinator RESUME restore (default-off; --resume).
+                        // Coordinator RESUME restore (default-off; --resume).
                         // MUST run BEFORE Thread A starts and BEFORE any
                         // requestWork/checkoutWork (the setCursor startup-only
                         // contract) AND before the initial WORK_ASSIGN loop below,
@@ -1155,7 +1156,7 @@ void MPQSOrchestrator::Run() {
                                 /*worker_id=*/0, /*rels=*/0,
                                 cluster_channel_->aValsConsumed(), time_sieve_sec);
 
-                            // S3 (M1): capture node 0's initial-range contiguous
+                            // Capture node 0's initial-range contiguous
                             // high-water NOW — the DirectChannel a-val counter is reset
                             // by setRange() for each subsequent overflow chunk (:1043),
                             // so this is the only instant it still reads the initial
@@ -1164,7 +1165,7 @@ void MPQSOrchestrator::Run() {
                             // resume offset), so a checkpoint taken mid-initial-sieve
                             // conservatively re-sieves node 0's (remaining) initial range
                             // on resume (never skips).
-                            // S4 resume: the local sieve consumed a-values from the TRIMMED
+                            // Cluster resume: the local sieve consumed a-values from the TRIMMED
                             // start (poly_range_start == eff_hw_0), so the ABSOLUTE high-water
                             // is the offset + the consumed count (clamped to the initial range
                             // size). Fresh run: offset 0, cap == orig_count ⇒ == aValsConsumed().
@@ -1929,7 +1930,7 @@ void MPQSOrchestrator::Run() {
                                       << "  [" << std::fixed << std::setprecision(2)
                                       << preproc_sec << "s, backend: " << preproc_backend_name << "]";
 
-                        // M8: Matrix truncation (M12-S1: char-col-aware target).
+                        // M8: Matrix truncation (char-col-aware target).
                         // Char cols (32) are appended *after* this call (see below);
                         // pass n_extra_cols=32 so the target accounts for them.
                         // Facet-2 fix (a): size-gate truncation. truncateMatrix's lightest-row
@@ -3073,10 +3074,13 @@ void MPQSOrchestrator::logSieveProgress(
     // 2026-07-10 A100 uint16 degenerate-baseline analysis): the SCATTER
     // kernel drops hits past globalBucketSize and the GATHER masks the overflow flag
     // (bit 31 of dev_globalBucketCounts) off, so under-accumulation is otherwise
-    // invisible. WIDE-ONLY (u16 + u8sat) — getBucketOverflowStats() returns false on the
-    // narrow path, so the narrow production hot path takes no extra DtoH sync. A high
-    // fraction on the u16 leg (bucket 16384) vs ~0 on u8sat (bucket 32768) confirms the
-    // degenerate-baseline mechanism.
+    // invisible. WIDE always; NARROW only under --sieve_bucket_overflow_stats (v1.0.6) —
+    // getBucketOverflowStats() returns false on narrow unless that default-off flag is set, so
+    // the narrow production hot path takes no extra DtoH sync. A high fraction on the u16 leg
+    // (bucket 16384) vs ~0 on u8sat (bucket 32768) confirms the degenerate-baseline mechanism.
+    // On narrow the number has never been observed anywhere in this project; it becomes
+    // load-bearing once --sieve_big_prime_start moves factor-base primes onto the bucketed
+    // SCATTER path, which raises bucket fill by an amount that is only INFERRED.
     if (siever_) {
         mpqs::sieve::DeviceSievingController::BucketOverflowStats bo;
         if (siever_->getBucketOverflowStats(bo)) {
@@ -3551,9 +3555,9 @@ void MPQSOrchestrator::logBufferWarnings() {
 // Stage 2: Sieve
 // -----------------------------------------------------------------------------
 
-// === B1 split: end-of-sieve finalize (dedup + fb_size+64 deficit guard + D2H) ===
+// === End-of-sieve finalize (dedup + fb_size+64 deficit guard + D2H) ===
 // VERBATIM extraction of the former inline end-of-sieve sequence — pure code-move,
-// no logic change (S1 identity gate: counts + factors match the S0 baseline). The
+// no logic change (counts + factors match the pre-split baseline). The
 // destructive deduplicatePersistentBatch() is correct ONLY here (nothing accumulates
 // afterward); the mid-loop checkpoint uses the copy-only copyPersistentToHost() instead.
 void MPQSOrchestrator::finalizePersistentToHost(uint64_t& pre_dedup_count,
@@ -3751,7 +3755,7 @@ void MPQSOrchestrator::finalizePersistentToHost(uint64_t& pre_dedup_count,
     }
 }
 
-// === B1 split: copy-only host snapshot (reusable mid-loop; NEVER dedups device state) ===
+// === Copy-only host snapshot (reusable mid-loop; NEVER dedups device state) ===
 void MPQSOrchestrator::copyPersistentToHost(
     mpqs::structures::HostRelationBatch& smooths_out,
     mpqs::structures::HostRelationBatch& partials_out) {
@@ -3787,11 +3791,39 @@ void MPQSOrchestrator::copyPersistentToHost(
 }
 
 // === Mid-sieve checkpoint emit (solo; default-off; copy-only snapshot, B1) ===
+bool MPQSOrchestrator::checkpointWillFire(uint64_t processed_batches,
+                                         std::chrono::steady_clock::time_point now) const {
+    if (config_.cluster_mode != ClusterMode::SOLO) return false;
+    const bool enabled = (config_.checkpoint_interval_sec > 0 || config_.checkpoint_batches > 0);
+    if (!enabled) return false;
+    // Unarmed timers: maybeCheckpoint's first call arms them and returns without firing, so the
+    // answer here is false (and this predicate must not arm anything — it is const).
+    if (!checkpoint_timer_started_) return false;
+
+    bool fire = false;
+    if (config_.checkpoint_interval_sec > 0) {
+        double since = std::chrono::duration<double>(now - last_checkpoint_time_).count();
+        if (since >= static_cast<double>(config_.checkpoint_interval_sec)) fire = true;
+    }
+    if (config_.checkpoint_batches > 0) {
+        if (processed_batches - last_checkpoint_batch_ >= config_.checkpoint_batches) fire = true;
+    }
+    return fire;
+}
+
+void MPQSOrchestrator::quiesceForCheckpoint() {
+    // Launch stream FIRST: a graph is one stream work item, so synchronizing it waits for every
+    // node including the forked proc branch. The proc_stream sync is the belt for anything the host
+    // issued there outside the graph.
+    if (siever_)        CUDA_CHECK(cudaStreamSynchronize(siever_->getCudaStream()));
+    if (postprocessor_) CUDA_CHECK(cudaStreamSynchronize(postprocessor_->getCudaStream()));
+}
+
 void MPQSOrchestrator::maybeCheckpoint(uint64_t current_step, uint64_t processed_batches,
                                        double elapsed_sieve_sec) {
-    // Default-off no-op. S1 restricts checkpointing to SOLO: the cluster coordinator's
-    // pooled-state checkpoint is S3 (written from Thread A), and workers never checkpoint
-    // (S4). Gating on SOLO keeps cluster runs byte-unchanged in S1.
+    // Default-off no-op. Checkpointing here is restricted to SOLO: the cluster
+    // coordinator's pooled-state checkpoint is written from Thread A, and workers never
+    // checkpoint at all. Gating on SOLO keeps cluster runs byte-unchanged.
     if (config_.cluster_mode != ClusterMode::SOLO) return;
     const bool enabled = (config_.checkpoint_interval_sec > 0 || config_.checkpoint_batches > 0);
     if (!enabled) return;
@@ -3805,15 +3837,8 @@ void MPQSOrchestrator::maybeCheckpoint(uint64_t current_step, uint64_t processed
         return;
     }
 
-    bool fire = false;
-    if (config_.checkpoint_interval_sec > 0) {
-        double since = std::chrono::duration<double>(now - last_checkpoint_time_).count();
-        if (since >= static_cast<double>(config_.checkpoint_interval_sec)) fire = true;
-    }
-    if (config_.checkpoint_batches > 0) {
-        if (processed_batches - last_checkpoint_batch_ >= config_.checkpoint_batches) fire = true;
-    }
-    if (!fire) return;
+    // Single copy of the fire logic (the graph loop's quiesce gate calls the same predicate).
+    if (!checkpointWillFire(processed_batches, now)) return;
 
     const std::string ckpt_dir = config_.checkpoint_dir.empty()
         ? (config_.work_dir + "/checkpoint") : config_.checkpoint_dir;
@@ -3824,7 +3849,7 @@ void MPQSOrchestrator::maybeCheckpoint(uint64_t current_step, uint64_t processed
     copyPersistentToHost(ckpt_scratch_smooths_, ckpt_scratch_partials_);
 
     // 2. Host-side dedup of the SCRATCH smooths copy (shrinks the file only; the live device
-    //    batch is untouched). raw = pre-dedup device count (M2 target accounting in S2).
+    //    batch is untouched). raw = pre-dedup device count (resume target accounting).
     const uint64_t raw = ckpt_scratch_smooths_.num_relations;
     mpqs::ckpt::dedupRelationsInPlace(ckpt_scratch_smooths_);
     const uint64_t deduped = ckpt_scratch_smooths_.num_relations;
@@ -3850,7 +3875,7 @@ void MPQSOrchestrator::maybeCheckpoint(uint64_t current_step, uint64_t processed
     tr.lp1_bound               = config_.lp1_bound;
     tr.sieve_bound             = config_.sieve_bound;
     tr.N                       = config_.N;
-    tr.cluster_section_present = 0;  // solo file (S1)
+    tr.cluster_section_present = 0;  // solo file
     tr.elapsed_sieve_sec       = static_cast<uint64_t>(elapsed_sieve_sec);
 
     bool ok = mpqs::ckpt::writeCheckpointAtomic(ckpt_dir, ckpt_scratch_smooths_,
@@ -3871,7 +3896,7 @@ void MPQSOrchestrator::maybeCheckpoint(uint64_t current_step, uint64_t processed
     last_checkpoint_batch_ = processed_batches;
 }
 
-// === S3: coordinator-only mid-sieve checkpoint WRITE (Thread A sole-mutator boundary) ===
+// === Coordinator-only mid-sieve checkpoint WRITE (Thread A sole-mutator boundary) ===
 void MPQSOrchestrator::writeClusterCheckpoint(const std::vector<uint64_t>& initial_high_water,
                                               double elapsed_sieve_sec) {
     // Caller (Thread A) gates on the interval + coordinator role; defensive guards only.
@@ -3906,16 +3931,16 @@ void MPQSOrchestrator::writeClusterCheckpoint(const std::vector<uint64_t>& initi
     // high-water), NOT the solo a-index cursor — set global_a_index to a 0 sentinel.
     tr.global_a_index          = 0;
     tr.target_relations        = config_.target_relations;
-    // The accumulator stores already-deduped smooths, so raw == dedup here. (S4 cluster
+    // The accumulator stores already-deduped smooths, so raw == dedup here. (Cluster
     // resume re-injects via addRelations, which re-dedups, so it does not need a separate
-    // pre-dedup raw count the way solo S2 does.)
+    // pre-dedup raw count the way the solo path does.)
     tr.loaded_smooths_raw      = smooths.num_relations;
     tr.loaded_smooths_dedup    = smooths.num_relations;
     tr.loaded_partials         = cluster_raw_partials_.num_relations;
     tr.lp1_bound               = config_.lp1_bound;
     tr.sieve_bound             = config_.sieve_bound;
     tr.N                       = config_.N;
-    tr.cluster_section_present = 1;  // an S3 cluster block follows the trailer
+    tr.cluster_section_present = 1;  // a cluster block follows the trailer
     tr.elapsed_sieve_sec       = static_cast<uint64_t>(elapsed_sieve_sec);
 
     mpqs::ckpt::CheckpointClusterBlock cb;
@@ -3938,7 +3963,7 @@ void MPQSOrchestrator::writeClusterCheckpoint(const std::vector<uint64_t>& initi
     }
 }
 
-// === S2 solo resume: union merge of loaded checkpoint + new sieve leg ===
+// === Solo resume: union merge of loaded checkpoint + new sieve leg ===
 namespace {
 /// Append every relation of `src` onto `dest`, maintaining CSR validity. No dedup — the caller
 /// deduplicates the smooths union via RelationAccumulator; this is used for the raw-partial
@@ -4060,13 +4085,13 @@ void MPQSOrchestrator::SieveStage() {
     const bool cluster_mode = (config_.cluster_mode != ClusterMode::SOLO);
 
     // =========================================================================
-    // 0. Solo resume: load the last checkpoint (S2; default-off, SOLO only)
+    // 0. Solo resume: load the last checkpoint (default-off, SOLO only)
     // =========================================================================
     // On --resume, load sieve.ckpt (falling back to sieve.ckpt.prev). The walk is restarted
     // from trailer.global_a_index after the siever is initialized (section 3b below); the
     // loaded payload is union-merged with the new leg at end-of-sieve (finalizeResumeUnion).
-    // Cluster resume is S4 — gated out here (SOLO only). A missing/invalid checkpoint warns
-    // and starts a fresh run (identical to a normal run).
+    // Cluster resume is handled on the coordinator path — gated out here (SOLO only).
+    // A missing/invalid checkpoint warns and starts a fresh run (identical to a normal run).
     resume_active_ = false;
     if (config_.resume && config_.cluster_mode == ClusterMode::SOLO) {
         const std::string ckpt_dir = config_.checkpoint_dir.empty()
@@ -4114,11 +4139,16 @@ void MPQSOrchestrator::SieveStage() {
     cudaStream_t sieve_stream;
     CUDA_CHECK(cudaStreamCreate(&sieve_stream));
     siever_ = std::make_unique<mpqs::sieve::DeviceSievingController>(config_.device_id, sieve_stream);
-    siever_->setAccumulatorMode(config_.sieve_accumulator_mode);  // S1: override known before predicate runs
-    siever_->setWideAccumMode(config_.sieve_wide_accum_mode);     // Option A: wide-accumulator width override
+    siever_->setAccumulatorMode(config_.sieve_accumulator_mode);  // override known before predicate runs
+    siever_->setWideAccumMode(config_.sieve_wide_accum_mode);     // wide-accumulator width override
     siever_->setMetaCycleCap(config_.sieve_meta_cycle_cap);  // A2: SCATTER meta-cycle cap (0 = off)
     siever_->setGatherBlockDim(config_.sieve_gather_block_dim);  // GATHER blockDim A/B knob (0 = off)
     siever_->setBucketSizeFactor(config_.sieve_bucket_size_factor);  // bucket-overflow ablation knob (0 = legacy SB/2)
+    // v1.0.6: narrow-batch --params-only geometry overrides (0 = off => byte-identical).
+    // Must run BEFORE initiate(), like every other loader-consumed override above.
+    siever_->setSievingBlockSizeOverride(config_.sieve_block_size);   // sievingBlockSize override (0 = off)
+    siever_->setBigPrimeStartOverride(config_.sieve_big_prime_start); // bigPrimeStartIndex override (0 = off)
+    siever_->setNarrowOverflowStats(config_.sieve_bucket_overflow_stats); // narrow [BucketOverflow] telemetry (false = off)
     siever_->initiate(f_data_);
     // M3: wire external_stop for sub-batch stop latency (cluster mode)
     if (config_.cluster_mode != ClusterMode::SOLO && siever_) {
@@ -4154,9 +4184,17 @@ void MPQSOrchestrator::SieveStage() {
         constexpr uint32_t maxRelationsPerBlock = 64;
         uint32_t work_units = config_.params[0] * config_.params[1]; // subCubeSize * numIntervals
         uint32_t min_sas = (work_units + maxRelationsPerBlock - 1) / maxRelationsPerBlock;
-        // Round up to next power of 2
-        if (min_sas > 0) { min_sas--; min_sas |= min_sas >> 1; min_sas |= min_sas >> 2;
-            min_sas |= min_sas >> 4; min_sas |= min_sas >> 8; min_sas |= min_sas >> 16; min_sas++; }
+        // Round up to the smallest ADMISSIBLE sasGridDim — a divisor of subCubeSize whose
+        // quotient (the GATHER chunk) is a power of two. v1.0.6: this belt-and-suspenders
+        // floor is the SECOND copy of the preflight's correction, so it must use the same
+        // admissible set; a plain next-power-of-two would manufacture a grid that does not
+        // divide an SM-aligned subCubeSize (e.g. np=560 -> 128) and the config would then be
+        // rejected by validateConfigs' G1 for a reason the operator never asked for. For a
+        // power-of-two subCubeSize admissibleSasGridDim IS next-pow2-then-clamp, so every
+        // pre-v1.0.6 configuration is unchanged.
+        if (min_sas > 0) {
+            min_sas = mpqs::autotune::admissibleSasGridDim(config_.params[0], min_sas);
+        }
         if (config_.params[6] < min_sas) {
             LOG(LOG_WARNING) << "LP active: raising sasGridDim from "
                              << config_.params[6] << " to " << min_sas << " (candidate buffer safety)";
@@ -4273,10 +4311,18 @@ void MPQSOrchestrator::SieveStage() {
     siever_->loadData();
     siever_->updateState();
 
-    // Preflight guard: reject infeasible kernel configs before sieve loop
+    // Preflight guard: reject infeasible kernel configs before sieve loop.
+    // v1.0.6: the narrow BATCH path admits SM-aligned (non-power-of-two)
+    // {num_polysPerSieveCall, metaGridDim, sasGridDim} tuples, so tell the preflight which rule
+    // set applies. The predicate is exactly validateConfigs' `relaxed_geometry` and is read from
+    // the siever, whose wide/narrow accumulator decision was made in initiate(). Legacy
+    // (sieve_batch_size == 0) and wide runs pass false = today's mandatory-pow2 rule set.
+    const bool relaxed_geometry =
+        (config_.sieve_batch_size > 0) && !siever_->isWideAccumulator();
     if (config_.useParams) {
         auto pf = mpqs::autotune::preflightKernelLaunch(config_,
-            static_cast<uint32_t>(f_data_.a_factors.size()), f_data_.M);
+            static_cast<uint32_t>(f_data_.a_factors.size()), f_data_.M,
+            relaxed_geometry);
         if (!pf.feasible) {
             LOG(LOG_ERROR_CRITICAL) << "Kernel launch preflight FAILED: " << pf.reason;
             throw std::runtime_error("SieveStage preflight: " + pf.reason);
@@ -4355,7 +4401,7 @@ void MPQSOrchestrator::SieveStage() {
     //   (no jump → starts at a_index 0); only its self-assigned OVERFLOW chunks (Fix
     //   A, set on Thread B before re-entering SieveStage) carry poly_range_start
     //   > 0 and must jump to the chunk's absolute a-index, exactly as a worker
-    //   does — keeping node-0's chunks disjoint from every worker's. S4 RESUME also
+    //   does — keeping node-0's chunks disjoint from every worker's. Cluster RESUME also
     //   sets poly_range_start == eff_hw_0 (> 0) for the coordinator's initial sieve so
     //   it jumps to its trimmed initial-range start, identical to a worker's trimmed
     //   range — this gate already covers it (the condition is poly_range_start > 0,
@@ -4369,7 +4415,7 @@ void MPQSOrchestrator::SieveStage() {
         LOG(LOG_INFO) << "Siever: jumped to a_index=" << config_.poly_range_start;
     }
 
-    // S2 solo resume: restart the polynomial walk from the saved a-index (mutually exclusive
+    // Solo resume: restart the polynomial walk from the saved a-index (mutually exclusive
     // with the cluster jump above — solo never sets poly_range_start). Tolerates the M1
     // cursor-lead (the trailer cursor may lead the saved payload by up to one accumulation
     // buffer): we sieve forward from global_a_index and the end-of-sieve union-dedup absorbs
@@ -4392,7 +4438,7 @@ void MPQSOrchestrator::SieveStage() {
     // continuous with the killed run.
     uint64_t current_step = resume_active_ ? resume_global_a_index_ : 0;
 
-    // M2 — RAW target accounting (S2). On resume the device persistent batch starts EMPTY; the
+    // RAW target accounting. On resume the device persistent batch starts EMPTY; the
     // loop stop-tests, the yield predictor, and the device cap all count only NEW device relations,
     // so reduce the target by the RAW (pre-dedup) loaded count from the trailer. A deduped count
     // would under-shoot. `effective_target` == config_.target_relations when not resuming, so the
@@ -4460,6 +4506,9 @@ void MPQSOrchestrator::SieveStage() {
         cudaStreamWaitEvent(siever_->getCudaStream(), init_buffer->safe_to_write_event, 0);
 
         int processed_batches = 0;
+        // Cumulative LP full relations. ASSIGNED (not accumulated) from the device-side
+        // counter at every drain site in this function (SO-11): with LP running once per
+        // batch inside the graph, a per-drain += would double-count.
         uint64_t global_lp_full_relations = 0;
         SieveProgressTracker progress_tracker;
 
@@ -4494,6 +4543,13 @@ void MPQSOrchestrator::SieveStage() {
         LOG(LOG_DEBUG_1) << "Params set: target=" << effective_target
                          << ", lp_stats=" << (has_lp_stats ? "yes" : "no");
 
+        // Seed the device-side sieve-step counter (survives CUDA graph capture; a by-value
+        // host scalar would be baked at capture time). Resume-aware: current_step is the
+        // restored global a-index. The increment is one batch of a-values; 0 in legacy
+        // (non-batch) mode, where no batch post-processing runs and the counter stays at its
+        // seed — matching today.
+        postprocessor_->seedPredictionSteps(current_step, config_.sieve_batch_size);
+
         // === CUDA Graph staging (if enabled) ===
         LOG_SET_SUBMODULE("Graph");
         const uint32_t graph_N = config_.cuda_graph_unroll;
@@ -4523,10 +4579,63 @@ void MPQSOrchestrator::SieveStage() {
             LOG(LOG_WARNING) << "CUDA graph on Jetson — experimental. "
                              << "Disable with --cuda_graph_unroll 0 if issues arise.";
         }
-        // LP support: always-launch model (S2). LP kernels at every batch position.
+
+        // === Capture-scope resolution (--cuda_graph_capture) ===
+        // Pure decision, no side effects; see include/graph_capture_scope.h for the
+        // invariants (cluster ⇒ no in-graph LP; MPQS_LP_DIAG ⇒ sieve-only; graph_N
+        // never downgrades). Resolved here so the capture body has it in hand; the
+        // result is reported only when a graph is actually built.
+        const bool lp_diag_active = [] {
+            const char* e = std::getenv("MPQS_LP_DIAG");
+            return e && std::string(e) == "1";
+        }();
+        // cluster_mode is authoritative: data_tap_ alone is neither necessary
+        // (worker JIT warmup nulls it) nor sufficient (solo coordinator has one).
+        const bool is_cluster = (config_.cluster_mode != ClusterMode::SOLO) || (data_tap_ != nullptr);
+        const auto cap = resolveGraphCaptureScope(config_.graph_capture_scope,
+                                                  /*has_lp=*/(largeprime_ != nullptr),
+                                                  is_cluster, lp_diag_active, graph_N);
+        if (use_graph) {
+            if (cap.downgraded_cluster) {
+                LOG(LOG_WARNING) << "--cuda_graph_capture full requested in cluster mode — "
+                                    "downgraded to postproc (LP is CPU-side in cluster)";
+            }
+            if (cap.downgraded_lp_diag) {
+                LOG(LOG_WARNING) << "MPQS_LP_DIAG=1 is illegal inside a CUDA graph capture — "
+                                    "capture scope downgraded to sieve";
+            }
+            switch (cap.achieved) {
+                case GraphCaptureScope::FULL:
+                    LOG(LOG_DEBUG_1) << "capture scope=full";
+                    break;
+                case GraphCaptureScope::POSTPROC:
+                    LOG(LOG_DEBUG_1) << (is_cluster ? "capture scope=postproc (LP excluded: cluster)"
+                                                    : "capture scope=postproc");
+                    break;
+                default:
+                    LOG(LOG_DEBUG_1) << "capture scope=sieve";
+                    break;
+            }
+            if (cap.single_buffer) {
+                LOG(LOG_DEBUG_1) << "single-buffer (graph_N=1), no intra-replay overlap";
+            }
+        }
+        // LP support: always-launch model. LP kernels at every batch position.
 
         // Staging arrays for graph path
-        std::vector<uint32_t*> h_staged_indices(graph_N, nullptr);
+        // Two PINNED index sets only (2 x graph_N x indices_bytes, KB-scale). The DEVICE arrays are
+        // NOT doubled: they are written and read exclusively on the launch stream, so in-stream
+        // ordering already separates replay k's reads from replay k+1's writes — one graph_exec, one
+        // device slot-set, no re-capture (two launches of one exec into one stream are serialized
+        // regardless). What IS exposed once the per-replay host sync goes away is the HOST memcpy into
+        // the pinned staging buffer racing a still-pending H2D node that reads it, hence the
+        // alternating sets and the stage_done gate below.
+        std::vector<uint32_t*> h_staged_indices[2] = {
+            std::vector<uint32_t*>(graph_N, nullptr),
+            std::vector<uint32_t*>(graph_N, nullptr)
+        };
+        cudaEvent_t stage_done[2] = {nullptr, nullptr};
+        int stage_slot = 0;
         std::vector<uint32_t*> d_staged_indices(graph_N, nullptr);
         std::vector<mpqs::uint512*> d_staged_a(graph_N, nullptr);
         std::vector<mpqs::uint512*> d_staged_B(graph_N, nullptr);
@@ -4540,16 +4649,97 @@ void MPQSOrchestrator::SieveStage() {
 
         if (use_graph) {
             for (uint32_t i = 0; i < graph_N; i++) {
-                cudaMallocHost(&h_staged_indices[i], indices_bytes);
+                cudaMallocHost(&h_staged_indices[0][i], indices_bytes);
+                cudaMallocHost(&h_staged_indices[1][i], indices_bytes);
                 cudaMalloc(&d_staged_indices[i], indices_bytes);
                 cudaMalloc(&d_staged_a[i], a_bytes);
                 cudaMalloc(&d_staged_B[i], B_bytes);
             }
+            CUDA_CHECK(cudaEventCreateWithFlags(&stage_done[0], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&stage_done[1], cudaEventDisableTiming));
             LOG(LOG_STATS) << "Allocated " << graph_N << " staging slots ("
-                          << (graph_N * (indices_bytes + a_bytes + B_bytes)) / 1024 << " KB device)";
+                          << (graph_N * (indices_bytes + a_bytes + B_bytes)) / 1024 << " KB device, "
+                          << (2 * graph_N * indices_bytes) / 1024 << " KB pinned in 2 sets)";
         } else if (graph_N > 0 && graph_blocked) {
             LOG(LOG_STATS) << "Disabled: CUDA_LAUNCH_BLOCKING=1";
         }
+
+        // =================================================================
+        // Per-batch enqueue sequence, shared by the graph-capture body and
+        // the standard batch loop.
+        //
+        // Invariant preserved (double-buffer DAG, buffer B, sieve queue Q_s,
+        // post-processing queue Q_p):
+        //     Q_s : wait(B.safe_to_write) -> sieve(B) -> record(B.safe_to_read)
+        //     Q_p : wait(B.safe_to_read)  -> factor(B) -> record(B.safe_to_write)
+        // i.e. the two queues alternate exclusive access to B; the Q_p half is
+        // issued internally by processBatchBufferedCandidates().
+        //
+        //   slot                  staging slot index; ignored unless `staged`
+        //   staged                true  -> graph path: job arrays come from
+        //                                  d_staged_{a,B,indices}[slot]
+        //                         false -> standard path: prepareSievingBatch()
+        //   with_buffer_handshake true  -> select the active accumulation buffer,
+        //                                  wait its safe_to_write_event on the sieve
+        //                                  stream, wire it via setPostProcessingLinks(),
+        //                                  and record safe_to_read_event afterwards
+        //                         false -> caller already wired a fixed buffer
+        //                                  (today's graph path)
+        //   with_postproc         true  -> processBatchBufferedCandidates()
+        //   wait_safe_to_write    true  -> issue the wait on B.safe_to_write_event
+        //                         (only consulted when with_buffer_handshake). The graph
+        //                         path captures this body into a CUDA graph and must
+        //                         SUPPRESS that wait for the first unrolled iterations: an
+        //                         in-capture wait on an externally recorded event is
+        //                         cudaErrorStreamCaptureIsolation (905) and invalidates
+        //                         the whole capture.
+        //
+        // NOTE: the standard loop's `#ifdef LP_DEBUG` block is deliberately NOT part of
+        // this lambda — it contains cudaStreamSynchronize(), illegal inside a stream
+        // capture (cudaErrorStreamCaptureUnsupported, 900), and it belongs to the
+        // periodic-LP block rather than to the per-batch body.
+        //
+        // Returns the accumulation buffer used (nullptr when !with_buffer_handshake).
+        // =================================================================
+        auto enqueue_batch = [&](uint32_t slot,
+                                 bool staged,
+                                 bool with_buffer_handshake,
+                                 bool with_postproc,
+                                 bool wait_safe_to_write = true)
+                             -> mpqs::postprocessing::DoubleBuffer* {
+            auto* buf = with_buffer_handshake
+                            ? postprocessor_->getActiveAccumulationBuffer()
+                            : nullptr;
+
+            // 1. Tell Sieve Stream to wait for PostProcessor to finish with this buffer
+            if (with_buffer_handshake && wait_safe_to_write) {
+                cudaStreamWaitEvent(siever_->getCudaStream(), buf->safe_to_write_event, 0);
+            }
+
+            // 2. Queue Sieve Batch
+            if (with_buffer_handshake) {
+                siever_->setPostProcessingLinks(buf);
+            }
+            if (staged) {
+                siever_->setJobArrays(d_staged_a[slot], d_staged_B[slot], d_staged_indices[slot]);
+            } else {
+                siever_->prepareSievingBatch();
+            }
+            siever_->runSievingBatch(batch_size, 0);
+
+            // 3. Tell Proc Stream that Sieving is done
+            if (with_buffer_handshake) {
+                cudaEventRecord(buf->safe_to_read_event, siever_->getCudaStream());
+            }
+
+            // 4. Queue Post Processing (the sieve-step counter it reads is advanced by a
+            //    device-side node inside processBatchBufferedCandidates)
+            if (with_postproc) {
+                postprocessor_->processBatchBufferedCandidates();
+            }
+
+            return buf;
+        };
 
         cudaGraph_t cuda_graph = nullptr;
         cudaGraphExec_t graph_exec = nullptr;
@@ -4558,15 +4748,32 @@ void MPQSOrchestrator::SieveStage() {
 
         if (use_graph) {
             // =============================================================
-            // GRAPH-BASED SIEVE LOOP (single-stream capture + between-replay LP)
+            // GRAPH-BASED SIEVE LOOP
             //
-            // Captures ONLY sieve kernels on the sieve stream (single-stream
-            // graph). Postproc and LP run between graph replays on their own
-            // streams, avoiding multi-stream graph capture issues (D2H memcpy
-            // nodes in captured postproc/LP corrupt forked stream state).
+            // At capture scope >= postproc the captured body is graph_N unrolled
+            // iterations of the standard per-batch body (enqueue_batch), i.e. per
+            // batch i:
+            //     sieve stream : [wait buf_i.safe_to_write (i>=2)] -> sieve(buf_i)
+            //                    -> record buf_i.safe_to_read            (FORK)
+            //     proc  stream : wait buf_i.safe_to_read -> trial division
+            //                    -> record buf_i.safe_to_write
+            // with buf_i = buffers[(start + i) % 2]: the host index toggles once per
+            // captured batch AT CAPTURE TIME, so the alternation is baked into the
+            // graph and batch i+2's wait is a genuine internal edge. Batches 0 and 1
+            // get NO safe_to_write wait: their last record lies outside this capture,
+            // which would either violate capture isolation (905, invalidating the whole
+            // capture) or create no edge at all — and it is unnecessary, since
+            // cudaGraphLaunch orders "each launch behind both any previous work in
+            // stream and any previous launches of graphExec", so replay k completes
+            // entirely before replay k+1 begins. The forked proc branch rejoins the
+            // origin stream via capture_join_event before EndCapture (otherwise
+            // cudaErrorStreamCaptureUnjoined).
             //
-            // LP uses always-launch model: runs once per graph replay
-            // (every graph_N batches), processing all accumulated partials.
+            // At capture scope sieve (explicit request, MPQS_LP_DIAG, or the retry
+            // after a failed capture) only the sieve kernels are captured, all writing
+            // one fixed buffer, and post-processing runs between replays as before.
+            //
+            // LP always runs between replays at this capture scope.
             // =============================================================
 
             // Save original device pointers (restored after graph loop to
@@ -4575,35 +4782,270 @@ void MPQSOrchestrator::SieveStage() {
 
             mpqs::sieve::factoringData& sieve_fdata = siever_->getFactoringDataRef();
 
-            // Use a fixed accumulation buffer for all graph batches
-            auto* graph_buffer = postprocessor_->getActiveAccumulationBuffer();
-            siever_->setPostProcessingLinks(graph_buffer);
+            // In-graph large-prime matching: SOLO + scope full only. cap.capture_lp is
+            // structurally false in cluster (cap.capture_lp = achieved==FULL && has_lp &&
+            // !is_cluster), which is where the operator's "cluster never captures LP"
+            // constraint is expressed, once.
+            const bool capture_lp = cap.capture_lp;
+
+            // In-graph LP cadence (--cuda_graph_lp_stride k): dispatch the captured LP block on
+            // captured batches i with (i % k) == (k - 1), i.e. every k-th batch, the last of each
+            // group. k = 1 is one dispatch per batch (finest); k = 0 or k >= graph_N collapses to a
+            // single dispatch after the last captured batch, reproducing the v1.0.5
+            // once-per-replay composition. The cadence is baked at capture time, so k is fixed for
+            // the whole graph phase (as --lp_interval already was on this path).
+            const uint32_t lp_stride = (config_.graph_lp_stride == 0 ||
+                                        config_.graph_lp_stride > graph_N)
+                                           ? graph_N
+                                           : config_.graph_lp_stride;
+
+            // Deferred-tail pipelining. Consecutive cudaGraphLaunches into one stream are
+            // fully serialized ("Only one instance of graphExec may be executing at a time. Each
+            // launch is ordered behind both any previous work in stream and any previous launches of
+            // graphExec."), so the LAST captured batch's post-processing (+LP) would be an exposed
+            // tail at the end of every replay. Defer it into the NEXT replay, where it is a ROOT of
+            // the proc branch and overlaps that replay's sieve(0).
+            //
+            // Buffer arithmetic (s = host active index at capture time; each
+            // processBatchBufferedCandidates() selects buffers[idx] and then toggles idx):
+            //   root      post-processes buffers[s]
+            //   batch i   sieves          buffers[(s + 1 + i) % 2]
+            //   last batch (i = graph_N-1) sieves buffers[(s + graph_N) % 2]
+            // The root's target equals the last batch's target iff graph_N is EVEN. For odd graph_N
+            // (only graph_N == 1 survives the CLI's rounding) the root would post-process a buffer the
+            // graph never fills, so the deferred body is disabled there and the plain body is used.
+            // Restricted to capture_lp (solo, scope full). With LP left BETWEEN replays (scope
+            // postproc) the deferred body corrupts the persistent batch: that path appends through
+            // the plain counters + a host-side resyncPersistentDualCounter(), while the deferred
+            // trial-division node appends through the DUAL counter one batch later, and the two
+            // interleave. Measured at RSA-100 scope postproc, 4/4 runs: a corrupted persistent factor
+            // count (4,301,343,056 factors for 200,382 relations) with an illegal memory access in the
+            // following resize, or a failed BW pre-flight SpMM AT verification. Re-ordering the
+            // post-loop drain after the LP drain does NOT fix it (the interleaving is per replay, not
+            // just at the end). At scope full every LP dispatch is a graph node ordered immediately
+            // after its own TD, so the hazard cannot arise — and that is the path this optimization
+            // exists for.
+            const bool deferred_tail = (graph_N % 2 == 0) && capture_lp;
+            if (cap.capture_postproc && !deferred_tail) {
+                if (graph_N % 2 != 0) {
+                    LOG(LOG_DEBUG_1) << "deferred-tail disabled (graph_N=" << graph_N << ")";
+                } else {
+                    LOG(LOG_DEBUG_1) << "deferred-tail disabled (LP runs between replays)";
+                }
+            }
+            // True only when the graph that actually got instantiated carries the deferred body —
+            // guards the post-loop drain against running after a fallback to scope sieve.
+            bool deferred_tail_active = false;
+
+            // The captured LP block, identical at all three issue points (deferred root, in-loop
+            // batch, post-loop drain). Runs on proc_stream: LargePrimeVariant is constructed with
+            // postprocessor_->getCudaStream(), so lp_stream == proc_stream and the historical
+            // cudaStreamWaitEvent(proc, lp_done) hand-offs were always self-waits — in-stream order
+            // supplies every gate the between-replay deferral needed events for. launchDeviceAppend
+            // is issued immediately (the one-replay lp_graph_pending deferral has no purpose in a DAG).
+            // The partials_ready record is IN-capture and its consumer (processAndCommitAsync's wait
+            // on lp_stream) is in the SAME capture — legal; a wait on an externally recorded event
+            // would be cudaErrorStreamCaptureIsolation (905) and would void the capture.
+            //
+            // Cost model: the proc branch is one serial chain per batch, TD -> publish -> LP
+            // probe/combine/append -> deviceAppend -> resync -> resetPartial, whose SUM must fit under
+            // the next batch's sieve. Ample at H100/RSA-140+ scale (~68 ms sieve vs ~3-5 ms proc);
+            // NOT obviously true at small N (RSA-70/80, 1-2 ms kernels).
+            auto issueLpBlock = [&]() {
+                CUDA_CHECK(cudaEventRecord(largeprime_->getPartialsReadyEvent(),
+                                           postprocessor_->getCudaStream()));
+                largeprime_->processAndCommitAsync(postprocessor_->getPartialBatch(),
+                                                   postprocessor_->getPersistentBatch());
+                largeprime_->launchDeviceAppend(postprocessor_->getPersistentBatch(),
+                                                postprocessor_->getCudaStream());
+                postprocessor_->resyncPersistentDualCounter();
+                // Ordered after launchDeviceAppend by stream order, so LP has finished reading the
+                // partials.
+                postprocessor_->resetPartialBatch();
+            };
+            // Which captured batch indices carry an LP dispatch (--cuda_graph_lp_stride): every k-th
+            // batch, the last of each group. The deferred root inherits the gate of the batch it
+            // post-processes (graph_N-1), so the SET of (batch -> LP dispatch) pairs is unchanged;
+            // only the last one moves into the next replay. With k = graph_N that single dispatch is
+            // the deferred one, i.e. still one LP dispatch per replay, now at the replay's start.
+            auto lpGateFor = [&](uint32_t batch_index) {
+                return capture_lp && ((batch_index % lp_stride) == (lp_stride - 1));
+            };
+
+            // Internal-only join event: an event whose last record is inside a capture is
+            // permanently unusable from the host, so the join edge and the host-visible
+            // completion signal must be two distinct events, and this one is never touched
+            // outside the capture.
+            cudaEvent_t capture_join_event = nullptr;
+            cudaEvent_t graph_done_event   = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(&capture_join_event, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&graph_done_event,   cudaEventDisableTiming));
+
+            // D10: re-arm every event the capture may have recorded. Never throws — it runs
+            // on recovery paths too.
+            auto rearmCaptureEvents = [&]() {
+                cudaStream_t pp = postprocessor_->getCudaStream();
+                for (int b = 0; b < 2; ++b) {
+                    auto* buf = postprocessor_->getAccumulationBuffer(b);
+                    (void)cudaEventRecord(buf->safe_to_read_event,  pp);
+                    (void)cudaEventRecord(buf->safe_to_write_event, pp);
+                }
+                if (capture_lp && largeprime_) {
+                    // With LP captured, processAndCommitAsync records count_snapshot / lp_done and
+                    // the block below records partials_ready INSIDE the capture; all three are then
+                    // used by non-graph code (the standard-loop tail's LP drains, the post-loop
+                    // drain, the end-of-sieve flush).
+                    cudaStream_t lps = largeprime_->getStream();   // == proc_stream
+                    (void)cudaEventRecord(largeprime_->getDoneEvent(),          lps);
+                    (void)cudaEventRecord(largeprime_->getPartialsReadyEvent(), lps);
+                    (void)cudaEventRecord(largeprime_->getCountSnapshotEvent(), lps);
+                }
+                (void)cudaStreamSynchronize(pp);
+            };
 
             // --- Pre-compute initial N batches ---
+            // Initial staging uses set 0; a full stream sync follows before BeginCapture, so no gate
+            // is needed here. The first per-replay refill therefore starts on the OTHER set.
             for (uint32_t i = 0; i < graph_N; i++) {
                 auto next_indices = mpqs::sieve::prepareNextBatchIndices(&sieve_fdata, batch_size);
-                memcpy(h_staged_indices[i], next_indices.data(), indices_bytes);
-                cudaMemcpyAsync(d_staged_indices[i], h_staged_indices[i],
+                memcpy(h_staged_indices[0][i], next_indices.data(), indices_bytes);
+                cudaMemcpyAsync(d_staged_indices[i], h_staged_indices[0][i],
                                 indices_bytes, cudaMemcpyHostToDevice, siever_->getCudaStream());
                 siever_->prepareSievingBatchFromStaged(
                     d_staged_indices[i], d_staged_a[i], d_staged_B[i]);
             }
-            cudaStreamSynchronize(siever_->getCudaStream());
+            stage_slot = 1;
 
-            // --- Graph Capture: N sieve batches (single stream, no postproc/LP) ---
-            cudaStreamBeginCapture(siever_->getCudaStream(), cudaStreamCaptureModeThreadLocal);
+            // Fixed accumulation buffer, used only by the sieve-scope body.
+            mpqs::postprocessing::DoubleBuffer* graph_buffer = nullptr;
 
-            for (uint32_t i = 0; i < graph_N; i++) {
-                siever_->setJobArrays(d_staged_a[i], d_staged_B[i], d_staged_indices[i]);
-                siever_->runSievingBatch(batch_size, 0);
+            // One capture attempt. `with_postproc` selects the scope-postproc body (fork/join,
+            // alternating buffers) or the sieve-only body (one fixed buffer, no in-capture
+            // events). Returns the EndCapture status; cuda_graph is set on success.
+            auto attemptCapture = [&](bool with_postproc) -> cudaError_t {
+                // Both streams must be idle at BeginCapture: proc_stream is forked INTO the
+                // capture, and work already pending on it would neither be represented in the
+                // graph nor ordered against it.
+                CUDA_CHECK(cudaStreamSynchronize(siever_->getCudaStream()));
+                CUDA_CHECK(cudaStreamSynchronize(postprocessor_->getCudaStream()));
+
+                if (!with_postproc) {
+                    graph_buffer = postprocessor_->getActiveAccumulationBuffer();
+                    siever_->setPostProcessingLinks(graph_buffer);
+                }
+
+                int host_toggles = 0;          // in-body toggleActiveBuffer() calls
+                const bool deferred_body = with_postproc && deferred_tail;
+                cudaError_t err = cudaErrorUnknown;
+                cudaStreamBeginCapture(siever_->getCudaStream(), cudaStreamCaptureModeThreadLocal);
+                try {
+                    if (deferred_body) {
+                        // ROOT of the proc branch: the PREVIOUS replay's batch graph_N-1. Its input is
+                        // complete because whole-graph serialization orders replay k entirely before
+                        // replay k+1's roots, so no cross-replay wait is needed (and none is legal:
+                        // an in-capture wait on an externally recorded event is
+                        // cudaErrorStreamCaptureIsolation, 905, and voids the capture).
+                        //
+                        // processBatchBufferedCandidates() nevertheless OPENS with
+                        // cudaStreamWaitEvent(proc_stream, buf->safe_to_read_event) — and that buffer's
+                        // last record is outside this capture, which is exactly the 905 above (measured:
+                        // the capture then fails with 901 at EndCapture). Since postprocessing.cu is out
+                        // of scope, satisfy the wait instead of removing it: record the same event
+                        // in-capture on the launch stream first. The resulting edge is
+                        // graph-entry -> deferred root, i.e. no real constraint, and it makes the
+                        // helper's wait a legal internal edge.
+                        //
+                        // First replay: the counter is zero, so the TD kernel is a no-op — no priming.
+                        auto* deferred = postprocessor_->getActiveAccumulationBuffer();
+                        CUDA_CHECK(cudaEventRecord(deferred->safe_to_read_event,
+                                                   siever_->getCudaStream()));
+                        postprocessor_->processBatchBufferedCandidates();
+                        ++host_toggles;
+                        if (lpGateFor(graph_N - 1)) issueLpBlock();
+                    }
+                    for (uint32_t i = 0; i < graph_N; i++) {
+                        if (with_postproc) {
+                            // wait_safe_to_write derivation. Batch i sieves buffers[(s+1+i)%2] in the
+                            // deferred body (buffers[(s+i)%2] in the non-deferred one). A wait is legal
+                            // and useful only if THIS capture already recorded that buffer's
+                            // safe_to_write; otherwise it is either 905 (external record) or a silent
+                            // no-edge (never recorded).
+                            //   deferred, graph_N=2: i=0 -> buffers[s+1] (root recorded s)      -> no
+                            //                        i=1 -> buffers[s]   (root recorded s)      -> yes
+                            //   deferred, graph_N=4: i=0 -> s+1 (no) | i=1 -> s (root) | i=2 -> s+1
+                            //                        (i=0's postproc) | i=3 -> s (i=1's postproc)
+                            //   deferred, graph_N=8: same pattern, all i>=1 covered
+                            //   non-deferred: the first TWO batches have no in-capture record.
+                            const bool do_postproc = !deferred_body || (i + 1 < graph_N);
+                            const bool wait_stw    = deferred_body ? (i >= 1) : (i >= 2);
+                            enqueue_batch(i, /*staged=*/true, /*with_buffer_handshake=*/true,
+                                          /*with_postproc=*/do_postproc,
+                                          /*wait_safe_to_write=*/wait_stw);
+                            if (do_postproc) {
+                                ++host_toggles;    // processBatchBufferedCandidates() toggles
+                                if (lpGateFor(i)) issueLpBlock();
+                            }
+                        } else {
+                            enqueue_batch(i, /*staged=*/true, /*with_buffer_handshake=*/false,
+                                          /*with_postproc=*/false, /*wait_safe_to_write=*/false);
+                        }
+                    }
+                    if (with_postproc) {
+                        // JOIN: the forked proc branch must rejoin before EndCapture.
+                        CUDA_CHECK(cudaEventRecord(capture_join_event, postprocessor_->getCudaStream()));
+                        CUDA_CHECK(cudaStreamWaitEvent(siever_->getCudaStream(), capture_join_event, 0));
+                    }
+                    err = cudaStreamEndCapture(siever_->getCudaStream(), &cuda_graph);
+                } catch (const std::exception& e) {
+                    // CUDA_CHECK throws; once a capture is invalidated every later call in the
+                    // region fails, so without this the stream would stay in capturing state and
+                    // even the fallback would die.
+                    cudaGraph_t dead = nullptr;
+                    (void)cudaStreamEndCapture(siever_->getCudaStream(), &dead);
+                    if (dead) cudaGraphDestroy(dead);
+                    cuda_graph = nullptr;
+                    (void)cudaGetLastError();
+                    (void)cudaStreamSynchronize(siever_->getCudaStream());
+                    (void)cudaStreamSynchronize(postprocessor_->getCudaStream());
+                    rearmCaptureEvents();
+                    deferred_tail_active = false;
+                    LOG(LOG_ERROR_CRITICAL) << "capture scope="
+                                            << mpqs::graphCaptureScopeName(cap.achieved)
+                                            << " FAILED (" << e.what()
+                                            << ") — retrying at capture scope=sieve";
+                    err = cudaErrorUnknown;
+                }
+                // Restore the pre-capture host accumulation index on BOTH paths: the body's
+                // toggles were host-side bookkeeping for the capture only.
+                if (host_toggles % 2) postprocessor_->toggleActiveBuffer();
+                return err;
+            };
+
+            // --- Graph capture ---
+            bool postproc_in_graph = cap.capture_postproc;
+            cudaError_t end_err = attemptCapture(postproc_in_graph);
+            if ((end_err != cudaSuccess || !cuda_graph) && postproc_in_graph) {
+                // Retry once at scope sieve (the v1.0.5 body).
+                if (cuda_graph) { cudaGraphDestroy(cuda_graph); cuda_graph = nullptr; }
+                postproc_in_graph = false;
+                end_err = attemptCapture(false);
             }
-
-            cudaError_t end_err = cudaStreamEndCapture(siever_->getCudaStream(), &cuda_graph);
             if (end_err != cudaSuccess) {
                 LOG(LOG_ERROR_CRITICAL) << "cudaStreamEndCapture failed: "
                                         << cudaGetErrorString(end_err)
                                         << " — falling back to standard loop";
                 cuda_graph = nullptr;
+            }
+            // What was ACTUALLY captured: a retry demoted to scope sieve carries no LP.
+            const bool lp_in_graph = capture_lp && postproc_in_graph;
+            // Belt: the stream must never be left capturing.
+            {
+                cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(siever_->getCudaStream(), &cs) == cudaSuccess &&
+                    cs != cudaStreamCaptureStatusNone) {
+                    LOG(LOG_ERROR_CRITICAL) << "sieve stream still capturing after recovery — disabling graph";
+                    if (cuda_graph) { cudaGraphDestroy(cuda_graph); cuda_graph = nullptr; }
+                }
             }
 
             if (cuda_graph) {
@@ -4618,7 +5060,19 @@ void MPQSOrchestrator::SieveStage() {
                     graph_exec = nullptr;
                 } else {
                     LOG(LOG_DEBUG_1) << "Captured " << graph_N << "-batch graph"
-                                    << (largeprime_ ? " (with LP between replays)" : "");
+                                    << (postproc_in_graph ? " (postproc in graph)" : " (sieve only)")
+                                    << (largeprime_ ? (lp_in_graph ? " (with LP in graph)"
+                                                                   : " (with LP between replays)") : "");
+                    if (lp_in_graph) {
+                        if (lp_stride == 1) {
+                            LOG(LOG_DEBUG_1) << "in-graph LP: one dispatch per captured batch; "
+                                                "--lp_interval governs the non-graph tail only";
+                        } else {
+                            LOG(LOG_DEBUG_1) << "in-graph LP: one dispatch every " << lp_stride
+                                             << " captured batches (lp_stride=" << lp_stride
+                                             << "); --lp_interval governs the non-graph tail only";
+                        }
+                    }
                     LOG(LOG_DEBUG_1) << "Configuration: unroll=" << graph_N
                                     << ", batch_size=" << batch_size
                                     << ", LP=" << (largeprime_ ? "between-replay" : "off");
@@ -4627,6 +5081,9 @@ void MPQSOrchestrator::SieveStage() {
 
             if (graph_exec) {
                 graph_ran = true;
+                // The instantiated graph carries the deferred body only if the postproc-scope capture
+                // succeeded (a retry demoted to scope sieve does not).
+                deferred_tail_active = postproc_in_graph && deferred_tail;
                 bool lp_graph_pending = false;  // LP async state for graph path
 
                 // --- Graph Replay Loop ---
@@ -4653,42 +5110,79 @@ void MPQSOrchestrator::SieveStage() {
                         }
                     }
 
-                    // Wait for partial batch reset if extraction in flight (cross-stream dependency)
-                    if (data_tap_ && extract_pending) {
-                        cudaStreamWaitEvent(postprocessor_->getCudaStream(), partial_reset_event, 0);
+                    // Sieve-scope graph only: post-processing runs between replays on
+                    // proc_stream, so the fixed buffer's handshake stays a host-issued edge.
+                    if (!postproc_in_graph) {
+                        if (data_tap_ && extract_pending) {
+                            cudaStreamWaitEvent(postprocessor_->getCudaStream(), partial_reset_event, 0);
+                        }
+                        cudaStreamWaitEvent(siever_->getCudaStream(),
+                                            graph_buffer->safe_to_write_event, 0);
                     }
 
-                    // Wait for postproc to finish (counter reset) before sieve starts
-                    cudaStreamWaitEvent(siever_->getCudaStream(),
-                                        graph_buffer->safe_to_write_event, 0);
-
-                    // Pre-compute next N batches (CPU + H2D + polyGen)
+                    // Pre-compute next N batches (CPU + H2D + polyGen). Gate ONLY the pinned host
+                    // write: in the steady state this event was recorded a whole replay ago, so the
+                    // wait costs ~us. cudaEventSynchronize is legal here (outside any capture; inside
+                    // one it would be error 900) and it is not a stream sync — it does not serialize
+                    // the device.
+                    if (stage_done[stage_slot]) {
+                        CUDA_CHECK(cudaEventSynchronize(stage_done[stage_slot]));
+                    }
                     for (uint32_t i = 0; i < graph_N; i++) {
                         auto next_indices = mpqs::sieve::prepareNextBatchIndices(&sieve_fdata, batch_size);
-                        memcpy(h_staged_indices[i], next_indices.data(), indices_bytes);
-                        cudaMemcpyAsync(d_staged_indices[i], h_staged_indices[i],
+                        memcpy(h_staged_indices[stage_slot][i], next_indices.data(), indices_bytes);
+                        cudaMemcpyAsync(d_staged_indices[i], h_staged_indices[stage_slot][i],
                                         indices_bytes, cudaMemcpyHostToDevice, siever_->getCudaStream());
                         siever_->prepareSievingBatchFromStaged(
                             d_staged_indices[i], d_staged_a[i], d_staged_B[i]);
                     }
+                    CUDA_CHECK(cudaEventRecord(stage_done[stage_slot], siever_->getCudaStream()));
+                    stage_slot ^= 1;
 
-                    // Launch graph (N sieve batches, candidates accumulate in graph_buffer)
+                    // Every external dependency of a captured graph must be expressed on the
+                    // LAUNCH stream before the launch: once trial division is a graph node, a
+                    // host-issued wait on proc_stream orders nothing the graph does, and the
+                    // next replay's in-graph TD could write partials while extract_stream is
+                    // still resetting the partial counters (silent partial loss).
+                    if (postproc_in_graph && data_tap_ && extract_pending) {
+                        cudaStreamWaitEvent(siever_->getCudaStream(), partial_reset_event, 0);
+                    }
+
+                    // Launch graph (N batches; at scope postproc each batch's trial division is
+                    // a node of the graph, at scope sieve candidates accumulate in graph_buffer)
                     cudaError_t launch_err = cudaGraphLaunch(graph_exec, siever_->getCudaStream());
                     if (launch_err != cudaSuccess) {
                         LOG(LOG_ERROR_CRITICAL) << "cudaGraphLaunch failed: "
                                                 << cudaGetErrorString(launch_err);
+                        rearmCaptureEvents();
+                        // Nothing was post-processed by a partial replay we cannot reason about; the
+                        // standard loop takes over from the current buffer state.
+                        deferred_tail_active = false;
                         break;
                     }
 
-                    // Signal postproc that sieve data is ready
-                    cudaEventRecord(graph_buffer->safe_to_read_event, siever_->getCudaStream());
+                    // Recorded OUTSIDE the capture: a graph is one stream work item, so this
+                    // signals whole-graph completion including the forked proc branch. (The
+                    // host sync below already orders everything on the paths that keep it.)
+                    CUDA_CHECK(cudaEventRecord(graph_done_event, siever_->getCudaStream()));
 
-                    // Process accumulated candidates (runs on postproc stream)
-                    postprocessor_->updatePredictionSteps(current_step);
-                    postprocessor_->processBatchBufferedCandidates();
+                    if (!postproc_in_graph) {
+                        // Signal postproc that sieve data is ready
+                        cudaEventRecord(graph_buffer->safe_to_read_event, siever_->getCudaStream());
+
+                        // Process accumulated candidates (runs on postproc stream)
+                        postprocessor_->processBatchBufferedCandidates();
+                    }
 
                     // === LP PIPELINE (always-launch, between replays) ===
-                    if (largeprime_) {
+                    // Retained for SOLO runs that landed on scope postproc/sieve (explicit CLI, or
+                    // the MPQS_LP_DIAG downgrade, or a failed capture retried at sieve): without it
+                    // LP would never run during the graph phase, and without the post-loop drain the
+                    // last dispatch's combines would never be appended — a silent relation loss.
+                    // `largeprime_ && !lp_in_graph` is the cap.between_replay_lp_retained predicate
+                    // (= has_lp && !capture_lp), narrowed to what was actually captured, so the
+                    // graph-capture-scope unit test's assertion covers this guard.
+                    if (largeprime_ && !lp_in_graph) {
                         // Drain previous async LP if pending
                         if (lp_graph_pending) {
                             cudaStreamWaitEvent(postprocessor_->getCudaStream(),
@@ -4699,7 +5193,7 @@ void MPQSOrchestrator::SieveStage() {
 
                             const auto* lp_stats = largeprime_->getTelemetry();
                             if (lp_stats)
-                                global_lp_full_relations += lp_stats->last_batch_full_relations;
+                                global_lp_full_relations = lp_stats->total_full_relations;   // cumulative device counter (SO-11)
 
                             postprocessor_->resyncPersistentDualCounter();
                             lp_graph_pending = false;
@@ -4720,11 +5214,34 @@ void MPQSOrchestrator::SieveStage() {
                         postprocessor_->resetPartialBatch();
                     }
 
-                    // Toggle back — graph always writes to the same buffer
-                    postprocessor_->toggleActiveBuffer();
-
-                    // Wait for postproc to finish before next graph launch
-                    cudaStreamSynchronize(postprocessor_->getCudaStream());
+                    if (!postproc_in_graph) {
+                        // Toggle back — the sieve-scope graph always writes the same buffer
+                        postprocessor_->toggleActiveBuffer();
+                        // Wait for postproc to finish before the next graph launch
+                        cudaStreamSynchronize(postprocessor_->getCudaStream());
+                    } else if (cap.keep_host_sync) {
+                        // keep_host_sync = is_cluster || !capture_lp (the scope resolver). The !capture_lp
+                        // term is load-bearing: in SOLO at scope postproc the in-graph trial division
+                        // writes partials while the retained between-replay LP block issues
+                        // processAndCommitAsync on proc_stream, which the graph does NOT order against
+                        // (proc_stream carries no work at replay time), so LP could read the partial
+                        // batch mid-append.
+                        if (is_cluster) {
+                            // The extraction block below needs EXACT counters, exactly as the
+                            // non-graph cluster loop has per batch. graph_done_event was recorded
+                            // OUTSIDE the capture right after cudaGraphLaunch and a graph is one
+                            // stream work item, so it signals whole-graph completion including the
+                            // forked proc branch; being a normal (non-captured) event it is legal to
+                            // wait on from extract_stream, unlike anything recorded in-capture.
+                            CUDA_CHECK(cudaStreamWaitEvent(extract_stream, graph_done_event, 0));
+                            CUDA_CHECK(cudaStreamSynchronize(extract_stream));   // ~10 us
+                        } else {
+                            CUDA_CHECK(cudaStreamSynchronize(siever_->getCudaStream()));
+                        }
+                    }
+                    // SOLO at scope full (cap.keep_host_sync == false): NO host sync at all. The loop
+                    // condition and the telemetry read pinned counters that now lag by at most ONE
+                    // replay — whole-graph serialization means at most one replay is ever in flight.
 
                     // === DATA EXTRACTION — graph path (cluster mode only) ===
                     if (data_tap_) {
@@ -4745,7 +5262,10 @@ void MPQSOrchestrator::SieveStage() {
                             }
                         }
 
-                        // Counters are exact (just synced postproc_stream) — no additional sync needed
+                        // Counters are exact: this block runs only under data_tap_ (cluster), where
+                        // the boundary above synchronized extract_stream behind graph_done_event, i.e.
+                        // behind the whole graph including its proc branch. In solo the block does not
+                        // run at all (data_tap_ is null) — no additional sync needed
                         uint64_t curr_pers = *postprocessor_->h_pinned_persistent_count;
                         uint64_t delta = curr_pers - prev_pers_count;
 
@@ -4780,7 +5300,23 @@ void MPQSOrchestrator::SieveStage() {
                     // Mid-sieve checkpoint (m-graphloop): emit AFTER the current_step advance,
                     // never at the :~3731 per-replay sync (else each resume re-sieves a whole
                     // graph replay). No-op unless solo + checkpointing enabled.
-                    maybeCheckpoint(current_step, static_cast<uint64_t>(processed_batches),
+                    // Deferred tail (option (c)): at a replay boundary the last batch's candidates
+                    // are not yet post-processed, so the completed prefix of the a-walk is one batch
+                    // behind the launched cursor. Check-pointing current_step verbatim would over-state
+                    // it and lose that batch's relations on resume.
+                    const uint64_t ckpt_step = (deferred_tail_active && current_step >= batch_size)
+                                                   ? (current_step - batch_size)
+                                                   : current_step;
+                    // current_step counts LAUNCHED a-values, so the trailer's global_a_index is only
+                    // correct once that work has actually completed — and with the per-replay sync
+                    // gone (solo, scope full) nothing else guarantees it. Quiesce ONLY when the
+                    // checkpoint will actually fire: gating on "enabled" would sync every replay of a
+                    // checkpoint-enabled production run and undo the sync removal.
+                    if (checkpointWillFire(static_cast<uint64_t>(processed_batches),
+                                           std::chrono::steady_clock::now())) {
+                        quiesceForCheckpoint();
+                    }
+                    maybeCheckpoint(ckpt_step, static_cast<uint64_t>(processed_batches),
                                     std::chrono::duration<double>(clock::now() - t_sieve_loop_start).count());
 
                     // === Telemetry (pinned counters, no GPU sync) ===
@@ -4790,6 +5326,12 @@ void MPQSOrchestrator::SieveStage() {
                     // LP telemetry
                     if (largeprime_) {
                         const auto* lp_stats = largeprime_->getTelemetry();
+                        // With LP inside the graph there is no host drain site during the graph
+                        // phase, so refresh the cumulative counter here (SO-11 assignment form) to
+                        // keep the Thruput / Progress / ETA lines live. Raw integer, no fmtSize().
+                        if (lp_in_graph && lp_stats) {
+                            global_lp_full_relations = lp_stats->total_full_relations;
+                        }
                         if (lp_stats && lp_stats->total_iterations > last_lp_gen) {
                             if (lp_stats->total_witnesses > lp_fill_history_.witness_max)
                                 lp_fill_history_.witness_max = lp_stats->total_witnesses;
@@ -4852,8 +5394,16 @@ void MPQSOrchestrator::SieveStage() {
                 LOG(LOG_DEBUG_1) << "Completed " << graph_replay_count << " graph replays ("
                                 << (graph_replay_count * graph_N) << " batches via graph)";
 
-                // Post-graph LP drain: last LP is still in flight
-                if (lp_graph_pending) {
+                // D10: re-arm the buffer events the capture recorded, at a defined quiescence
+                // point, BEFORE any non-graph code (the LP drain, the standard-loop tail, a later
+                // SieveStage entry) waits on or records them.
+                CUDA_CHECK(cudaStreamSynchronize(siever_->getCudaStream()));
+                rearmCaptureEvents();
+
+                // Post-graph LP drain: last LP is still in flight.
+                // Invariant: when lp_in_graph is true, lp_graph_pending is never set (the in-graph
+                // block appends within the same batch); the guard is explicit for legibility.
+                if (lp_graph_pending && !lp_in_graph) {
                     cudaStreamWaitEvent(postprocessor_->getCudaStream(),
                                         largeprime_->getDoneEvent(), 0);
                     largeprime_->launchDeviceAppend(
@@ -4861,15 +5411,51 @@ void MPQSOrchestrator::SieveStage() {
                         postprocessor_->getCudaStream());
                     const auto* lp_stats = largeprime_->getTelemetry();
                     if (lp_stats)
-                        global_lp_full_relations += lp_stats->last_batch_full_relations;
+                        global_lp_full_relations = lp_stats->total_full_relations;   // cumulative device counter (SO-11)
                     postprocessor_->resyncPersistentDualCounter();
                     lp_graph_pending = false;
                 }
+
+                // Deferred-tail drain, issued AFTER the between-replay LP drain above. Ordering is
+                // load-bearing at scope postproc: that drain's launchDeviceAppend writes the persistent
+                // batch through its plain counters and only then resyncs the dual counter, while this
+                // drain's trial division appends through the DUAL counter. Draining in the other
+                // order interleaves the two and leaves the counters
+                // divergent — measured: a corrupted persistent factor count (4,301,343,056 factors for
+                // 200,382 relations) and an illegal memory access in the following resize, or, when it
+                // survives, a failed BW pre-flight SpMM verification. At scope full the LP drain is a
+                // no-op (lp_graph_pending is never set), so the order is immaterial there.
+                //
+                // With the deferred body exactly ONE buffer holds candidates no node
+                // ever post-processed: the one the last replay's batch graph_N-1 filled, buffers[s].
+                // The host index is back at s (host_toggles == graph_N is even for even graph_N, so the
+                // post-capture fixup toggles nothing, and the replay loop does not toggle on this
+                // path), hence getActiveAccumulationBuffer() selects exactly that buffer. The drain's
+                // own toggle then leaves the index at s+1, which is what the standard-loop tail must
+                // target next: buffers[s+1] was last post-processed by the graph's batch graph_N-2 and
+                // its safe_to_write was just re-armed. No further fixup is required.
+                //
+                // The re-arm above MUST precede this: processBatchBufferedCandidates() opens with
+                // cudaStreamWaitEvent(proc_stream, safe_to_read_event), whose last record was inside
+                // the capture — such an event fails permanently (and here silently, the wait is not
+                // CUDA_CHECKed) until re-recorded from a non-capturing stream.
+                if (deferred_tail_active && graph_replay_count > 0) {
+                    LOG(LOG_DEBUG_1) << "deferred-tail drain: post-processing the last captured batch";
+                    postprocessor_->processBatchBufferedCandidates();
+                    if (lpGateFor(graph_N - 1)) issueLpBlock();
+                    CUDA_CHECK(cudaStreamSynchronize(postprocessor_->getCudaStream()));
+                }
+
 
                 // Cleanup graph
                 cudaGraphExecDestroy(graph_exec);
                 graph_exec = nullptr;
             }
+
+            cudaEventDestroy(capture_join_event);
+            cudaEventDestroy(graph_done_event);
+            if (stage_done[0]) { cudaEventDestroy(stage_done[0]); stage_done[0] = nullptr; }
+            if (stage_done[1]) { cudaEventDestroy(stage_done[1]); stage_done[1] = nullptr; }
 
             // Restore original device pointers to prevent double-free
             // (setJobArrays redirected them to staging buffers during capture)
@@ -4896,22 +5482,9 @@ void MPQSOrchestrator::SieveStage() {
                 cudaStreamWaitEvent(postprocessor_->getCudaStream(), partial_reset_event, 0);
             }
 
-            auto* active_buffer = postprocessor_->getActiveAccumulationBuffer();
-
-            // 1. Tell Sieve Stream to wait for PostProcessor to finish with this buffer
-            cudaStreamWaitEvent(siever_->getCudaStream(), active_buffer->safe_to_write_event, 0);
-
-            // 2. Queue Sieve Batch
-            siever_->setPostProcessingLinks(active_buffer);
-            siever_->prepareSievingBatch();
-            siever_->runSievingBatch(config_.sieve_batch_size, 0);
-
-            // 3. Tell Proc Stream that Sieving is done
-            cudaEventRecord(active_buffer->safe_to_read_event, siever_->getCudaStream());
-
-            // 4. Queue Post Processing
-            postprocessor_->updatePredictionSteps(current_step);
-            postprocessor_->processBatchBufferedCandidates();
+            // Buffer handshake + sieve + post-processing (see enqueue_batch above).
+            enqueue_batch(0, /*staged=*/false, /*with_buffer_handshake=*/true,
+                          /*with_postproc=*/true, /*wait_safe_to_write=*/true);
 
             // Record batch completion for extraction pipeline (cluster mode)
             if (data_tap_) {
@@ -4941,7 +5514,7 @@ void MPQSOrchestrator::SieveStage() {
                     // Telemetry (stale pinned stats — no GPU sync)
                     const mpqs::lp::SLPPinnedStats* lp_stats = largeprime_->getTelemetry();
                     if (lp_stats) {
-                        global_lp_full_relations += lp_stats->last_batch_full_relations;
+                        global_lp_full_relations = lp_stats->total_full_relations;   // cumulative device counter (SO-11)
                     }
 
                     // Resync postprocessor dual counter after LP modified persistent batch
@@ -5151,7 +5724,8 @@ void MPQSOrchestrator::SieveStage() {
         // === CUDA Graph staging buffer cleanup ===
         if (use_graph) {
             for (uint32_t i = 0; i < graph_N; i++) {
-                if (h_staged_indices[i]) cudaFreeHost(h_staged_indices[i]);
+                if (h_staged_indices[0][i]) cudaFreeHost(h_staged_indices[0][i]);
+                if (h_staged_indices[1][i]) cudaFreeHost(h_staged_indices[1][i]);
                 if (d_staged_indices[i]) cudaFree(d_staged_indices[i]);
                 if (d_staged_a[i]) cudaFree(d_staged_a[i]);
                 if (d_staged_B[i]) cudaFree(d_staged_B[i]);
@@ -5167,7 +5741,7 @@ void MPQSOrchestrator::SieveStage() {
             );
             const mpqs::lp::SLPPinnedStats* lp_stats = largeprime_->getTelemetry();
             if (lp_stats) {
-                global_lp_full_relations += lp_stats->last_batch_full_relations;
+                global_lp_full_relations = lp_stats->total_full_relations;   // cumulative device counter (SO-11)
             }
             postprocessor_->resyncPersistentDualCounter();
             lp_async_pending = false;
@@ -5222,7 +5796,7 @@ void MPQSOrchestrator::SieveStage() {
 
             const mpqs::lp::SLPPinnedStats* lp_stats = largeprime_->getTelemetry();
             if (lp_stats) {
-                global_lp_full_relations += lp_stats->last_batch_full_relations;
+                global_lp_full_relations = lp_stats->total_full_relations;   // cumulative device counter (SO-11)
 
                 LOG(LOG_DEBUG_1) << "Batch LP processing complete.";
                 LOG(LOG_DEBUG_1) << " Witnesses stored: "
@@ -5523,7 +6097,7 @@ void MPQSOrchestrator::SieveStage() {
 
     if (!cluster_mode) {
         if (resume_active_) {
-            // S2 solo resume: device-dedup the new leg, union-merge with the loaded checkpoint,
+            // Solo resume: device-dedup the new leg, union-merge with the loaded checkpoint,
             // re-assert fb_size+64 on the union, then the solo LP final host-match.
             finalizeResumeUnion(pre_dedup_count, post_dedup_count);
         } else {
@@ -5605,7 +6179,17 @@ void MPQSOrchestrator::SieveStage() {
         summary.lp_active = true;
         const auto* lp_stats = largeprime_->getTelemetry();
         if (lp_stats) {
-            summary.lp_combined_relations = lp_stats->total_full_relations;
+            // LP-combined count for this block is the POST-DEDUP ground truth, counted from the
+            // final relation set (same predicate as the `LP fraction:` line), NOT the device
+            // cumulative: `total_full_relations` counts every LP relation ever committed
+            // (pre-dedup), and subtracting it from the post-dedup total below would mix scales
+            // and understate `Sieved full`. The device cumulative still drives the rate lines
+            // (`[LP_Pipeline] Thruput`, `Cumulative LP full relations`).
+            uint64_t lp_combined_post_dedup = 0;
+            for (size_t i = 0; i < host_relations_soa_.num_relations; ++i) {
+                if (host_relations_soa_.large_primes[i] > 1) ++lp_combined_post_dedup;
+            }
+            summary.lp_combined_relations = lp_combined_post_dedup;
             summary.unique_witnesses_stored = lp_stats->total_witnesses;
             summary.slab_overflows = lp_stats->slab_overflow_count;
             summary.witness_overflows = lp_stats->witness_overflow_count;
@@ -5838,11 +6422,16 @@ MPQSOrchestrator::TruncatedSieveResult MPQSOrchestrator::TruncatedSieveRun(
         CUDA_CHECK(cudaStreamCreate(&sieve_stream));
         siever_ = std::make_unique<mpqs::sieve::DeviceSievingController>(config_.device_id, sieve_stream);
     }
-    siever_->setAccumulatorMode(config_.sieve_accumulator_mode);  // S1: override known before predicate runs
-    siever_->setWideAccumMode(config_.sieve_wide_accum_mode);     // Option A: wide-accumulator width override
+    siever_->setAccumulatorMode(config_.sieve_accumulator_mode);  // override known before predicate runs
+    siever_->setWideAccumMode(config_.sieve_wide_accum_mode);     // wide-accumulator width override
     siever_->setMetaCycleCap(config_.sieve_meta_cycle_cap);  // A2: SCATTER meta-cycle cap (0 = off)
     siever_->setGatherBlockDim(config_.sieve_gather_block_dim);  // GATHER blockDim A/B knob (0 = off)
     siever_->setBucketSizeFactor(config_.sieve_bucket_size_factor);  // bucket-overflow ablation knob (0 = legacy SB/2)
+    // v1.0.6: narrow-batch --params-only geometry overrides (0 = off => byte-identical).
+    // Must run BEFORE initiate(), like every other loader-consumed override above.
+    siever_->setSievingBlockSizeOverride(config_.sieve_block_size);   // sievingBlockSize override (0 = off)
+    siever_->setBigPrimeStartOverride(config_.sieve_big_prime_start); // bigPrimeStartIndex override (0 = off)
+    siever_->setNarrowOverflowStats(config_.sieve_bucket_overflow_stats); // narrow [BucketOverflow] telemetry (false = off)
     siever_->initiate(f_data_);
     if (config_.lp1_bound > 0)
         siever_->setThresholdOverride(config_.lp1_bound);
@@ -6725,7 +7314,7 @@ void MPQSOrchestrator::networkLoop() {
     cluster_raw_partials_ = structures::HostRelationBatch{};
     cluster_raw_partials_.factor_offsets.push_back(0);  // CSR sentinel
 
-    // S4: coordinator RESUME re-injection (default-off). Runs ONCE at Thread A start,
+    // Coordinator RESUME re-injection (default-off). Runs ONCE at Thread A start,
     // BEFORE any worker/local batch is processed, so the loaded pool is the baseline the
     // resumed run tops up. Order (m-dedup-order): smooths via addRelations rebuild
     // accumulated_ + the seen_ dedup set FIRST; then the loaded partials re-feed
@@ -6736,7 +7325,7 @@ void MPQSOrchestrator::networkLoop() {
     // for the expanded-matrix path — done here, AFTER the reset above, so the sentinel/CSR
     // stays valid (doing it pre-Thread-A would be wiped by the reset). The live pooled count
     // then includes the loaded smooths, so the target test (targetReached) works unchanged —
-    // no separate effective-target reduction is needed on the cluster path (unlike solo S2).
+    // no separate effective-target reduction is needed on the cluster path (unlike solo).
     if (cluster_resume_active_) {
         const uint64_t n_sm = cluster_resume_smooths_.num_relations;
         const uint64_t n_pt = cluster_resume_partials_.num_relations;
@@ -6757,7 +7346,7 @@ void MPQSOrchestrator::networkLoop() {
     uint32_t total_workers = comm_backend_ ? comm_backend_->peerCount() : 0;
     bool all_workers_flushed = (total_workers == 0);  // M1: no workers to flush
 
-    // S8: Per-worker last recall timestamp for anti-thrashing (60s cooldown).
+    // Per-worker last recall timestamp for anti-thrashing (60s cooldown).
     // Accessed only from Thread A — no synchronization needed.
     std::unordered_map<uint8_t, std::chrono::steady_clock::time_point> last_recall_time_;
 
@@ -6831,7 +7420,7 @@ void MPQSOrchestrator::networkLoop() {
         node_telemetry[w].gpu_name = std::string(info.gpu_name);
     }
 
-    // --- S3: coordinator checkpoint state (Thread-A-local; default-off no-op) ---
+    // --- Coordinator checkpoint state (Thread-A-local; default-off no-op) ---
     // Cluster checkpoints fire on the WALL-CLOCK interval only (checkpoint_batches is a
     // solo-loop notion — Thread A has no sieve-batch counter). worker_initial_hw[node_id]
     // is the per-node initial-range contiguous high-water (M1): index 0 = coordinator (set
@@ -6841,7 +7430,7 @@ void MPQSOrchestrator::networkLoop() {
     auto last_ckpt_time     = std::chrono::steady_clock::now();
     bool ckpt_timer_armed   = false;
     std::vector<uint64_t> worker_initial_hw(node_telemetry.size(), 0);
-    // S4 resume: seed each node's high-water with the offset it was trimmed by, so a node
+    // Cluster resume: seed each node's high-water with the offset it was trimmed by, so a node
     // that hasn't reported its (trimmed) initial CHUNK_COMPLETE before the next checkpoint
     // re-reports that offset (a further resubmission re-issues the same trimmed range —
     // re-sieve, never skip). Fresh run: cluster_initial_resume_offsets_ empty ⇒ all 0 (identity).
@@ -6854,7 +7443,7 @@ void MPQSOrchestrator::networkLoop() {
     uint64_t last_sample_rels = 0;
     auto     last_log_time    = sieve_start;
 
-    // --- P0.c: Thread-A occupancy telemetry (permanent, always-on) ---
+    // --- Thread-A occupancy telemetry (permanent, always-on) ---
     // Thread A is the coordinator's sole consumer of all cluster relation traffic and is
     // serial: recv → deserialize → buffer partials → dedup → LP match. These counters
     // attribute its wall-clock across those stages, so a saturating LP table (per-witness
@@ -6934,7 +7523,7 @@ void MPQSOrchestrator::networkLoop() {
                            << std::fixed << std::setprecision(1) << comb_rate << "/s)"
                            << " | yield " << std::fixed << std::setprecision(1) << yield << "%";
 
-            // P0.c Thread-A occupancy — PARSER CONTRACT (stable field order; extend only
+            // Thread-A occupancy — PARSER CONTRACT (stable field order; extend only
             // by APPENDING). Space-separated key=value pairs; every value is a raw plain
             // uint64 decimal. NEVER fmtSize() here: its K/M truncation above 1,000 silently
             // froze a whole campaign's witness extraction (fixed b7ff2ce/2504647).
@@ -6969,7 +7558,7 @@ void MPQSOrchestrator::networkLoop() {
         }
     };
 
-    // S8: Straggler detection lambda — runs after each CHUNK_COMPLETE.
+    // Straggler detection lambda — runs after each CHUNK_COMPLETE.
     // Sends CHUNK_RECALL to a worker whose estimated remaining time exceeds 2×
     // the fastest worker's estimated remaining time.
     // Anti-thrashing: 30s minimum execution before first recall, 60s cooldown per worker.
@@ -7233,7 +7822,7 @@ void MPQSOrchestrator::networkLoop() {
             cluster::RecvMessage msg;
             auto now = std::chrono::steady_clock::now();
             deferred_batches.clear();
-            // P0.c: the drain is split recv-vs-dispatch so the two stages attribute
+            // The drain is split recv-vs-dispatch so the two stages attribute
             // separately. ctl_us covers every case below EXCEPT the deferred batch replay
             // (which is timed per-stage inside processIncrementalBatch); INCREMENTAL_BATCH
             // contributes only its O(1) move-push onto the deferred FIFO.
@@ -7301,7 +7890,7 @@ void MPQSOrchestrator::networkLoop() {
                                                                cc.a_values_consumed);
                         }
 
-                        // S3 (M1): capture this worker's INITIAL-range contiguous
+                        // Capture this worker's INITIAL-range contiguous
                         // high-water on its FIRST CHUNK_COMPLETE. wt.current_chunk_id ==
                         // kInitialChunk (still its pre-completion value here) means the
                         // worker is reporting its initial WORK_ASSIGN range, which it
@@ -7316,7 +7905,7 @@ void MPQSOrchestrator::networkLoop() {
                             uint64_t cap = (msg.sender_id < cluster_initial_ranges_.size())
                                 ? cluster_initial_ranges_[msg.sender_id].second
                                 : cc.a_values_consumed;
-                            // S4 resume: cc.a_values_consumed is relative to this worker's
+                            // Cluster resume: cc.a_values_consumed is relative to this worker's
                             // CURRENT (trimmed) initial assignment, so add the offset it was
                             // trimmed by to recover the ABSOLUTE high-water. Fresh run: offset
                             // 0 ⇒ unchanged. Clamp to the initial range size (lag-conservative).
@@ -7353,7 +7942,7 @@ void MPQSOrchestrator::networkLoop() {
                                             /*debug_droppable=*/true,
                                             /*is_redispatch=*/false);
 
-                        // S8: Check for stragglers after each CHUNK_COMPLETE.
+                        // Check for stragglers after each CHUNK_COMPLETE.
                         checkStragglers();
                     }
                     break;
@@ -7443,7 +8032,7 @@ void MPQSOrchestrator::networkLoop() {
 
             // --- M3: Heartbeat timeout check (every 5 seconds) ---
             if (now - last_timeout_check > std::chrono::seconds(5)) {
-                auto t_hb = std::chrono::steady_clock::now();  // P0.c: also chunk-mgmt
+                auto t_hb = std::chrono::steady_clock::now();  // also chunk-mgmt
                 last_timeout_check = now;
                 for (auto& [wid, wt] : worker_trackers) {
                     if (!wt.alive) continue;
@@ -7677,7 +8266,7 @@ void MPQSOrchestrator::networkLoop() {
             break;
         }
 
-        // S3: coordinator checkpoint emit at the Thread-A sole-mutator boundary. By here
+        // Coordinator checkpoint emit at the Thread-A sole-mutator boundary. By here
         // every batch popped/received this iteration has been deduped into
         // cluster_accumulator_, the LP table updated, and raw partials buffered — so a
         // snapshot is host-consistent with nothing mid-flight. Default-off no-op; fires

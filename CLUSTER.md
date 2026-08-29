@@ -66,8 +66,9 @@ ssh user@worker-host "cd /path/to/cuda-mpqs && ./build/tests/cuda-mpqs --RSA100 
 write periodic atomic `sieve.ckpt` snapshots; add `--resume` on resubmission to continue
 from the last checkpoint. Workers are stateless and reconnect normally — no worker-side
 flags required. See `docs/modules/cluster.md` (Coordinator Checkpointing section) for
-details and the SLURM sbatch template in `tools/cluster/rsa140_a100_4node_pc2.sbatch`
-for a production-ready example.
+details. Under a batch scheduler, keep `--checkpoint_dir` on a run-stable path (keyed
+on a run tag, never on the job ID) so a resubmission finds the previous run's
+checkpoint, and add `--resume` on every resubmission.
 
 The transport is fixed to TCP: there is **no** `--transport` CLI flag. The `MPQSConfig::transport` field defaults to `"tcp"` and TCP is the only backend.
 

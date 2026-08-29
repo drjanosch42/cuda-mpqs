@@ -52,9 +52,11 @@ bool KernelLaunchValidator::isValid(const Params8& p) const {
 
 std::string KernelLaunchValidator::diagnose(const Params8& p) const {
     if (!checkPow2(p)) {
-        for (int i = 0; i < 8; ++i) {
+        for (uint32_t i = 0; i < 8; ++i) {
             uint32_t x = p[i];
-            if (x == 0 || (x & (x - 1)) != 0)
+            if (x == 0)
+                return "param[" + std::to_string(i) + "]=0 (must be > 0)";
+            if (pow2Required(i) && (x & (x - 1)) != 0)
                 return "param[" + std::to_string(i) + "]=" + std::to_string(x) + " is not a power of 2";
         }
     }
@@ -77,9 +79,25 @@ std::string KernelLaunchValidator::diagnose(const Params8& p) const {
             return "sasGridDim=" + std::to_string(p[P_SAS_GRID_DIM])
                  + " > subCubeSize=" + std::to_string(subCubeSize)
                  + " (polysPerSieveCall/gridDim.x would be 0)";
+        uint32_t sasGridDim = p[P_SAS_GRID_DIM];
+        if (sasGridDim == 0 || subCubeSize % sasGridDim != 0)
+            return "sasGridDim=" + std::to_string(sasGridDim)
+                 + " does not divide subCubeSize=" + std::to_string(subCubeSize)
+                 + " (GATHER would overlap prefixes and leave a polynomial tail uncovered)";
+        uint32_t chunk = subCubeSize / sasGridDim;
+        if ((chunk & (chunk - 1)) != 0)
+            return "GATHER chunk subCubeSize/sasGridDim=" + std::to_string(chunk)
+                 + " is not a power of 2 (polyIdPrefix | gray(poly) would alias)";
         uint32_t divisor = metaGridDim * polyBlockSize;
+        if (divisor == 0 || subCubeSize % divisor != 0)
+            return "metaGridDim*polyBlockSize=" + std::to_string(divisor)
+                 + " does not divide subCubeSize=" + std::to_string(subCubeSize)
+                 + " (SCATTER exact-partition violation)";
         uint32_t num_polyBlocksPerTB = subCubeSize / divisor;
-        if (num_polyBlocksPerTB == 0 || (num_polyBlocksPerTB & (num_polyBlocksPerTB - 1)) != 0)
+        if (num_polyBlocksPerTB == 0)
+            return "num_polyBlocksPerTB=0";
+        if (pow2Required(P_SUB_CUBE_SIZE)
+            && (num_polyBlocksPerTB & (num_polyBlocksPerTB - 1)) != 0)
             return "num_polyBlocksPerTB=" + std::to_string(num_polyBlocksPerTB) + " is not a power of 2";
         return "arithmetic decomposition mismatch";
     }
@@ -130,13 +148,31 @@ std::string KernelLaunchValidator::diagnose(const Params8& p) const {
 }
 
 // ---------------------------------------------------------------------------
-// Step 1: All 8 params must be powers of two
-// Mirrors POW2_CHECK on lines 864-872 (the 8 user-facing params)
+// Step 1: power-of-two policy, PER PARAMETER
+//
+// Mirrors the POW2_CHECK block in DeviceSievingController::validateConfigs().
+//
+// Indices 1,2,3,5,7 (numIntervals, polyBlockSize, blocksPerCycle, metaBlockDim, sasBlockDim)
+// require pow2 ALWAYS — polyBlockSize because advanceRoots' cyclic Gray wrap is single-bit
+// only for a power-of-two block, the rest because of the shared-accumulator/warp geometry.
+//
+// Indices 0,4,6 (subCubeSize = num_polysPerSieveCall, metaGridDim, sasGridDim) require pow2
+// only in the legacy or wide regimes. On the narrow BATCH path (sc_.allow_nonpow2_geometry)
+// they may be SM-aligned instead; their real constraints — exact SCATTER partition, exact
+// GATHER division with a pow2 chunk — are enforced in checkArithmeticConstraints(). Every
+// value is still required to be non-zero. v1.0.6; the normative admissible set is the
+// predicate implemented by the checks below.
 // ---------------------------------------------------------------------------
 
+bool KernelLaunchValidator::pow2Required(uint32_t idx) const {
+    if (!sc_.allow_nonpow2_geometry) return true;   // legacy / wide: today's rule set verbatim
+    return !(idx == P_SUB_CUBE_SIZE || idx == P_META_GRID_DIM || idx == P_SAS_GRID_DIM);
+}
+
 bool KernelLaunchValidator::checkPow2(const Params8& p) const {
-    for (uint32_t x : p) {
-        if (x == 0 || (x & (x - 1)) != 0) return false;
+    for (uint32_t i = 0; i < 8; ++i) {
+        if (p[i] == 0) return false;
+        if (pow2Required(i) && (p[i] & (p[i] - 1)) != 0) return false;
     }
     return true;
 }
@@ -154,9 +190,15 @@ bool KernelLaunchValidator::checkPow2(const Params8& p) const {
 //   LEQ:   blocksPerCycle <= numIntervals                           [line 885]
 //   LEQ:   metaGridDim <= subCubeSize                               [line 882]
 //   LEQ:   metaGridDim * polyBlockSize <= subCubeSize               [line 883]
-//   POW2:  num_polyBlocksPerTB must be power-of-two                 [line 866]
+//   POW2:  num_polyBlocksPerTB must be power-of-two                 [line 866; legacy/wide only]
 //   EQUAL: num_polyBlocksPerTB * polyBlockSize * metaGridDim == subCubeSize [line 875]
 //   EQUAL: num_metaSieveCycles * blocksPerCycle == numIntervals     [line 879]
+//
+// v1.0.6: the two derived quantities are now checked for EXACTNESS FIRST
+// (divisibility) instead of relying on the pow2 world making the floored quotient exact.
+// The GATHER decomposition constraints G1/G2 — sasGridDim | subCubeSize with a power-of-two
+// chunk — are stated explicitly here; both are tautologies for pow2 tuples, so no previously
+// valid tuple changes verdict. Mirrors validateConfigs' G1/G2/G3.
 // ---------------------------------------------------------------------------
 
 bool KernelLaunchValidator::checkArithmeticConstraints(const Params8& p) const {
@@ -165,21 +207,36 @@ bool KernelLaunchValidator::checkArithmeticConstraints(const Params8& p) const {
     uint32_t polyBlockSize = p[P_POLY_BLOCK_SIZE];
     uint32_t blocksPerCyc = p[P_BLOCKS_PER_CYC];
     uint32_t metaGridDim  = p[P_META_GRID_DIM];
+    uint32_t sasGridDim   = p[P_SAS_GRID_DIM];
 
     // LEQ checks
     if (subCubeSize > (1u << (sc_.shc_dim - 1))) return false;
     if (blocksPerCyc > numIntervals) return false;
     if (metaGridDim > subCubeSize) return false;
     if (metaGridDim * polyBlockSize > subCubeSize) return false;
-    // sasGridDim must not exceed subCubeSize (polysPerSieveCall / gridDim.x must be > 0)
-    if (p[P_SAS_GRID_DIM] > subCubeSize) return false;
+    // G3: sasGridDim must not exceed subCubeSize (polysPerSieveCall / gridDim.x must be > 0)
+    if (sasGridDim > subCubeSize) return false;
 
-    // Derived: num_polyBlocksPerThreadBlock = subCubeSize / (metaGridDim * polyBlockSize)
+    // G1: sasGridDim must DIVIDE subCubeSize — a non-divisor grid overlaps polyIdPrefixes and
+    //     leaves a tail of polynomials ungathered (silently wrong relations, no error).
+    if (sasGridDim == 0 || subCubeSize % sasGridDim != 0) return false;
+    // G2: the GATHER chunk must be a power of two — the kernel composes the polynomial index
+    //     as `polyIdPrefix | gray(poly)`, an OR that equals addition only when the prefix is a
+    //     multiple of the next power of two above the chunk.
+    uint32_t chunk = subCubeSize / sasGridDim;
+    if ((chunk & (chunk - 1)) != 0) return false;
+
+    // Derived: num_polyBlocksPerThreadBlock = subCubeSize / (metaGridDim * polyBlockSize).
+    // EXACTNESS FIRST: a floored quotient here would silently violate the SCATTER partition.
     uint32_t divisor = metaGridDim * polyBlockSize;
+    if (divisor == 0 || subCubeSize % divisor != 0) return false;
     uint32_t num_polyBlocksPerTB = subCubeSize / divisor;
+    if (num_polyBlocksPerTB == 0) return false;
 
-    // Must be power-of-two (mirrors POW2_CHECK at line 866)
-    if (num_polyBlocksPerTB == 0 || (num_polyBlocksPerTB & (num_polyBlocksPerTB - 1)) != 0)
+    // Must be power-of-two in the legacy/wide regimes (mirrors POW2_CHECK at line 866); on the
+    // narrow batch path no kernel reads its log2, so exactness above is the whole requirement.
+    if (pow2Required(P_SUB_CUBE_SIZE)
+        && (num_polyBlocksPerTB & (num_polyBlocksPerTB - 1)) != 0)
         return false;
 
     // EQUAL: num_polyBlocksPerTB * polyBlockSize * metaGridDim == subCubeSize (line 875)
@@ -204,7 +261,7 @@ bool KernelLaunchValidator::checkArithmeticConstraints(const Params8& p) const {
 bool KernelLaunchValidator::checkSharedMem(const Params8& p) const {
     size_t sharedMem_meta = static_cast<size_t>(p[P_BLOCKS_PER_CYC] * p[P_POLY_BLOCK_SIZE])
                           * sizeof(int);
-    // accumulatorBytes = 1 (uint8/narrow) reproduces the pre-S2 sizeof(uint8_t) exactly;
+    // accumulatorBytes = 1 (uint8/narrow) reproduces the legacy sizeof(uint8_t) exactly;
     // 2 (uint16/wide) matches the wide sieveAndScanBatchKernelWide blockEntries width.
     size_t sharedMem_sas  = static_cast<size_t>(sc_.sievingBlockSize) * sc_.accumulatorBytes
                           + 3u * sc_.bigPrimeStartIndex * sizeof(int);
@@ -223,7 +280,7 @@ bool KernelLaunchValidator::checkGlobalMem(const Params8& p) const {
     // bucketEntriesBytes() == the prior hand-rolled dev_globalBucketEntries term on
     // this candidate's geometry (subCubeSize=p[0] polys, numIntervals=p[1] blocks); the
     // budget sieveBucketBudget(totalGlobalMem,0,4,5) == (4*totalGlobalMem)/5 == 0.80*VRAM
-    // (S2; the operative kSieveBudget flipped from 3/4 to 4/5). This is the bucket-only
+    // (the operative kSieveBudget was flipped from 3/4 to 4/5). This is the bucket-only
     // gate; the autotune total-footprint OOM guard adds persistent+scratch+pp/LP+reserve.
     uint64_t mem = mpqs::sieve::bucketEntriesBytes(
         p[P_SUB_CUBE_SIZE], p[P_NUM_INTERVALS], sc_.globalBucketSize);
@@ -233,7 +290,7 @@ bool KernelLaunchValidator::checkGlobalMem(const Params8& p) const {
 }
 
 // ---------------------------------------------------------------------------
-// Total-footprint OOM guard (S2). Additive to checkGlobalMem; never looser.
+// Total-footprint OOM guard. Additive to checkGlobalMem; never looser.
 // ---------------------------------------------------------------------------
 
 bool KernelLaunchValidator::fitsTotalFootprint(const Params8& p,
@@ -294,13 +351,43 @@ bool KernelLaunchValidator::checkNonZeroDerived(const Params8& p) const {
         (2 * sc_.M) / (sc_.sievingBlockSize * p[P_NUM_INTERVALS]));
     uint32_t maxSubCube = std::min(32768u, (1u << sc_.shc_dim) / 2);
     uint32_t num_subCubes = maxSubCube / p[P_SUB_CUBE_SIZE];
-    uint32_t num_polyBlocksPerTB = p[P_SUB_CUBE_SIZE] / (p[P_META_GRID_DIM] * p[P_POLY_BLOCK_SIZE]);
+    // v1.0.6: exactness FIRST, then non-zero — a floored quotient is not a valid geometry
+    // (it silently violates the SCATTER exact partition), so reject it here as well.
+    const uint32_t meta_divisor = p[P_META_GRID_DIM] * p[P_POLY_BLOCK_SIZE];
+    if (meta_divisor == 0 || p[P_SUB_CUBE_SIZE] % meta_divisor != 0) return false;
+    if (p[P_BLOCKS_PER_CYC] == 0 || p[P_NUM_INTERVALS] % p[P_BLOCKS_PER_CYC] != 0) return false;
+    uint32_t num_polyBlocksPerTB = p[P_SUB_CUBE_SIZE] / meta_divisor;
     uint32_t num_metaSieveCycles = p[P_NUM_INTERVALS] / p[P_BLOCKS_PER_CYC];
 
     return num_sievingBlockBatches > 0
         && num_subCubes > 0
         && num_polyBlocksPerTB > 0
         && num_metaSieveCycles > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Admissible GATHER grids: { np / 2^j : 2^j divides np }  (v1.0.6)
+//
+// The batch GATHER kernel needs sasGridDim | np AND np/sasGridDim a power of two (G1/G2).
+// Enumerating np/2^j downward walks the admissible set from the LARGEST grid (chunk 1) to
+// the smallest, so the first value that is still >= min_sas, taken from the smallest end
+// upward, is the minimum admissible grid. For pow2 np the set is the full pow2 ladder
+// {1,2,...,np}, so the result equals "round min_sas up to the next power of two, clamped to
+// np" — byte-identical to the v1.0.5 behaviour on every pow2 tuple.
+// ---------------------------------------------------------------------------
+
+uint32_t admissibleSasGridDim(uint32_t np, uint32_t min_sas) {
+    if (np == 0) return 0;
+    // v2(np) = number of times 2 divides np; the admissible set is { np >> j : 0 <= j <= v2 }.
+    uint32_t v2 = 0;
+    for (uint32_t t = np; (t & 1u) == 0u; t >>= 1) ++v2;
+    // Walk from the SMALLEST admissible grid (np >> v2, the odd part) upward and take the
+    // first value that meets min_sas.
+    for (uint32_t j = v2 + 1; j-- > 0; ) {
+        const uint32_t g = np >> j;
+        if (g >= min_sas) return g;
+    }
+    return np;   // min_sas exceeds every admissible grid — clamp to the largest (chunk 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +419,8 @@ std::vector<Params8> enumerateValidConfigs(const KernelLaunchValidator& v) {
 
 SieveConstants buildSieveConstants(uint32_t shc_dim, uint32_t M,
                                    size_t maxSharedMemPerBlock,
-                                   bool use_wide, bool use_u8sat) {
+                                   bool use_wide, bool use_u8sat,
+                                   bool allow_nonpow2_geometry) {
     // Largest power of 2 <= x
     auto pow2leq = [](uint32_t x) -> uint32_t {
         return (x < 1) ? 0 : 1u << (31 - std::countl_zero(x));
@@ -342,10 +430,10 @@ SieveConstants buildSieveConstants(uint32_t shc_dim, uint32_t M,
     sc.shc_dim = shc_dim;
     sc.M       = M;
     // Sieving-block size from the smem budget. accumBytes = 2 (uint16 wide) halves the
-    // block; 1 (narrow OR Option A saturating-uint8 wide) restores it. Mirror
+    // block; 1 (narrow OR saturating-uint8 wide) restores it. Mirror
     // loadPartialCustomConfig exactly:  SB*(accumBytes + 12/32) <= (3/4)*maxShared =>
     // SB <= 24*maxShared/(32*accumBytes+12) (76 for uint16, 44 for u8sat). Narrow keeps
-    // the pre-S2 3*maxShared/4.
+    // the legacy 3*maxShared/4.
     const uint32_t maxSh     = static_cast<uint32_t>(maxSharedMemPerBlock);
     const uint32_t accumB    = use_wide ? (use_u8sat ? 1u : 2u) : 1u;
     const uint32_t wide_den  = 32u * accumB + 12u;   // 76 (uint16) or 44 (u8sat)
@@ -355,6 +443,10 @@ SieveConstants buildSieveConstants(uint32_t shc_dim, uint32_t M,
     sc.globalBucketSize   = sc.sievingBlockSize / 2;
     sc.bigPrimeStartIndex = sc.sievingBlockSize / 32;   // tracks the wide SB
     sc.accumulatorBytes   = accumB;
+    // v1.0.6: the SM-aligned geometry is a NARROW-path capability only — the wide (uint16 /
+    // u8sat) bucket footprint is proportional to np and its production regime already rides
+    // the retention boundary at np = 512. Never relax it here, whatever the caller asks.
+    sc.allow_nonpow2_geometry = allow_nonpow2_geometry && !use_wide;
     return sc;
 }
 
@@ -367,14 +459,16 @@ PreflightResult preflightKernelLaunch(
     uint32_t shc_dim,
     uint32_t M,
     int device_id,
-    bool use_wide, bool use_u8sat) {
+    bool use_wide, bool use_u8sat,
+    bool allow_nonpow2_geometry) {
 
     // 1. Query device properties and build SieveConstants
     cudaDeviceProp prop;
     std::memset(&prop, 0, sizeof(prop));
     cudaGetDeviceProperties(&prop, device_id);
 
-    SieveConstants sc = buildSieveConstants(shc_dim, M, prop.sharedMemPerBlock, use_wide, use_u8sat);
+    SieveConstants sc = buildSieveConstants(shc_dim, M, prop.sharedMemPerBlock, use_wide, use_u8sat,
+                                           allow_nonpow2_geometry);
 
     // 2. Validate
     KernelLaunchValidator validator(device_id, sc);
@@ -389,7 +483,8 @@ PreflightResult preflightKernelLaunch(
 PreflightResult preflightKernelLaunch(
     mpqs::MPQSConfig& config,
     uint32_t shc_dim,
-    uint32_t M) {
+    uint32_t M,
+    bool allow_nonpow2_geometry) {
 
     if (!config.useParams) {
         return {true, ""};  // Standard config path; no custom params to validate
@@ -408,15 +503,14 @@ PreflightResult preflightKernelLaunch(
         uint32_t work_units = total_polys * total_sieve_blocks;
         uint32_t min_sas = (work_units + maxRelationsPerBlock - 1) / maxRelationsPerBlock;
 
-        // Round up to next power of 2 (params must be powers of 2)
+        // Round up to the smallest ADMISSIBLE grid — a divisor of subCubeSize whose quotient
+        // (the GATHER chunk) is a power of two. For a power-of-two subCubeSize the admissible
+        // set is the power-of-two ladder, so this reproduces the previous "round up to the next
+        // power of 2" behaviour exactly; for an SM-aligned subCubeSize it lands on a grid the
+        // GATHER decomposition can actually use (e.g. np=864, min_sas=108 -> 108, not 128).
+        // v1.0.6.
         if (min_sas > 0) {
-            min_sas--;
-            min_sas |= min_sas >> 1;
-            min_sas |= min_sas >> 2;
-            min_sas |= min_sas >> 4;
-            min_sas |= min_sas >> 8;
-            min_sas |= min_sas >> 16;
-            min_sas++;
+            min_sas = admissibleSasGridDim(total_polys, min_sas);
         }
 
         if (config.params[P_SAS_GRID_DIM] < min_sas) {
@@ -450,7 +544,9 @@ PreflightResult preflightKernelLaunch(
     for (int i = 0; i < 8; ++i)
         params[i] = config.params[i];
 
-    return preflightKernelLaunch(params, shc_dim, M, config.device_id);
+    return preflightKernelLaunch(params, shc_dim, M, config.device_id,
+                                 /*use_wide=*/false, /*use_u8sat=*/false,
+                                 allow_nonpow2_geometry);
 }
 
 } // namespace mpqs::autotune

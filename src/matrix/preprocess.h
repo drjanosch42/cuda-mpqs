@@ -147,9 +147,9 @@ std::vector<uint32_t> selectKernelVectorRows(
 /// @param truncation_factor  > 0 enables M9c-post truncation, 0 disables it.
 /// @param compact_cycles     Max compact-merge cycles (default 5; 0 = single pass, no compaction).
 /// @param truncation_excess  Excess rows over (n_cols + 32) at truncation. Default 200.
-/// @param gf2_floor_factor   M12-S2 GF(2) col-diversity floor as fraction of
+/// @param gf2_floor_factor   GF(2) col-diversity floor as fraction of
 ///                           the initial post-singleton GF(2) col count. Default 0.5.
-/// @param gf2_min_floor      M12-S2 absolute lower bound on the GF(2) col floor. Default 8192.
+/// @param gf2_min_floor      Absolute lower bound on the GF(2) col floor. Default 8192.
 /// @param char_mode          NORM (default): product char cols via the norm symbol on
 ///                           the merged sqrt_Q (gpuProductCharCols_packed) — byte-identical
 ///                           to before. BRANCH (Stage 6): unpack the per-row char vector

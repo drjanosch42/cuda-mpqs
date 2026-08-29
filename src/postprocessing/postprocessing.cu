@@ -500,7 +500,7 @@ __global__ void find_first_bad_offset(
  * [47..32] XOR Sum of Factor Exponents (counts)
  * [31.. 0] XOR Sum of (Factor Index * Magic) ^ SignLogic
  *
- * Stage 4 invariant (M12-S5/S5b analogue): view.char_bits is DELIBERATELY excluded
+ * Stage 4 invariant: view.char_bits is DELIBERATELY excluded
  * from this hash. char_bits is a deterministic function of (ax+b), so two relations
  * with identical factorization carry identical char vectors — folding it in cannot
  * change dedup identity but would risk divergence from the cluster CPU dedup hash.
@@ -536,7 +536,7 @@ __global__ void compute_relation_hashes_soa(
     // Logic: xor sign * (1 << exponent of 2) into the dedup hash so that
     // two relations with identical factor sets but opposite Q-signs hash
     // distinctly.
-    // Encoding (canonical, see audit Appendix A): view.signs[idx] is uint8_t
+    // Encoding (canonical): view.signs[idx] is uint8_t
     // with {1 = positive Q, 0xFF = negative Q}. Use the M11c encoding-agnostic
     // "negative iff != 1" extraction (matches expanded_matrix.cpp:20,
     // gpu_batch_merge.cu:319, sqrt_step.cu:393).
@@ -617,6 +617,18 @@ __global__ void compute_new_lengths_kernel(
 // -----------------------------------------------------------------------------
 
 /**
+ * @brief Advances the device-side sieve-step counter by one batch.
+ *
+ * s_{k+1} = s_k + delta, with delta = sieve_batch_size (a-values launched per batch).
+ * Single-thread node: the counter is read only by yield_prediction_kernel on the same
+ * stream, so no atomics or fences are required. Exists so the step count survives CUDA
+ * graph capture, where a by-value host scalar would be baked at capture time.
+ */
+__global__ void advance_steps_kernel(uint64_t* __restrict__ steps, uint64_t delta) {
+    *steps += delta;
+}
+
+/**
  * @brief Single-thread kernel estimating whether enough relations have been
  *        collected to terminate sieving.
  *
@@ -629,22 +641,23 @@ __global__ void compute_new_lengths_kernel(
  * @param result        Mapped pinned PredictionResult (host-visible).
  * @param global_count  Device pointer to persistent batch relation counter.
  * @param target        Required number of relations (FB size + extra).
- * @param total_steps   Total sieve batches processed so far.
+ * @param total_steps   Device pointer to the cumulative sieve-step counter.
  * @param lp_stats      Device pointer to SLP pinned stats (nullable).
  */
 __global__ void yield_prediction_kernel(
     mpqs::postprocessing::PredictionResult* __restrict__ result,
     const uint64_t* __restrict__ global_count,
     uint32_t target,
-    uint64_t total_steps,
+    const uint64_t* __restrict__ total_steps,
     const mpqs::lp::SLPPinnedStats* __restrict__ lp_stats
 ) {
     // Current relation count (lower 32 bits — count never exceeds 2^32)
     uint32_t R = static_cast<uint32_t>(*global_count);
 
-    // Yield rate: relations per sieve step (total_steps is u64 — RSA-140 a-value counts
+    // Yield rate: relations per sieve step (the counter is u64 — RSA-140 a-value counts
     // exceed 2^32; the float division is value-preserving for the smaller-N regimes).
-    float lambda = (total_steps > 0) ? static_cast<float>(R) / static_cast<float>(total_steps) : 0.0f;
+    uint64_t steps = total_steps ? *total_steps : 0ull;
+    float lambda = (steps > 0) ? static_cast<float>(R) / static_cast<float>(steps) : 0.0f;
 
     // LP match rate and predicted LP yield
     float mu = 0.0f;
@@ -716,6 +729,7 @@ void DevicePostProcessingController::clearBuffers() {
     if (d_full_dual_counter) { cudaFree(d_full_dual_counter); d_full_dual_counter = nullptr; }
     if (d_partial_dual_counter) { cudaFree(d_partial_dual_counter); d_partial_dual_counter = nullptr; }
     if (d_persistent_dual_counter) { cudaFree(d_persistent_dual_counter); d_persistent_dual_counter = nullptr; }
+    if (d_prediction_steps_) { cudaFree(d_prediction_steps_); d_prediction_steps_ = nullptr; }
 
     if (d_full_batch) d_full_batch.reset();
     if (d_partial_batch) d_partial_batch.reset();
@@ -892,6 +906,11 @@ void DevicePostProcessingController::initiate(
         LOG(LOG_DEBUG_2) << "Prediction result: mapped pinned memory allocated.";
     }
 
+    // --- Device sieve-step counter (capture-safe: a by-value host scalar would be baked
+    //     into the graph at capture time; seeded per sieve leg via seedPredictionSteps) ---
+    CUDA_CHECK(cudaMalloc(&d_prediction_steps_, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(d_prediction_steps_, 0, sizeof(uint64_t)));
+
     // --- Buffer fill telemetry (mapped pinned memory for zero-sync host readback) ---
     {
         CUDA_CHECK(cudaHostAlloc(
@@ -914,6 +933,17 @@ void DevicePostProcessingController::initiate(
 
     // sets *d_current_accumulation_counter and accumulation_count to 0
     resetAccumulation();
+}
+
+void DevicePostProcessingController::seedPredictionSteps(uint64_t initial_steps,
+                                                          uint32_t per_batch_increment) {
+    prediction_step_increment_ = per_batch_increment;
+    if (!d_prediction_steps_) return;
+    CUDA_CHECK(cudaMemcpyAsync(d_prediction_steps_, &initial_steps, sizeof(uint64_t),
+                               cudaMemcpyHostToDevice, proc_stream));
+    // Safe here: this call site is outside every CUDA graph capture, and the sync keeps the
+    // lifetime of the host source scalar trivially correct.
+    CUDA_CHECK(cudaStreamSynchronize(proc_stream));
 }
 
 void DevicePostProcessingController::resetAccumulation() {
@@ -1584,9 +1614,14 @@ void DevicePostProcessingController::processBatchBufferedCandidates() {
             d_prediction_result,
             persistent_view.global_count,
             prediction_target_,
-            prediction_total_steps_,
+            d_prediction_steps_,
             d_lp_stats_
         );
+        // Advance AFTER the read: total_steps is the number of a-values launched BEFORE
+        // this batch (the host used to set it from current_step, which is incremented at
+        // the END of the loop body). Read-then-advance reproduces that exactly.
+        kernels::advance_steps_kernel<<<1, 1, 0, proc_stream>>>(
+            d_prediction_steps_, static_cast<uint64_t>(prediction_step_increment_));
     }
 
     // 8. Publish buffer fill telemetry (zero-sync, sub-microsecond)

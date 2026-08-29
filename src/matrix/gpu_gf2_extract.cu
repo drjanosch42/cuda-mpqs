@@ -7,7 +7,7 @@
 //   Pass 1: count odd-exponent entries per row
 //   Prefix sum → row offsets
 //   Pass 2: write column indices for odd-exponent entries
-// Produces binary CSR identical to binary XOR merge output (audit v4 §10.5).
+// Produces binary CSR identical to binary XOR merge output.
 
 #include "gpu_gf2_extract.cuh"
 #include "cuda_check.h"

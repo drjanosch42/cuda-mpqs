@@ -78,7 +78,7 @@ void AsyncNetworkDataTap::onBatchComplete(
     const uint64_t a_advanced =
         (a_values_advanced > 0) ? a_values_advanced : batch_a_values_;
 
-    // Option A: copy into a local TapSlot, then move into the ring.
+    // Copy into a local TapSlot, then move into the ring.
     // Vector copy triggers allocation + memcpy (~50us for RSA-100 batch sizes).
     // Still 24x faster than the 1.2ms synchronous serialize+send.
     TapSlot slot;

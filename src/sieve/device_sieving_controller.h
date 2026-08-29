@@ -46,13 +46,13 @@ public:
 
     /// Lightweight sieve benchmark: run num_subcubes subcubes (0 = full cube).
     /// Returns elapsed microseconds. Saves/restores ds_params state.
-    /// S2 (wide-autotune foundation): on the WIDE (uint16) accumulator path — where
+    /// Wide-autotune foundation: on the WIDE (uint16) accumulator path — where
     /// there is no non-batch kernel — this dispatches to sieveMiniBatch() (the real
     /// batch-wide probe) instead of returning the -1.0f "wide has no probe" sentinel.
-    /// The NARROW (uint8) path is byte-for-byte the pre-S2 non-batch probe.
+    /// The NARROW (uint8) path is byte-for-byte the original non-batch probe.
     float sieveMini(uint32_t num_subcubes);
 
-    /// S3 (scale-representative harness, wide-only): drive the REAL batch pipeline
+    /// Scale-representative harness (wide-only): drive the REAL batch pipeline
     /// (mpqs::sieve::runSievingBatch → sieveAndScanBatchKernelWide + compact) over a
     /// warm-up-then-measure WALL-CLOCK window and return a candidate-survivors/sec RATE
     /// (Δdev_probe_pp_counter / Δwall-seconds). HIGHER = faster/better (the wide objective
@@ -60,19 +60,19 @@ public:
     /// ⇒ a fixed batch count is unrepresentative), so `repeats` is IGNORED — the window
     /// (probe_window_sec_ + probe_warmup_sec_, set via setProbeWindow) governs the duration.
     /// Returns -1.0f if setup/timing failed. Only ever called from sieveMini() when
-    /// isWideAccumulator() (S3) and from sieveMiniStandardWide() (S4 floor).
+    /// isWideAccumulator() and from sieveMiniStandardWide() (the acceptance floor).
     float sieveMiniBatch(uint32_t repeats);
 
-    /// S4 (floor gate, wide-only): load the STANDARD wide config (loadStandardConfig —
+    /// Floor gate (wide-only): load the STANDARD wide config (loadStandardConfig —
     /// the exact geometry that ships when autotune is OFF / useParams==false) into this
-    /// probe siever, resize the sieve scratch to match, and measure it under the SAME S3
+    /// probe siever, resize the sieve scratch to match, and measure it under the SAME
     /// window harness as the search candidates. Returns the standard config's
     /// survivors/sec RATE (the acceptance floor), or -1.0f if not wide / setup failed.
     /// Preserves the staged probe batch + pp scratch (loadSievingDataParamTest does not
     /// touch them). NARROW callers never reach this (wide-gated).
     float sieveMiniStandardWide();
 
-    /// S5 (wide autotune search-space seeding, wide-only): the occupancy-optimal GATHER
+    /// Wide autotune search-space seeding (wide-only): the occupancy-optimal GATHER
     /// (sieve-and-scan) blockDim for the wide kernel sieveAndScanBatchKernelWide. Evaluates
     /// each candidate blockDim via cudaOccupancyMaxActiveBlocksPerMultiprocessor at the wide
     /// GATHER shared-memory footprint (ss_conf.sharedMemReq + shc_dim*sizeof(uint512) — the
@@ -86,7 +86,7 @@ public:
     /// state; never reached on the narrow (uint8) path.
     uint32_t wideGatherOccupancyBlockDim(const uint32_t* candidates, uint32_t count) const;
 
-    /// S3 (wide-only): set the measurement window (survivors/sec is measured over
+    /// Wide-only: set the measurement window (survivors/sec is measured over
     /// window_sec of wall clock after a warmup_sec warm-up prefix). The optimizer sets
     /// this before each wide eval so the harness auto-scales by wall time and can shrink
     /// toward a floor when the autotune budget is tight. Never read on the narrow path.
@@ -208,12 +208,12 @@ public:
     /// One of 2 permitted submodule changes (Spec Section 8.3, Section 11.1).
     void setExternalStop(std::atomic<bool>* flag) { external_stop_ = flag; }
 
-    /// S1 (dual-path accumulator): CLI/config override for the accumulator-width
+    /// Dual-path accumulator: CLI/config override for the accumulator-width
     /// dispatch predicate. 0 = auto (predicate decides), 1 = force u8, 2 = force u16.
     /// Consumed in initiate() when computing use_wide_accumulator_.
     void setAccumulatorMode(int mode) { accumulator_mode_ = mode; }
 
-    /// Option A (wide saturating-uint8 accumulator): CLI/config override for the
+    /// Wide saturating-uint8 accumulator: CLI/config override for the
     /// wide-accumulator WIDTH dispatch. Only consulted when use_wide_accumulator_
     /// is true. 0 = auto (use saturating-uint8 iff the config-time exactness gate
     /// APV_max-threshold<=254 holds, else uint16), 1 = force u8sat (still honours
@@ -221,7 +221,7 @@ public:
     /// Consumed in initiate() when computing wide_u8sat_selected_.
     void setWideAccumMode(int mode) { wide_accum_mode_ = mode; }
 
-    /// Option A: true iff this siever resolved to the SATURATING-uint8 wide
+    /// True iff this siever resolved to the SATURATING-uint8 wide
     /// accumulator (use_wide AND the exactness gate holds AND not forced to u16).
     /// Read by runSievingBatch() to pick the u8sat kernel and by the config
     /// loaders to size SB at the 1-byte width. Narrow and uint16-wide see false.
@@ -253,7 +253,7 @@ public:
     /// polynomials. Wide path only (ensureProbeBatchSetup is never reached on narrow).
     void setAutotuneProbePolys(uint32_t n) { autotune_probe_polys_override_ = n; }
 
-    /// S1 (wide autotune foundation): true iff this siever resolved to the wide
+    /// True iff this siever resolved to the wide
     /// (uint16) accumulator path in initiate() (predicate OR --sieve_accumulator
     /// override). Read by the autotune probe/validator to select width-aware
     /// geometry and by loadPartialCustomConfig()'s num_polys clamp. Narrow
@@ -296,6 +296,43 @@ public:
     /// so an over-large factor degrades num_polys / is validator-rejected, never OOM-crashes.
     /// Consumed only at config-load time; call before either loader.
     void setBucketSizeFactor(double f) { bucket_size_factor_override_ = f; }
+
+    /// v1.0.6: override gs_conf.sievingBlockSize on the NARROW BATCH --params path.
+    /// n == 0 (default) = OFF: the loader keeps SB = min(M, pow2leq(3/4 * maxSharedMemPerBlock)),
+    /// byte-identical to v1.0.5 on every path. n > 0 replaces that derivation inside
+    /// loadPartialCustomConfig ONLY (loadStandardConfig is deliberately untouched, so no
+    /// non---params run can change). SB is the GATHER shared-memory accumulator length, so
+    /// lowering it is the ONLY lever that can bring ss_conf.sharedMemReq under the co-residency
+    /// threshold at production M -- shared memory is the measured sole obstruction
+    /// (launch__occupancy_limit_shared_mem = 1 vs _registers = 2, A100 job 34135902).
+    /// Caller must pass a power of two in [256, M] (validated at the CLI; downstream
+    /// POW2_CHECK + LEQ_CHECK + the narrow-batch occupancy preflight). LOWERING SB shrinks a
+    /// single launch's interval coverage, so --params field 2 (numIntervals) must be raised in
+    /// step to keep numIntervals * SB >= 2M -- enforced by narrowBatchCoverageOk() in
+    /// validateConfigs, never silently accepted. Ignored (and rejected by validateConfigs) on
+    /// the wide and legacy paths. Call before initiate().
+    void setSievingBlockSizeOverride(uint32_t n) { sb_override_ = n; }
+
+    /// v1.0.6: override gs_conf.bigPrimeStartIndex on the NARROW BATCH --params path.
+    /// n == 0 (default) = OFF: the loader keeps bPSI = sievingBlockSize/32, byte-identical.
+    /// n > 0 replaces that derivation inside loadPartialCustomConfig ONLY. bPSI splits the
+    /// factor base between GATHER's in-block path [0,bPSI) and SCATTER's bucketed path
+    /// [bPSI,fb_size), and costs 3*bPSI*4 bytes of the GATHER shared-memory budget. Because the
+    /// loader derivation is unconditionally bPSI = SB/32, an SB override alone ALSO moves primes
+    /// across that split; this knob cancels the coupling so the two effects can be attributed
+    /// separately. Caller must pass n > midPrimeStartIndex (= 32) and n <= fb_size (validated at
+    /// the CLI): at n <= 32 the mid-prime loops [midPrimeStart, bPSI) invert and silently drop
+    /// the entire mid-prime band. Power-of-two is NOT required (every consumer is a grid-stride
+    /// loop). Ignored (and rejected by validateConfigs) on the wide and legacy paths.
+    /// Call before initiate().
+    void setBigPrimeStartOverride(uint32_t n) { bpsi_override_ = n; }
+
+    /// v1.0.6: enable getBucketOverflowStats() on the NARROW path. false (default) = OFF:
+    /// the reader returns false on narrow exactly as in v1.0.5, so the narrow production hot
+    /// path takes no extra DtoH copy and no cudaStreamSynchronize on the siever stream at the
+    /// ~5 s stats cadence. true = the same read the wide path already performs. Wide behaviour
+    /// is unaffected either way (wide always reports). Set from --sieve_bucket_overflow_stats.
+    void setNarrowOverflowStats(bool on) { narrow_overflow_stats_ = on; }
 
     /// Save snapshot of current a-factor state. Call immediately after initiate()
     /// and init_a_factors() completes, before any sieving begins.
@@ -366,8 +403,7 @@ public:
 	        cudaFree(dev_pointers.dev_job_B_flat);
 	    if(dev_pointers.dev_job_factor_indices)
 	        cudaFree(dev_pointers.dev_job_factor_indices);
-	    if(h_pinned_factor_indices_)
-	        { cudaFreeHost(h_pinned_factor_indices_); h_pinned_factor_indices_ = nullptr; }
+	    releasePinnedIndexStaging();
 	}
         // Do NOT free FactorBase or RootN here as they might be used by post processing
     }
@@ -402,11 +438,36 @@ private:
 
     mpqs::postprocessing::DoubleBuffer* current_pp_buffer;
 
-    // Pinned host buffer for truly async H2D copies in prepareSievingBatch().
+    // Pinned host staging for truly async H2D copies in prepareSievingBatch().
     // Without pinning, cudaMemcpyAsync from pageable memory forces an implicit
     // stream synchronization, creating a pipeline bubble every batch.
-    uint32_t* h_pinned_factor_indices_ = nullptr;
-    size_t    pinned_factor_indices_capacity_ = 0;
+    //
+    // DOUBLE-BUFFERED + EVENT-GATED (v1.0.6). A single reused slot is a
+    // correctness hazard: the host memcpy into the slot is immediate while the
+    // cudaMemcpyAsync that consumes it is stream-deferred, so with the host Δ
+    // batches ahead in the launch queue every in-flight H2D reads whichever index
+    // set the host wrote LAST. In steady state that is a pure relabeling (batch b
+    // sieves the set prepared for b+Δ, batch b+Δ's own set is skipped); at any host
+    // stop — sieve-loop exit, checkpoint quiesce — the Δ still-queued copies all
+    // read the SAME final set and the final polynomial batch is sieved Δ times,
+    // re-emitting its candidates and (with LP on) its partials verbatim. Gating the
+    // host write on completion of the H2D that last consumed the slot closes the
+    // overwrite window. kPinnedIndexSlots = 2 keeps one batch in flight while the
+    // host stages the next — the discipline the graph path already uses for its
+    // staged slots (orchestrator.cpp, stage_done[]).
+    // Root-caused and fixed in v1.0.6 (2026-08-23).
+    static constexpr uint32_t kPinnedIndexSlots = 2;
+
+    /// Allocate (or re-allocate) the pinned index staging and its per-slot
+    /// completion events. @p elems_per_slot = batch_size * shc_dim.
+    void allocatePinnedIndexStaging(size_t elems_per_slot);
+    /// Free the pinned staging and destroy the per-slot events. Idempotent.
+    void releasePinnedIndexStaging();
+
+    uint32_t* h_pinned_factor_indices_ = nullptr;   ///< kPinnedIndexSlots contiguous slots
+    size_t    pinned_factor_indices_capacity_ = 0;  ///< elements PER SLOT
+    cudaEvent_t pinned_h2d_done_[kPinnedIndexSlots] = {};
+    uint32_t    pinned_slot_ = 0;                   ///< slot claimed by the next call
     std::atomic<bool>* external_stop_ = nullptr;  ///< External stop signal (cluster mode)
     AFactorsSnapshot snapshot_;  ///< Saved after initiate() + init_a_factors()
 
@@ -415,15 +476,22 @@ private:
     uint64_t max_total_sieve_bytes_ = 0;
     SeedClampInfo last_seed_clamp_;  ///< Filled by loadStandardConfig() when the knob binds.
 
-    // S1 (dual-path sieve accumulator): dispatch-predicate state.
+    // Dual-path sieve accumulator: dispatch-predicate state.
     // accumulator_mode_: 0 = auto (predicate decides), 1 = force u8, 2 = force u16
     //   (set via setAccumulatorMode() before initiate()).
     // use_wide_accumulator_: computed in initiate() from f_data.a.msb()/f_data.M.
-    //   INERT at S1 (compute-and-log only) — no launch/config depends on it yet.
+    //   Computed once per initiate(); it selects the batch-sieve kernel width.
     int  accumulator_mode_     = 0;
+    /// v1.0.6: set by loadPartialCustomConfig when a pinned tuple violates an
+    /// invariant the loader itself can prove (currently: metaGridDim*polyBlockSize must divide
+    /// num_polysPerSieveCall exactly). validateConfigs consumes and CLEARS it, so a later
+    /// successful load starts clean. Loader-level rejection keeps the diagnostic specific —
+    /// validateConfigs would otherwise only report the resulting EQUAL_CHECK mismatch.
+    bool custom_config_invalid_ = false;
+
     bool use_wide_accumulator_ = false;
 
-    // Option A (wide saturating-uint8 accumulator): width dispatch inside the wide
+    // Wide saturating-uint8 accumulator: width dispatch inside the wide
     // regime. wide_accum_mode_: 0 = auto (gate decides), 1 = force u8sat (gate-honoured),
     // 2 = force uint16. wide_u8sat_selected_ computed in initiate() (only when
     // use_wide_accumulator_). Narrow path leaves both at their defaults (u8sat=false).
@@ -458,6 +526,20 @@ private:
     /// both config loaders where globalBucketSize is assigned.
     double bucket_size_factor_override_ = 0.0;
 
+    /// v1.0.6 --sieve_block_size / --sieve_big_prime_start overrides. 0 = OFF (the loader's own
+    /// derivation runs, byte-identical to v1.0.5). Consumed ONLY inside loadPartialCustomConfig,
+    /// at the derivation site of each field, so every quantity derived from them
+    /// (log2_sievingBlockSize, globalBucketSize, ss_conf.sharedMemReq) follows automatically and
+    /// there is no second site to keep in sync. Both are additionally gated on
+    /// !use_wide_accumulator_ at the point of use and rejected by validateConfigs on the wide or
+    /// legacy paths. See setSievingBlockSizeOverride() / setBigPrimeStartOverride().
+    uint32_t sb_override_ = 0;
+    uint32_t bpsi_override_ = 0;
+
+    /// v1.0.6 --sieve_bucket_overflow_stats. false = OFF (narrow reports no overflow stats,
+    /// byte-identical to v1.0.5). See setNarrowOverflowStats() and getBucketOverflowStats().
+    bool narrow_overflow_stats_ = false;
+
     /// Resolve globalBucketSize for a given sieving-block size, honoring the ablation knob.
     /// override <= 0 (default) returns SB/2 EXACTLY — this is the byte-identical legacy path.
     /// override > 0 returns round(override*SB), floored at 1 slot. globalBucketSize need not
@@ -471,7 +553,7 @@ private:
         return v < 1u ? 1u : v;
     }
 
-    // ----- S2 (wide-autotune foundation): batch-wide probe scratch state -----
+    // ----- Wide-autotune foundation: batch-wide probe scratch state -----
     // The wide probe (sieveMiniBatch) drives the REAL batch path, which needs the
     // batch-context job arrays + a postprocessing scratch that the autotune ephemeral
     // siever never allocates (it only calls loadData(), not allocateBatchBuffers() /
@@ -484,7 +566,7 @@ private:
     uint32_t* dev_probe_pp_counter_ = nullptr;///< probe-owned pp fill counter (compact atomicAdd target)
     void*     dev_probe_pp_accum_   = nullptr;///< probe-owned DenseCandidate scratch (compact output)
     uint32_t  probe_pp_capacity_    = 0;      ///< capacity (entries) of dev_probe_pp_accum_
-    /// S3 (scale-representative harness): the wall-clock measurement window and warm-up
+    /// Scale-representative harness: the wall-clock measurement window and warm-up
     /// prefix (seconds) used by sieveMiniBatch(). Defaults give a stable, repeatable rate;
     /// the optimizer overrides via setProbeWindow() to auto-scale and honour the budget.
     double    probe_window_sec_     = 10.0;   ///< survivors/sec measured over this wall window

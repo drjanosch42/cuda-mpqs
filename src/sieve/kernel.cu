@@ -57,7 +57,7 @@ namespace mpqs {
 namespace sieve {
 
 // -----------------------------------------------------------------------------
-// RSA-155 dual-path wide accumulator — SATURATING uint8 variant (Option A).
+// RSA-155 dual-path wide accumulator — SATURATING uint8 variant.
 //
 // Restores the wide sievingBlockSize (SB) to narrow's full width by keeping a
 // 1-byte accumulator, but CLAMPS every add at 255 instead of wrapping. Under the
@@ -76,7 +76,7 @@ namespace sieve {
 // sub-lattices per thread) and saturates with a plain clamped store (no atomic).
 //
 // NEW symbol: the legacy ATOMIC_BYTE_ADD* macros and atomicByteAdd() above are
-// byte-for-byte untouched (tools/sieve/assert_legacy_untouched.sh).
+// byte-for-byte untouched.
 __device__ __forceinline__
 void atomicByteAddSat(uint8_t* array, int index, uint32_t x) {
     uint32_t* base  = (uint32_t*)(array + (index & (~3)));
@@ -661,7 +661,7 @@ void loadSievingDataParamTest(std::vector<uint32_t>& factorBase,
     devicePointers& dev_pointers){
     //allocate memory
     //
-    // Scratch-zeroing parity with the batch path (audit S2-follow-up): the batch
+    // Scratch-zeroing parity with the batch path: the batch
     // allocator (DeviceSievingController::allocateBatchBuffers) zeros
     // dev_blockRelationCounts, and clearCandidates() zeros dev_candidateRelations
     // before every sieve. cudaMalloc returns UNINITIALIZED device memory, so this
@@ -915,7 +915,7 @@ int excludeNonRelations(
 /*
  * WIDE (uint16) FORK of excludeNonRelations (RSA-155 dual-path accumulator).
  * Near-verbatim copy; ONLY the blockEntries width changes (uint8_t* -> uint16_t*).
- * Dead code until S4 dispatch. Enforced by tools/sieve/assert_fork_widthdiff.sh.
+ * Reached only through the wide accumulator dispatch in runSievingBatch().
  */
 __device__
 int excludeNonRelationsWide(
@@ -1434,8 +1434,8 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
 // WIDE (uint16) FORK of sieveAndScanBatchKernel (RSA-155 dual-path accumulator).
 // Near-verbatim copy; width-only diff (uint16 blockEntries + ATOMIC_HALF_ADD* +
 // excludeNonRelationsWide call). Same control flow/ordering as the legacy kernel;
-// the accumulator simply no longer wraps at 255. Dead code until S4 dispatch.
-// Enforced by tools/sieve/assert_fork_widthdiff.sh.
+// the accumulator simply no longer wraps at 255. Reached only through the wide
+// accumulator dispatch in runSievingBatch().
 // -----------------------------------------------------------------------------
 __global__ void __launch_bounds__(1024) sieveAndScanBatchKernelWide(
     devicePointers dev_pointers,
@@ -1742,7 +1742,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernelWide(
 }
 
 // -----------------------------------------------------------------------------
-// SATURATING-uint8 wide accumulator kernel (RSA-155 dual-path, Option A).
+// SATURATING-uint8 wide accumulator kernel (RSA-155 dual-path).
 // A copy of the legacy narrow sieveAndScanBatchKernel — uint8 blockEntries,
 // excludeNonRelations (uint8), ATOMIC_BYTE_ADD_RETURN backward scan — with the
 // ONLY change being that the FIVE forward-accumulation sites SATURATE at 255
@@ -2562,8 +2562,8 @@ void runSievingBatch(
     int num_steps,
     int start_batch_index,
     cudaStream_t stream,
-    bool use_wide,  // S4: default (=false) declared in kernel.cuh; omitted here (same-TU rule)
-    bool wide_u8sat  // Option A: when use_wide, dispatch the saturating-uint8 wide kernel
+    bool use_wide,  // default (=false) declared in kernel.cuh; omitted here (same-TU rule)
+    bool wide_u8sat  // when use_wide, dispatch the saturating-uint8 wide kernel
 ) {
     // Pre-calculate grid dimensions to avoid overhead inside the loop
     // 1. Reset Kernel Config
@@ -2681,11 +2681,11 @@ void runSievingBatch(
         #endif
 
         // Step 4: Sieve & Scan (Produce Relation Candidates + Block Counts)
-        // S4 dispatch: single launch-ternary. sieve_smem is already wide-sized by S3's
+        // Width dispatch: single launch-ternary. sieve_smem is already wide-sized by the
         // config function when use_wide, so no smem branch is needed. When use_wide==false the
-        // else-branch launch is character-for-character the pre-S4 legacy launch (item 9).
+        // else-branch launch is character-for-character the original legacy launch.
         if (use_wide && wide_u8sat) {
-            // Option A: saturating-uint8 wide accumulator (restored SB). Bit-for-bit
+            // Saturating-uint8 wide accumulator (restored SB). Bit-for-bit
             // equivalent to the uint16 kernel in candidate selection under the
             // config-time exactness gate (checked host-side in initiate()).
             sieveAndScanBatchKernelWideU8Sat<<<sieve_grid, sieve_block, sieve_smem, stream>>>(

@@ -4,7 +4,7 @@
 //
 // GF(2) extraction from packed merged CSR (M9f).
 // Two-pass: count odd-exponent entries per row → prefix sum → write col_indices.
-// Produces binary CSR identical to the result of binary XOR merges (audit v4 §10.5).
+// Produces binary CSR identical to the result of binary XOR merges.
 
 #pragma once
 
@@ -33,7 +33,7 @@ struct GF2ExtractionResult {
 /// 2. Filter: keep entries with odd exponents, emit column indices only.
 ///
 /// The resulting CSR is identical to the binary CSR that would result from
-/// performing all merges as GF(2) XOR operations (proof in audit v4 §10.5).
+/// performing all merges as GF(2) XOR operations.
 ///
 /// @param csr           Original packed CSR (post-singleton, device-resident).
 /// @param merge_result  Result from gpuBatchMerge() — workspace + h_row_ptr.

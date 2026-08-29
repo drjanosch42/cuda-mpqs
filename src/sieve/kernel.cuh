@@ -19,6 +19,19 @@ namespace sieve {
 
 __global__ void globalMetaSieveKernel(devicePointers dev_pointers, fixedSievingParams fs_params, dynamicSievingParams ds_params, generalSievingConfig gs_conf, globalMetaSieveConfig gms_conf);
 
+// Batch (SCATTER) meta-sieve. Declared here — the definition in kernel.cu is UNCHANGED —
+// so the host controller can pass its address to cudaOccupancyMaxActiveBlocksPerMultiprocessor
+// for the v1.0.6 SM-aligned-geometry occupancy gate (launch parameters are pre-validated
+// via the CUDA occupancy API before any launch).
+__global__ void globalMetaSieveBatchKernel(
+    devicePointers dev_pointers,
+    fixedSievingParams fs_params,
+    int current_step,
+    int subCube,
+    int sieveIntervalStart,
+    generalSievingConfig gs_conf,
+    globalMetaSieveConfig gms_conf);
+
 __global__ void sieveAndScanKernel(devicePointers dev_pointers, fixedSievingParams fs_params, dynamicSievingParams ds_params, generalSievingConfig gs_conf, sieveAndScanConfig ss_conf);
 __global__ void sieveAndScanBatchKernel(
     devicePointers dev_pointers,
@@ -47,7 +60,7 @@ __global__ void sieveAndScanBatchKernelWide(
     generalSievingConfig gs_conf,
     sieveAndScanConfig ss_conf); // We want gridDim.x blocks with size of blockDim.x
 
-// RSA-155 dual-path SATURATING-uint8 wide accumulator kernel (Option A).
+// RSA-155 dual-path SATURATING-uint8 wide accumulator kernel.
 // Copy of the legacy narrow sieveAndScanBatchKernel with the five forward-
 // accumulation sites saturating at 255 (see kernel.cu). Restores SB to narrow's
 // full width while staying bit-for-bit equivalent to sieveAndScanBatchKernelWide
@@ -312,8 +325,8 @@ void runSievingBatch(
     int num_steps,
     int start_batch_index,
     cudaStream_t stream,
-    bool use_wide = false,  // S4: select sieveAndScanBatchKernelWide when true (default false = legacy)
-    bool wide_u8sat = false  // Option A: when use_wide, dispatch the saturating-uint8 wide kernel
+    bool use_wide = false,  // select sieveAndScanBatchKernelWide when true (default false = legacy)
+    bool wide_u8sat = false  // when use_wide, dispatch the saturating-uint8 wide kernel
 );
 
 } // namespace sieve

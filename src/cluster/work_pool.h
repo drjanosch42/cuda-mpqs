@@ -8,7 +8,8 @@
 /// @file work_pool.h
 /// @brief Thread-safe polynomial work-unit pool with tracked-checkout for fault tolerance.
 ///
-/// S5 rewrite: replaces linear allocator with a checked-out/completed/reclaimed model.
+/// Tracked-checkout rewrite: replaces the linear allocator with a
+/// checked-out/completed/reclaimed model.
 /// Each checkout is assigned a unique chunk_id and tracked in in_flight_.
 /// Reclaimed work (from dead workers) is served before advancing the linear cursor.
 
@@ -44,7 +45,7 @@ public:
     /// @param unit_size Default work unit size for legacy requestWork() (default: 64)
     WorkPool(uint64_t a_start, uint64_t total_a, uint32_t unit_size = 64);
 
-    // --- S2 legacy interface (backward compat, wraps checkoutWork) ---
+    // --- Legacy interface (backward compat, wraps checkoutWork) ---
 
     /// Request a default-sized work unit. Returns nullopt if exhausted.
     std::optional<WorkUnit> requestWork();
@@ -58,7 +59,7 @@ public:
     /// True if no unassigned a-values remain (linear exhausted AND returned_ empty).
     bool exhausted() const;
 
-    // --- S5: tracked checkout ---
+    // --- Tracked checkout ---
 
     /// Checkout a chunk. Assigns unique chunk_id. Records in in_flight_.
     /// Serves returned_ (reclaimed) work before advancing the linear cursor.
@@ -98,7 +99,7 @@ public:
     /// Total a-values remaining OR in-flight (useful for "is all work done?" check).
     uint64_t remainingOrInFlight() const;
 
-    // --- S6: cursor accessors for coordinator checkpoint ---
+    // --- Cursor accessors for coordinator checkpoint ---
 
     /// Current linear cursor position (next unassigned a-value index).
     uint64_t nextCursor() const {
@@ -112,7 +113,7 @@ public:
         return end_;
     }
 
-    /// Completed contiguous-prefix cursor (S3 coordinator checkpoint, B2).
+    /// Completed contiguous-prefix cursor (coordinator checkpoint).
     ///
     /// Returns the largest cursor C such that EVERY a-index in [a_start, C) has been
     /// fully sieved (checked out AND completed). Computed as

@@ -113,33 +113,101 @@ setup, parameters, and launch examples.
 
 ### Factorization records
 
-- **RSA-155 (512 bits, 155 decimal digits) factored 2026-07-14** on a 16-node
-  H100 cluster (64 GPUs). Total **700.64 GPU-hours**: sieving 689.74 GPU-h on
-  64× H100 across 16 nodes (10.78 h wall-clock), linear algebra 10.90 GPU-h on a
-  single H100 (10.90 h wall-clock). 17.27 M relations collected (41.4 % via the
-  single large-prime variant); Block Wiedemann on a 16.7 M × 15.67 M GF(2)
-  matrix with 684 M nonzeros. Result: two 78-digit primes, product-verified.
-  Total energy ≈ 242 kWh.
-- **RSA-140 (463 bits) factored 2026-06-29** on the same pipeline: ≈ 104
-  GPU-hours — sieving on 16× H100 (6 h 28 m wall-clock) and linear algebra in
-  21 m 31 s on a single H100. Result: two 70-digit primes, product-verified.
+Every result below is product-verified — the pipeline recomputes `p × q` and checks
+it against `N` — and was produced by the standard pipeline, not by a special-cased
+run. GPU-hours are summed over all participating GPUs; wall-clock is given
+separately.
 
-**Record RSA-100 runtime:** the full pipeline factors RSA-100 (100 decimal
-digits) end-to-end in **51.12 s** on an NVIDIA H100 SXM — the per-GPU breakdown
-is in the table below.
+| Modulus | Bits | Factored | Sieve hardware | Sieve | Linear algebra | Total | Energy |
+|---------|-----:|----------|----------------|-------|----------------|------:|--------|
+| RSA-155 | 512 | 2026-07-14 | 64× H100, 16 nodes | 689.74 GPU-h (10.78 h wall) | 10.90 GPU-h, 1× H100 | **700.64 GPU-h** | 242.26 kWh |
+| RSA-150 | 496 | 2026-08-23 | 64× H100, 16 nodes | 295.18 GPU-h (4.61 h wall) | 7.68 GPU-h, 1× H100 | **302.86 GPU-h** | 107.506 kWh |
+| RSA-140 | 463 | 2026-06-29 | 16× H100, 4 nodes | ≈ 103.5 GPU-h (6 h 28 m wall) | 0.36 GPU-h, 1× H100 | **103.9 GPU-h** | not measured |
+| RSA-130 | 430 | 2026-06-22 | 8× A100, 2 nodes | 25.67 GPU-h (3.21 h wall) | 0.08 GPU-h, 1× A100 | **25.75 GPU-h** | not measured |
+| RSA-120 | 397 | 2026-06-06 | 1× RTX 5070 Ti | 10,498 s | 109 s | **2.947 h** | not measured |
+
+- **RSA-155** — two 78-digit primes. 17,272,258 relations, 41.4 % of them contributed
+  by the single large-prime variant; Block Wiedemann on a
+  16,700,000 × 15,666,202 GF(2) matrix with 683,983,246 nonzeros. Sieve
+  configuration `--fb_bound 600000000 --sieve_bound 8388608 --lp1_bound 80000000000000
+  --bucket_size_factor 1.0`. The 41 % large-prime fraction is structural to
+  `fb_bound = 600M`, not a tuning shortfall.
+- **RSA-150** — two 75-digit (248-bit) primes. 17,269,643 relations at 44.90 %
+  large-prime fraction, sieved in 4.61 h wall-clock on 64 H100 GPUs; Block Wiedemann
+  on a 16,700,000 × 15,663,546 GF(2) matrix with 690,586,752 nonzeros, 7.675 h on a
+  single H100 (1.796 kWh) at Block Wiedemann block width 256. Sieve configuration
+  `--fb_bound 600000000 --sieve_bound 8388608 --lp1_bound 200000000000000
+  --bucket_size_factor 1.0`. The linear algebra was run twice: the quoted 7.68 GPU-h is
+  the block-width-256 run of record, while an earlier run of the same matrix at block
+  width 128 took 20.60 GPU-h, so the machine time actually expended across the campaign
+  was 323.45 GPU-h / 111.213 kWh. Block width 256 is the default; 128 is not
+  recommended.
+- **RSA-140** — two 70-digit primes. 3,027,706 relations at 56.8 % large-prime
+  fraction; matrix 3,027,706 × 2,059,597 with 123.5 M nonzeros, solved in 21 m 31 s on
+  one H100. Sieve configuration `--fb_bound 70000000 --sieve_bound 524288 --lp1_bound
+  60000000000000`. That run used `--dedup_safety_factor 1.4` and over-collected roughly
+  25 % of its relations; at the 1.05 default the same configuration projects to
+  ≈ 78 GPU-h, but that has not been measured.
+- **RSA-130** — two 65-digit primes. 1,023,475 relations at 51.8 % large-prime
+  fraction on 8 A100 GPUs across 2 nodes (88.6 relations/s cluster-wide), end to end in
+  ≈ 3 h 17 m. Sieve configuration `--fb_bound 30000000 --sieve_bound 131072 --lp1_bound
+  13000000000000 --sieve_batch_size 16 --cuda_graph_unroll 4 --matrix_mode legacy`.
+- **RSA-120** — single-GPU record: 10,609 s (2 h 56 m 49 s) end to end on one
+  RTX 5070 Ti, 48.7 % large-prime fraction. Configuration `--fb_bound 24000000
+  --sieve_bound 131072 --lp1_bound 1000000000000 --lp1_max_witnesses 16M
+  --sieve_batch_size 16 --cuda_graph_unroll 4 --lp_interval 1 --matrix_mode legacy
+  --autotune_stage1`.
+
+**Record RSA-100 runtime:** the full pipeline factors RSA-100 (100 decimal digits)
+end-to-end in **50.12 s** on a single NVIDIA H100 SXM under v1.0.6 — mean of three
+product-verified runs, fastest run 49.99 s — with `--fb_bound 5500000 --sieve_bound
+524288 --lp1_bound 1000000000000 --sieve_batch_size 8 --cuda_graph_unroll 0
+--params 1024,8,4,8,256,1024,256,1024 --matrix_mode legacy --char_mode none`.
+The per-GPU breakdown is in the table below.
 
 ### RSA-100 across GPU generations
 
-End-to-end RSA-100 (100-digit) full-pipeline factorization time across NVIDIA
-GPUs, ordered by CUDA-core count:
+End-to-end RSA-100 (100-digit) full-pipeline factorization time across NVIDIA GPUs,
+ordered by CUDA-core count. Each device runs its own tuned configuration, so a row is
+a measurement of that device at that configuration, not a device-versus-device ratio:
 
-| GPU | Architecture (CC) | CUDA cores | RSA-100 (full pipeline) | Version |
-|-----|-------------------|-----------:|-------------------------|---------|
-| Jetson Orin Nano Super 8 GB (25 W) | Ampere (8.7) | 1,024 | 39 m 56 s | 1.0.5 |
-| TITAN RTX 24 GB | Turing (7.5) | 4,608 | 3 m 39 s | 1.0.4 |
-| A100 SXM4 | Ampere (8.0) | 6,912 | 2 m 20 s | 1.0.4 |
-| RTX 5070 Ti 16 GB | Blackwell (12.0) | 8,960 | 1 m 25 s | 1.0.5 |
-| H100 SXM | Hopper (9.0) | 16,896 | 51.12 s | 1.0.4 |
+| GPU | Architecture (CC) | CUDA cores | RSA-100 (full pipeline) | Reps | Version |
+|-----|-------------------|-----------:|-------------------------|------|---------|
+| Jetson Orin Nano Super 8 GB (25 W) | Ampere (8.7) | 1,024 | 2,405.49 s (40 m 05 s) | n = 1 | 1.0.6 |
+| TITAN RTX 24 GB | Turing (7.5) | 4,608 | 199.08 s (median) | n = 3 | 1.0.6 |
+| A100 SXM4 40 GB | Ampere (8.0) | 6,912 | 114.79 s (mean) | n = 3 | 1.0.6 |
+| RTX 5070 Ti 16 GB | Blackwell (12.0) | 8,960 | 76.03 s (mean) | n = 5 | 1.0.6 |
+| H100 SXM 94 GB | Hopper (9.0) | 16,896 | 50.12 s (mean) | n = 3 | 1.0.6 |
+
+How to read the table:
+
+- **Operating points differ per row.** The 5070 Ti and TITAN rows run
+  `--fb_bound 7000000 --sieve_bound 262144 --sieve_batch_size 32`, the A100 row
+  `--fb_bound 7000000 --sieve_bound 262144 --sieve_batch_size 8`, the H100 row
+  `--fb_bound 5500000 --sieve_bound 524288 --sieve_batch_size 8`, and the Jetson row
+  `--fb_bound 7000000 --sieve_bound 131072 --sieve_batch_size 8`. Walls are comparable
+  within a device, not across devices.
+- **The A100 and H100 rows are measured, not optimized.** Both inherit
+  `--sieve_batch_size 8` from the cluster probe configuration they were run under; the
+  single-GPU configurations use 32, and no batch-size sweep has been run on either device at
+  this operating point. Treat them as honest measurements of the configuration shown,
+  not as each card's best achievable time.
+- **`--params` tuples are derived from a device's SM count** and must not be copied
+  between GPUs. All rows except Jetson run `--cuda_graph_unroll 0`, `--matrix_mode
+  legacy`, `--char_mode none` with a pinned `--params` tuple; the Jetson row uses its
+  documented `--autotune_stage1 --cuda_graph_unroll 4` configuration and is therefore a
+  single autotuned run.
+- **TITAN RTX shows a monotone thermal ramp across its three repetitions**
+  (196.99 → 199.08 → 199.65 s, 77 → 83 °C), so the median is quoted rather than the
+  mean of 198.57 s.
+- **The Jetson figure is 0.4 % slower than the 1.0.5 measurement** of the same
+  configuration (2,395.69 s). Both are single runs on a thermally constrained 25 W
+  board, and a separate independent run of the same configuration measured
+  2,395.31 s; the difference is run-to-run variation, not a regression.
+- A halved shared-memory sieve geometry (`--sieve_block_size` / `--sieve_big_prime_start`,
+  new in 1.0.6) measures faster still on the H100 — 48.86 s, reproduced to +0.24 % in a
+  second job — but costs 7.6 % more GPU board energy and is not a recommended
+  configuration, so the record above is the one the documented settings reproduce.
 
 The table below lists end-to-end wall-clock time on a single RTX 5070 Ti
 (Blackwell, CC 12.0) across input sizes, using the autotuned default parameters,
@@ -153,9 +221,12 @@ full pipeline (sieve + linear algebra + square root):
 | RSA-100       | 100    | 84.72    | RTX 5070 Ti  |
 | RSA-110       | 110    | 1040.03  | RTX 5070 Ti  |
 
-Numbers reflect the full pipeline with autotuned parameters. The single large
-prime variant (L > 0) is only used at ~90 digits and above; the 70d and 80d
-rows run with L = 0. Performance on other GPUs scales roughly with
+Numbers reflect the full pipeline with autotuned parameters, measured under releases
+1.0.1–1.0.5b; they have not been re-measured under 1.0.6. The RSA-100 row differs from
+the 76.03 s in the table above because it is an `--autotune_stage1` run rather than a
+run with a pinned `--params` tuple: on this card the gap is the parameter pin, not the
+release. The single large prime variant (L > 0) is only used at ~90 digits and above;
+the 70d and 80d rows run with L = 0. Performance on other GPUs scales roughly with
 sieve-relevant SM count and memory bandwidth.
 
 ## Known Limitations
@@ -182,7 +253,7 @@ BibTeX:
   title   = {cuda-mpqs: A GPU-accelerated Self-Initializing Multiple Polynomial
              Quadratic Sieve},
   year    = {2026},
-  version = {1.0.5},
+  version = {1.0.6},
   url     = {https://github.com/drjanosch42/cuda-mpqs},
   license = {LGPL-3.0-only}
 }

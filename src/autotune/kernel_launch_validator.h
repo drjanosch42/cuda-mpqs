@@ -34,6 +34,12 @@ struct SieveConstants {
     uint32_t globalBucketSize;   ///< sievingBlockSize / 2
     uint32_t bigPrimeStartIndex; ///< sievingBlockSize / 32
     uint32_t accumulatorBytes = 1; ///< sieve-accumulator width in bytes: 1 = uint8 (narrow), 2 = uint16 (wide)
+    /// v1.0.6: when true, {subCubeSize, metaGridDim, sasGridDim} and the derived
+    /// num_polyBlocksPerThreadBlock are NOT required to be powers of two — the SM-aligned
+    /// narrow BATCH geometry. Set ONLY for the narrow batch path (batch_size > 0 && !wide);
+    /// the default false reproduces the legacy/wide rule set byte-for-byte for every caller.
+    /// The normative admissible set is the predicate enforced by the validators below.
+    bool allow_nonpow2_geometry = false;
 };
 
 /// Ordered 8-parameter tuple for kernel launch configuration.
@@ -68,6 +74,11 @@ public:
     /// Queries cudaGetDeviceProperties for device_id, stores sc.
     KernelLaunchValidator(int device_id, const SieveConstants& sc);
 
+    /// Explicit-limits constructor — identical checks, no CUDA call. Lets host unit tests
+    /// exercise the admissible-set policy deterministically on any machine (v1.0.6).
+    KernelLaunchValidator(const DeviceLimits& dev, const SieveConstants& sc)
+        : dev_(dev), sc_(sc) {}
+
     /// Returns true iff the 8-tuple passes ALL feasibility checks.
     /// Silent on failure — designed for bulk filtering (called thousands of times).
     bool isValid(const Params8& p) const;
@@ -77,7 +88,7 @@ public:
     /// Designed for diagnostics, not bulk filtering.
     std::string diagnose(const Params8& p) const;
 
-    /// Autotune OOM guard (S2): true iff the candidate's COMPLETE device footprint
+    /// Autotune OOM guard: true iff the candidate's COMPLETE device footprint
     /// (sieve bucket + persistent + scratch via mpqs::sieve::estimateSieveFootprint,
     /// PLUS the caller-supplied non_sieve_bytes = postprocessing/LP + context reserve)
     /// fits the operative budget (kSieveBudget fraction, 0.80) of free_vram.
@@ -106,6 +117,11 @@ private:
     DeviceLimits dev_;
     SieveConstants sc_;
 
+    /// True iff parameter `idx` must be a power of two under this validator's regime.
+    /// Always true unless sc_.allow_nonpow2_geometry (narrow batch), which frees exactly
+    /// {P_SUB_CUBE_SIZE, P_META_GRID_DIM, P_SAS_GRID_DIM}. v1.0.6.
+    bool pow2Required(uint32_t idx) const;
+
     bool checkPow2(const Params8& p) const;
     bool checkArithmeticConstraints(const Params8& p) const;
     bool checkSharedMem(const Params8& p) const;
@@ -113,6 +129,20 @@ private:
     bool checkDeviceLimits(const Params8& p) const;
     bool checkNonZeroDerived(const Params8& p) const;
 };
+
+/// Smallest admissible sasGridDim >= min_sas for a given num_polysPerSieveCall `np`.
+///
+/// The batch GATHER kernel decomposes its polynomial index as `polyIdPrefix | gray(poly)`
+/// with `polyIdPrefix = blockIdx.x * chunk` and `chunk = np / sasGridDim`. The OR is a valid
+/// addition iff `chunk` is a power of two, and coverage is exact iff `sasGridDim` divides
+/// `np` — i.e. the admissible grids are exactly `{ np / 2^j : 2^j | np }`. Returns the
+/// smallest such value that is >= min_sas, or `np` (the largest admissible value, chunk 1)
+/// when min_sas exceeds every admissible grid.
+///
+/// For a power-of-two `np` the admissible set IS the power-of-two ladder `{1,2,...,np}`, so
+/// this reproduces the previous "round min_sas up to the next power of two, then clamp to np"
+/// behaviour exactly. Pure arithmetic; `np == 0` returns 0.
+uint32_t admissibleSasGridDim(uint32_t np, uint32_t min_sas);
 
 /// Enumerate all valid parameter combinations by iterating over predefined
 /// value arrays and filtering through the validator.
@@ -122,14 +152,15 @@ std::vector<Params8> enumerateValidConfigs(const KernelLaunchValidator& v);
 /// Preflight check from raw Params8 + factoringData dimensions + device.
 /// Builds SieveConstants, creates validator, returns structured result.
 /// use_wide selects the uint16 (wide) sieve geometry (SB, accumulator byte width);
-/// default false = the pre-S2 uint8 (narrow) behaviour, byte-identical for all callers.
+/// default false = the uint8 (narrow) behaviour, byte-identical for all callers.
 PreflightResult preflightKernelLaunch(
     const Params8& params,
     uint32_t shc_dim,
     uint32_t M,
     int device_id,
     bool use_wide = false,
-    bool use_u8sat = false);   // Option A: saturating-uint8 wide accumulator geometry
+    bool use_u8sat = false,    // saturating-uint8 wide accumulator geometry
+    bool allow_nonpow2_geometry = false);  // v1.0.6: SM-aligned narrow BATCH geometry
 
 /// Convenience overload: extracts Params8 from MPQSConfig::params[8].
 /// Short-circuits with {true, ""} when config.useParams == false.
@@ -138,7 +169,8 @@ PreflightResult preflightKernelLaunch(
 PreflightResult preflightKernelLaunch(
     mpqs::MPQSConfig& config,
     uint32_t shc_dim,
-    uint32_t M);
+    uint32_t M,
+    bool allow_nonpow2_geometry = false);
 
 /// Build SieveConstants from factoringData dimensions + device properties.
 ///   shc_dim            = f_data.a_factors.size()
@@ -150,10 +182,11 @@ PreflightResult preflightKernelLaunch(
 ///   accumulatorBytes   = use_wide ? (use_u8sat ? 1 : 2) : 1
 /// use_wide mirrors DeviceSievingController::loadPartialCustomConfig's wide geometry so the
 /// standalone validator/preflight rank the config as it will actually run on the wide kernel.
-/// use_u8sat (Option A) selects the saturating-uint8 wide accumulator (SB restored, den=44).
-/// Defaults false = byte-identical to the pre-S2 narrow build for every existing caller.
+/// use_u8sat selects the saturating-uint8 wide accumulator (SB restored, den=44).
+/// Defaults false = byte-identical to the narrow build for every existing caller.
 SieveConstants buildSieveConstants(uint32_t shc_dim, uint32_t M,
                                    size_t maxSharedMemPerBlock,
-                                   bool use_wide = false, bool use_u8sat = false);
+                                   bool use_wide = false, bool use_u8sat = false,
+                                   bool allow_nonpow2_geometry = false);
 
 } // namespace mpqs::autotune

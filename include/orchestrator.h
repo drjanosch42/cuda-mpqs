@@ -35,6 +35,7 @@
 #include "merge_filter.h"
 #include "character_columns.h"  // matrix::CharMode (Stage 2)
 #include "expanded_matrix.h"
+#include "graph_capture_scope.h"  // GraphCaptureScope (--cuda_graph_capture)
 #include "preprocess.h"        // PreprocessResultV2 (M9f)
 #include <optional>
 
@@ -159,7 +160,7 @@ struct MPQSConfig {
     uint64_t matrix_max_rows = 0;    ///< Cap legacy relation-batch rows before matrix build (0=off); used to keep
                                       ///< padded n_cols <= 2^24-1 so TiledCOO-256 stays admissible. CLI: --matrix_max_rows
     double truncation_factor = 1.05; ///< Matrix truncation enable flag. > 0 = enabled, 0 = disabled.
-                                      ///< Per M12-S1 the actual target is char-col-aware and excess-based:
+                                      ///< The actual target is char-col-aware and excess-based:
                                       ///<   target_rows = n_cols + n_extra_cols + matrix_truncation_excess.
                                       ///< The factor is retained as an on/off switch for backward CLI compatibility.
                                       ///< CLI: --truncation_factor
@@ -175,11 +176,11 @@ struct MPQSConfig {
     uint32_t compact_cycles = 5; ///< Maximum compact-merge cycles (GPU backend only).
                                   ///< 0 = single pass (no compaction, reverts to pre-M10 behavior).
                                   ///< CLI: --compact_cycles
-    double matrix_gf2_floor_factor = 0.5;  ///< M12-S2 GF(2) column-diversity floor: stop
+    double matrix_gf2_floor_factor = 0.5;  ///< GF(2) column-diversity floor: stop
                                             ///< compact-merge cycles when surviving GF(2) cols fall
                                             ///< below max(min_floor, factor × initial_gf2_cols).
                                             ///< CLI: --matrix_gf2_floor_factor
-    uint32_t matrix_gf2_min_floor = 8192;  ///< M12-S2 absolute lower bound on the GF(2) col floor.
+    uint32_t matrix_gf2_min_floor = 8192;  ///< Absolute lower bound on the GF(2) col floor.
                                             ///< Prevents triggering on tiny test matrices.
                                             ///< CLI: --matrix_gf2_min_floor
     uint32_t sieve_bound = 0;      // 0 = Auto-calculate "M"
@@ -187,7 +188,7 @@ struct MPQSConfig {
     uint32_t sieve_batch_size = 0;       // 0 = Auto-calculate
     int sieve_accumulator_mode = 0;      ///< CLI: --sieve_accumulator auto|u8|u16.
                                          ///< 0 = auto (dispatch predicate decides), 1 = force u8, 2 = force u16.
-    int sieve_wide_accum_mode = 0;       ///< CLI: --wide_accum auto|u8sat|u16 (Option A). Only consulted
+    int sieve_wide_accum_mode = 0;       ///< CLI: --wide_accum auto|u8sat|u16. Only consulted
                                          ///< in the wide regime. 0 = auto (saturating-uint8 iff the exactness
                                          ///< gate APV_max-threshold<=254 holds, else uint16), 1 = force u8sat
                                          ///< (gate-honoured), 2 = force uint16.
@@ -206,6 +207,36 @@ struct MPQSConfig {
                                          ///< sieving-block, not per-thread; all work loops stride by blockDim),
                                          ///< so relations/witnesses are identical across values — only occupancy
                                          ///< changes. Must be a power of two in [32,1024] (downstream POW2_CHECK).
+    uint32_t sieve_block_size = 0;       ///< CLI: --sieve_block_size (v1.0.6). Overrides
+                                         ///< gs_conf.sievingBlockSize on the NARROW BATCH --params
+                                         ///< path only. 0 = OFF (loader derives SB = min(M,
+                                         ///< pow2leq(3/4*maxSharedMemPerBlock)) — byte-identical to
+                                         ///< v1.0.5 on every path). N>0 must be a power of two in
+                                         ///< [256, M]. SB is the GATHER shared-memory accumulator
+                                         ///< length; lowering it is the only lever that brings
+                                         ///< ss_conf.sharedMemReq under the 2-blocks/SM threshold at
+                                         ///< production M (shared memory is the MEASURED sole
+                                         ///< obstruction). Lowering SB shrinks a launch's interval
+                                         ///< coverage, so numIntervals (--params field 2) must rise
+                                         ///< in step: numIntervals*SB >= 2M is a hard invariant.
+    uint32_t sieve_big_prime_start = 0;  ///< CLI: --sieve_big_prime_start (v1.0.6). Overrides
+                                         ///< gs_conf.bigPrimeStartIndex on the NARROW BATCH --params
+                                         ///< path only. 0 = OFF (loader derives bPSI = SB/32 —
+                                         ///< byte-identical). N>0 must satisfy 32 < N <= fb_size
+                                         ///< (32 = midPrimeStartIndex; at N<=32 the mid-prime loops
+                                         ///< invert and the band is silently dropped). Not required
+                                         ///< to be a power of two. Decouples the GATHER/SCATTER
+                                         ///< factor-base split from SB, so an SB override does not
+                                         ///< also silently migrate primes between the two paths.
+    bool sieve_bucket_overflow_stats = false; ///< CLI: --sieve_bucket_overflow_stats (v1.0.6).
+                                         ///< false = OFF: the bucket-overflow reader stays WIDE-ONLY,
+                                         ///< so the narrow zero-sync batch pipeline takes no extra
+                                         ///< DtoH copy + cudaStreamSynchronize on the siever stream at
+                                         ///< the ~5 s stats cadence (byte-identical to v1.0.5).
+                                         ///< true = the narrow path also emits [BucketOverflow]. The
+                                         ///< device data exists on both widths (the SCATTER kernel's
+                                         ///< bit-31 overflow flag is width-agnostic); only the host
+                                         ///< reader was gated. Wide behaviour is unaffected either way.
     double sieve_bucket_size_factor = 0.0; ///< CLI: --bucket_size_factor. Ablation knob decoupling the
                                          ///< large-prime bucket capacity from the legacy globalBucketSize=SB/2.
                                          ///< 0.0 = OFF (legacy SB/2 — byte-identical on ALL paths: narrow uint8,
@@ -225,6 +256,14 @@ struct MPQSConfig {
     uint32_t sieve_gms_num_blocks = 0;   // 0 = Auto-calculate
     uint32_t cuda_graph_unroll = 0;  ///< 0 = disabled. N > 0: capture N batches as CUDA graph.
                                      ///< Must be even (double-buffer constraint). Recommended: 2 or 4.
+    GraphCaptureScope graph_capture_scope = GraphCaptureScope::AUTO;
+        ///< CLI: --cuda_graph_capture {sieve|postproc|full}. AUTO = full (solo) / postproc (cluster).
+        ///< Inert when cuda_graph_unroll == 0. Cluster never captures LP (operator constraint).
+    uint32_t graph_lp_stride = 1;
+        ///< CLI: --cuda_graph_lp_stride <k>. In-graph LP cadence: dispatch the captured LP block
+        ///< every k-th captured batch. 1 = once per batch (finest; the v1.0.6 default).
+        ///< 0 or >= cuda_graph_unroll = once per replay, after the last batch (the v1.0.5
+        ///< composition). Honoured only when LP is actually captured (solo, scope full).
     double probe_timeout = 120.0;  ///< Hard timeout (seconds) for TruncatedSieveRun(). CLI: --probe_timeout
     bool estimate_only = false;    ///< Run truncated sieve in current topology, print estimate, exit.
 
@@ -481,7 +520,7 @@ private:
     /// Sentinel for finalizePersistentToHost's deficit_floor: "use the default fb_size+64".
     static constexpr uint64_t kDeficitFloorAuto = ~uint64_t(0);
 
-    // --- Mid-sieve checkpoint helpers (B1 split — see sieve_checkpoint.h) ---
+    // --- Mid-sieve checkpoint helpers (see sieve_checkpoint.h) ---
     /// Copy-only host snapshot of the live device persistent batch (and, iff LP active, the
     /// witness table) into the supplied SCRATCH host buffers. Drains/syncs first. Reusable
     /// mid-loop: it MUST NOT call deduplicatePersistentBatch() or otherwise mutate the live
@@ -494,12 +533,12 @@ private:
     /// counts for the sieve summary.
     ///
     /// @param deficit_floor  Minimum post-dedup device count below which the guard re-sieves.
-    ///   `kDeficitFloorAuto` (default) → `fb_size + 64` (the normal/non-resume floor). S2 solo
+    ///   `kDeficitFloorAuto` (default) → `fb_size + 64` (the normal/non-resume floor). Solo
     ///   resume passes an explicit floor that accounts for the already-loaded relations so the
     ///   guard does NOT push the (intentionally partial) new leg up to the full fb_size+64.
     void finalizePersistentToHost(uint64_t& pre_dedup_count, uint64_t& post_dedup_count,
                                   uint64_t deficit_floor = kDeficitFloorAuto);
-    /// S2 solo resume end-of-sieve: merge the loaded checkpoint (ckpt_loaded_smooths_/partials_)
+    /// Solo resume end-of-sieve: merge the loaded checkpoint (ckpt_loaded_smooths_/partials_)
     /// with the freshly-sieved NEW leg. Device-dedups the new leg (resume-aware deficit floor),
     /// builds the (loaded ∪ new) union dedup set via the shared computeRelationHash, re-asserts
     /// the fb_size+64 floor on the UNION (re-sieving the new leg if short), then runs the solo
@@ -509,15 +548,31 @@ private:
     void finalizeResumeUnion(uint64_t& pre_dedup_count, uint64_t& post_dedup_count);
     /// If checkpointing is enabled and the interval/batch threshold fired, emit one atomic
     /// mid-sieve checkpoint (copy-only snapshot → host-dedup of the scratch copy → atomic
-    /// write). No-op when checkpointing is disabled or in cluster mode (solo only in S1).
+    /// write). No-op when checkpointing is disabled or in cluster mode (solo only).
     /// Called at the bottom-of-loop boundary of the batch and graph-replay loops.
     void maybeCheckpoint(uint64_t current_step, uint64_t processed_batches,
                          double elapsed_sieve_sec);
 
-    /// S3 — coordinator-only mid-sieve checkpoint WRITE. Snapshots the pooled state at the
+    /// True iff maybeCheckpoint() would emit a checkpoint right now (solo + enabled + the
+    /// interval/batch threshold crossed + timers armed). Extracted so the graph replay loop can
+    /// quiesce the launch stream ONLY at a firing boundary instead of on every replay — gating on
+    /// "enabled" would re-serialize every replay of a checkpoint-enabled production run. Stays
+    /// bit-identical to maybeCheckpoint's own gate because maybeCheckpoint CALLS it: one copy of
+    /// the logic. const: arms nothing, and returns false while the timers are unarmed.
+    bool checkpointWillFire(uint64_t processed_batches,
+                            std::chrono::steady_clock::time_point now) const;
+
+    /// Quiesce the whole graph pipeline before a mid-sieve checkpoint snapshot: the LAUNCH stream
+    /// first (synchronizing it waits for every graph node, including the forked post-processing
+    /// branch), then proc_stream. Without this the LP-off solo graph path tears the snapshot:
+    /// copyPersistentToHost's cudaStreamSynchronize(pp_stream) is a no-op once post-processing is a
+    /// graph node, because proc_stream itself carries no work at replay time.
+    void quiesceForCheckpoint();
+
+    /// Coordinator-only mid-sieve checkpoint WRITE. Snapshots the pooled state at the
     /// Thread-A sole-mutator boundary: the non-consuming RelationAccumulator::peek() smooths
     /// + cluster_raw_partials_ as the v2 payload, plus a variable-size cluster block
-    /// {completedPrefixCursor (B2), per-node initial-range high-water array (M1)} via the
+    /// {completedPrefixCursor, per-node initial-range high-water array} via the
     /// same atomic writeCheckpointAtomic. `initial_high_water` is assembled by the caller
     /// (Thread A: worker marks from CHUNK_COMPLETE + node-0 from cluster_node0_initial_hw_).
     /// Workers never call this; SOLO path is untouched.
@@ -613,7 +668,7 @@ private:
     std::unique_ptr<cluster::CommBackend> comm_backend_;  ///< TCP/MPI backend (coordinator + worker)
     std::unique_ptr<cluster::WorkPool> cluster_work_pool_;
     std::unique_ptr<cluster::ChunkScheduler> cluster_scheduler_;
-    // --- S3: per-node initial-range high-water tracking (coordinator checkpoint, M1) ---
+    // --- Per-node initial-range high-water tracking (coordinator checkpoint) ---
     /// Per-node initial contiguous range {start, count} as computed by
     /// ChunkScheduler::computeContiguousRanges (index == node_id, node 0 = coordinator).
     /// Written once during coordinator setup BEFORE Thread A starts, then read-only — so
@@ -626,7 +681,7 @@ private:
     /// completes (the DirectChannel a-val counter is reset for subsequent overflow chunks, so
     /// it must be captured at that instant); read atomically by Thread A at checkpoint write.
     std::atomic<uint64_t> cluster_node0_initial_hw_{0};
-    // --- S4: coordinator RESUME state (default-off — set only when --resume loads a valid
+    // --- Coordinator RESUME state (default-off — set only when --resume loads a valid
     //     CLUSTER checkpoint at coordinator setup; consumed once at Thread A start) ---
     /// True after a valid cluster checkpoint is loaded + restored in coordinator setup.
     bool cluster_resume_active_ = false;
@@ -723,9 +778,9 @@ private:
     mpqs::structures::HostRelationBatch ckpt_scratch_smooths_;
     mpqs::structures::HostRelationBatch ckpt_scratch_partials_;
 
-    // --- Solo resume state (S2; default-off — set only when --resume loads a checkpoint) ---
+    // --- Solo resume state (default-off — set only when --resume loads a checkpoint) ---
     bool     resume_active_         = false;  ///< True after a valid checkpoint loaded at SieveStage entry.
-    uint64_t resume_loaded_raw_     = 0;      ///< trailer.loaded_smooths_raw — RAW device count (M2 target acct).
+    uint64_t resume_loaded_raw_     = 0;      ///< trailer.loaded_smooths_raw — RAW device count (target accounting).
     uint64_t resume_global_a_index_ = 0;      ///< trailer.global_a_index — first un-sieved a-index.
     /// Loaded checkpoint payload, held across SieveStage for the end-of-sieve union merge.
     mpqs::structures::HostRelationBatch ckpt_loaded_smooths_;

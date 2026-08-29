@@ -4,15 +4,15 @@
 // See LICENSE at the repository root for licensing terms, including the NVIDIA CUDA Toolkit exception.
 //
 // =============================================================================
-// test_cluster_resume — focused unit tests for the S4 cluster-coordinator RESUME path
+// test_cluster_resume — focused unit tests for the cluster-coordinator RESUME path
 // =============================================================================
 //
-// Three independently-testable pieces of the S4 design, none of which need a live
+// Three independently-testable pieces of that path, none of which need a live
 // cluster (the live 2-node kill+resubmit smoke is a separate maintainer package):
 //
 //   (A) computeResumeTrim()       — per-node initial-range trim [orig_start+hw, orig_count-hw),
 //                                    incl. the count==0 -> re-sieve-last-hypercube hardening and
-//                                    the eff_hw + count == orig_count invariant (M1, option (a)).
+//                                    the eff_hw + count == orig_count invariant.
 //   (B) clusterResumeTopologyOk() — the N2 guard: REJECT a resume whose checkpoint node_count
 //                                    differs from the current run, or whose completed-prefix
 //                                    cursor falls outside the current overflow pool.
@@ -71,7 +71,7 @@ void appendRel(HostRelationBatch& b, uint8_t sign, int32_t v2,
 } // namespace
 
 // -----------------------------------------------------------------------------
-// (A) computeResumeTrim — range trimming + boundary hardening (M1, option (a))
+// (A) computeResumeTrim — range trimming + boundary hardening
 // -----------------------------------------------------------------------------
 static void test_resume_trim() {
     const uint64_t H = 256;  // a representative hypercube size (2^8)

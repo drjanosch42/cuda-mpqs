@@ -4,7 +4,7 @@
 // See LICENSE at the repository root for licensing terms, including the NVIDIA CUDA Toolkit exception.
 //
 // =============================================================================
-// test_work_pool_cursor — focused unit test for WorkPool::completedPrefixCursor() (S3, B2)
+// test_work_pool_cursor — focused unit test for WorkPool::completedPrefixCursor()
 // =============================================================================
 //
 // completedPrefixCursor() must return the COMPLETED contiguous prefix =

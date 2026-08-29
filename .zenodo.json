@@ -1,6 +1,6 @@
 {
-  "title": "CUDA-MPQS: a fully GPU-resident quadratic sieve - v1.0.5",
-  "version": "1.0.5",
+  "title": "CUDA-MPQS: a fully GPU-resident quadratic sieve - v1.0.6",
+  "version": "1.0.6",
   "upload_type": "software",
   "access_right": "open",
   "license": "lgpl-3.0-only",

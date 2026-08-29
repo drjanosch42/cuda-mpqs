@@ -39,7 +39,7 @@ struct CompactResult {
 
     /// Number of columns alive in the GF(2) projection (i.e. columns with at
     /// least one odd-exponent entry across all alive rows). Computed by the
-    /// K4-GF2 kernel in gpuCompactPackedCSR(). Used by M12-S2 column-diversity
+    /// K4-GF2 kernel in gpuCompactPackedCSR(). Used by the column-diversity
     /// floor in gpuCompactMergeCycles().
     uint32_t gf2_n_cols = 0;
 };
@@ -96,7 +96,7 @@ struct CompactMergeResult {
 /// DevicePackedCSR and an accurate inverted index — avoiding the workspace
 /// exhaustion and stale-state abort cascade of a single-pass merge.
 ///
-/// Termination criteria (M12-S2):
+/// Termination criteria:
 ///   1. Convergence: cycle_merges < 0.02 × alive_rows
 ///   2. Budget exhausted: cycle >= max_cycles
 ///   3. GF(2) column-diversity floor: post-compaction GF(2) col count drops

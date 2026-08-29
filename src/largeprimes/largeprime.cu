@@ -425,15 +425,28 @@ __global__ void global_combine_kernel(
         uint64_t lp_witness = (uint64_t)global_witness_view.large_primes[target_global_idx];
         if (lp_input != lp_witness) return;  // Tag collision, not a true match — skip
 
-        // TODO (cluster duplicate-partial follow-up, CHANGELOG [1.0.3a]): no sqrt_Q
-        // identity guard here. If input and witness are the SAME relation (identical
-        // sqrt_Q), combining yields a perfect square (X≡Y → trivial sqrt). NOT
-        // load-bearing: this kernel runs only in solo/single-node mode, which emits
-        // no duplicate partials (duplicates are a cross-node artifact, and the CPU
-        // matcher cpu_lp.cu::combinePartials carries the canonical guard). If this
-        // path is ever fed aggregated multi-node partials, add:
-        //   if (input_view.sqrt_Q[my_idx] == global_witness_view.sqrt_Q[target_global_idx]) return;
-        // See logs/preproc_exp/dup_diag/.
+        // Identity guard (v1.0.6) — the device mirror of the canonical
+        // host guard cpu_lp.cu::combinePartials (commit 9881c00).
+        //
+        // If the input partial and the matched witness are the SAME relation they
+        // share the large prime P *and* the Q-root, so the merge produces
+        //     Q_res = sqrt_Q(P)^2 mod N,   exponent vector = 2·e  ≡ 0 (mod 2),
+        // i.e. a perfect-square row: a valid congruence that can only ever yield the
+        // trivial dependency X ≡ ±Y. sqrt_Q is a sufficient and cheapest
+        // discriminator — two DISTINCT relations sharing an LP arise from different
+        // (a,b) and therefore have different sqrt_Q.
+        //
+        // Load-bearing (the earlier "solo emits no duplicate partials" premise is
+        // falsified): matched witnesses are NOT purged at production factor-base
+        // sizes (purge_after_match = fb_size < 20000), so any re-presentation of a
+        // partial — a duplicate emission from the sieve, a cluster worker's
+        // end-of-assignment repeat — self-matches against the witness copy it
+        // inserted itself. Each self-combine is a UNIQUE row that survives the
+        // end-of-sieve dedup into the matrix as pure trivial ballast, diluting the
+        // per-solution nontrivial-GCD rate. The host guard drops 2,909 such rows on
+        // real RSA-155 cluster data.
+        // Root-caused and fixed in v1.0.6 (2026-08-23).
+        if (input_view.sqrt_Q[my_idx] == global_witness_view.sqrt_Q[target_global_idx]) return;
 
         // 1. Algebra Merge
         mpqs::uint512 Q_res = input_view.sqrt_Q[my_idx];
@@ -564,6 +577,20 @@ __global__ void capture_provenance_kernel(
 }
 
 /**
+ * @brief Records an LP append performed by the host-side (legacy synchronous) path.
+ *
+ * C <- C + delta, b <- delta. Mirrors what device_append_kernel does for the async path so
+ * that LP relation accounting has exactly one definition: relations committed to the
+ * persistent batch. Single thread; the counters are read only by update_telemetry_kernel.
+ */
+__global__ void record_appended_kernel(uint64_t* __restrict__ cum_full_relations,
+                                       uint64_t* __restrict__ last_batch_full,
+                                       uint64_t delta) {
+    if (cum_full_relations) *cum_full_relations += delta;
+    if (last_batch_full)    *last_batch_full = delta;
+}
+
+/**
  * @brief Stage 5B Kernel: Atomically Appends unique 1-partials to the Global Hash Table.
  *
  * Logic (The Spin-Lock):
@@ -644,11 +671,32 @@ __global__ void global_append_kernel(
 
         bool spin = true;
         while (spin) {
-            uint64_t current_dir = directory[hash];
-            
+            // COHERENT read of the directory word (fix for an intermittent hang).
+            //
+            // A plain load here compiles to a weak, L1-cacheable LDG (verified in SASS:
+            // `LDG.E.64` / test / branch-back, no atomic on the spin path). L1 is not
+            // coherent across SMs: the lock holder's release below is an atomicExch
+            // serviced at L2 and never invalidates ANOTHER SM's cached line, so a
+            // thread that once observed the locked value can re-read its own stale L1
+            // line forever — an unbounded livelock that wedges lp_stream and, through
+            // the event DAG, the whole pipeline. Latent since this kernel was written;
+            // first surfaced by the v1.0.6 SM-aligned launch geometries (~23 % of
+            // runs at `--params 560,8,8,8,70,1024,560,1024`, `--cuda_graph_unroll 0`,
+            // RTX 5070 Ti), whose occupancy shape leaves LP blocks alone on an SM with
+            // no L1 eviction pressure. Confirmed by instrumentation: the plain load
+            // returned lock=SET/count=4 for 2^20 consecutive iterations while the L2
+            // view of the same address was lock=CLEAR/count=5. Root-caused and fixed in
+            // v1.0.6 (2026-08-23).
+            //
+            // atomicAdd(addr, 0) is this module's established coherent-read idiom
+            // (see atomic_reserve_dual above); it is serviced at L2, the coherence
+            // point, so the release is guaranteed to become visible and the spin is
+            // guaranteed to terminate (forward progress via SM 7.0+ ITS).
+            uint64_t current_dir = atomicAdd((unsigned long long*)&directory[hash], 0ULL);
+
             if (current_dir & lock_mask) {
                 // Bucket is locked by another warp/thread. Spin.
-                continue; 
+                continue;
             }
 
             // Attempt to acquire lock
@@ -717,7 +765,9 @@ __global__ void device_append_kernel(
     const uint64_t* __restrict__ src_factor_count,
     uint64_t* __restrict__ dst_count,
     uint64_t* __restrict__ dst_factor_count,
-    uint64_t* __restrict__ appended_count_pinned
+    uint64_t* __restrict__ appended_count_pinned,
+    uint64_t* __restrict__ cum_full_relations,
+    uint64_t* __restrict__ last_batch_full
 ) {
     __shared__ uint32_t s_num_rels;
     __shared__ uint32_t s_num_factors;
@@ -734,6 +784,7 @@ __global__ void device_append_kernel(
             s_num_factors = 0;
             s_fits = false;
             if (appended_count_pinned) *appended_count_pinned = 0;
+            if (last_batch_full) *last_batch_full = 0;
         } else {
             uint32_t dst_current_rels = (uint32_t)*dst_count;
             uint64_t dst_current_facts = *dst_factor_count;
@@ -746,6 +797,7 @@ __global__ void device_append_kernel(
                 s_num_factors = 0;
                 s_fits = false;
                 if (appended_count_pinned) *appended_count_pinned = 0;
+                if (last_batch_full) *last_batch_full = 0;
             } else {
                 s_num_rels = src_rels;
                 s_num_factors = src_facts;
@@ -758,6 +810,17 @@ __global__ void device_append_kernel(
                 *dst_factor_count = dst_current_facts + src_facts;
 
                 if (appended_count_pinned) *appended_count_pinned = src_rels;
+                // LP relation accounting. Counted HERE — device-side, exactly once, at the
+                // single point where LP relations enter the persistent batch — because it is
+                // the only site with no cross-stream reset dependency: the output batch's own
+                // counter is reset by launchDeviceAppend on the POST-PROCESSING stream while
+                // LP dispatches run on lp_stream, so summing that counter is not a sum of
+                // disjoint per-dispatch values. The former host-side accumulation (a racy read
+                // of the mapped pinned counter) was lossy under async overlap: it undercounted
+                // by ~26 % at RSA-100 / cuda_graph_unroll 0, landing BELOW the post-dedup
+                // ground truth (`LP fraction:`), which is impossible for a pre-dedup total.
+                if (last_batch_full) *last_batch_full = src_rels;
+                if (cum_full_relations) *cum_full_relations += src_rels;
             }
         }
     }
@@ -803,16 +866,24 @@ __global__ void device_append_kernel(
  * DESIGN: Expected to be launched with EXACTLY 1 Block.
  * Uses a grid-stride loop and shared memory atomic reductions to safely compute stats,
  * then commits them to pinned host memory via a strict generation ticket.
+ *
+ * All telemetry INPUTS are device-resident, so the kernel is CUDA-graph-capturable:
+ * a by-value host scalar would be baked into the graph at capture time and every replay
+ * would then publish the same frozen witness/combine figures.
+ *     C_k = *d_cum_full_relations, b_k = *d_last_batch_full   (maintained by
+ *                                   device_append_kernel, one increment per append)
+ *     w_k = W_k - W_{k-1}          (d_last_witness_count holds W_{k-1}; updated to W_k here)
+ * Thread 0 is the sole writer of the witness snapshot, so no atomics are required.
  */
 __global__ void update_telemetry_kernel(
     const uint64_t* __restrict__ directory,
     uint32_t num_buckets,
     uint32_t row_width_elems,
     uint64_t current_partials_count,
-    uint64_t last_batch_full,
-    uint64_t total_full_relations,
+    const uint64_t* __restrict__ d_last_batch_full,
+    const uint64_t* __restrict__ d_cum_full_relations,
     const uint64_t* __restrict__ witness_dual_counter,
-    uint64_t prev_witness_count,
+    uint64_t* __restrict__ d_last_witness_count,
     SLPPinnedStats* __restrict__ pinned_stats,
     const uint64_t* __restrict__ slab_overflow_count,
     const uint64_t* __restrict__ witness_overflow_count,
@@ -853,11 +924,21 @@ __global__ void update_telemetry_kernel(
         uint32_t total_witnesses, _f;
         unpack_rf(*witness_dual_counter, total_witnesses, _f);
 
+        // Device-resident telemetry state (see the kernel doc): the LP relation counters are
+        // maintained by device_append_kernel; this kernel only publishes them. The witness
+        // delta uses a device snapshot updated below.
+        const uint64_t last_batch_full = d_last_batch_full ? *d_last_batch_full : 0ull;
+        const uint64_t cum = d_cum_full_relations ? *d_cum_full_relations : 0ull;
+        const uint64_t prev_wit = d_last_witness_count ? *d_last_witness_count : 0ull;
+
         pinned_stats->new_partials_buffer_fill  = current_partials_count;
         pinned_stats->total_witnesses           = total_witnesses;
-        pinned_stats->total_full_relations      = total_full_relations;
+        pinned_stats->total_full_relations      = cum;
         pinned_stats->last_batch_full_relations = last_batch_full;
-        pinned_stats->last_batch_new_witnesses  = total_witnesses - prev_witness_count;
+        pinned_stats->last_batch_new_witnesses  = total_witnesses - prev_wit;
+
+        // Fresh snapshot for the NEXT dispatch's delta.
+        if (d_last_witness_count) *d_last_witness_count = total_witnesses;
 
         pinned_stats->empty_hash_buckets = empty_count_smem;
         pinned_stats->full_hash_buckets  = full_count_smem;
@@ -947,6 +1028,9 @@ void LargePrimeVariant::clearBuffers() {
     if (d_slab_overflow_count) { cudaFree(d_slab_overflow_count); d_slab_overflow_count = nullptr; }
     if (d_witness_overflow_count) { cudaFree(d_witness_overflow_count); d_witness_overflow_count = nullptr; }
     if (d_output_overflow_count) { cudaFree(d_output_overflow_count); d_output_overflow_count = nullptr; }
+    if (d_cum_full_relations_) { cudaFree(d_cum_full_relations_); d_cum_full_relations_ = nullptr; }
+    if (d_last_batch_full_) { cudaFree(d_last_batch_full_); d_last_batch_full_ = nullptr; }
+    if (d_last_witness_count_) { cudaFree(d_last_witness_count_); d_last_witness_count_ = nullptr; }
 
     // Pipeline buffers cleanup (no CUDA_CHECK — may be called from destructor)
     if (d_routing_keys) cudaFree(d_routing_keys);
@@ -1079,6 +1163,12 @@ void LargePrimeVariant::initiate(
     CUDA_CHECK(cudaMemset(d_witness_overflow_count, 0, sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_output_overflow_count, sizeof(uint64_t)));
     CUDA_CHECK(cudaMemset(d_output_overflow_count, 0, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_cum_full_relations_, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(d_cum_full_relations_, 0, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_last_batch_full_, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(d_last_batch_full_, 0, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_last_witness_count_, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(d_last_witness_count_, 0, sizeof(uint64_t)));
 
     // --- 7. Global Witness SoA Batch (Append Only) ---
     size_t est_factors = config.max_witness_capacity * 64; 
@@ -1152,34 +1242,25 @@ void LargePrimeVariant::updateStats() {
     uint32_t threads = 1024;
     uint32_t blocks = 1;
 
-    // Read output count from our pinned counter
-    uint64_t current_output_count = h_pinned_lp_combined_count ? h_pinned_lp_combined_count[0] : 0;
-
-    // Track cumulative full relations across all LP batches
-    cumulative_full_relations_ += current_output_count;
-
-    // Dispatch telemetry kernel — reads witness count directly from d_witness_dual_counter
-    // on the GPU, avoiding the host roundtrip that was always returning 0 (the RelationBatch
-    // built-in counter is never updated by global_append_kernel which uses the dual counter).
+    // Dispatch telemetry kernel — every input is device-resident (graph-capturable). The LP
+    // relation counters are maintained by device_append_kernel, i.e. counted once per relation
+    // at the point of commit; the output batch's own counter must NOT be summed here, since its
+    // reset is issued on the post-processing stream and overlaps LP dispatches (measured: that
+    // scheme over-counts by ~37 % on the async path).
     kernels::update_telemetry_kernel<<<blocks, threads, 0, lp_stream>>>(
         d_directory,
         num_buckets,
         ROW_WIDTH_ELEMS,
-        0,                          // partials buffer fill (optional)
-        current_output_count,       // Full relations formed in this batch
-        cumulative_full_relations_, // Cumulative LP full relations
-        d_witness_dual_counter,     // GPU reads witness count directly
-        last_witness_count_,        // Previous snapshot for delta computation
+        0,                            // partials buffer fill (optional)
+        d_last_batch_full_,           // LP relations committed by the last append (device)
+        d_cum_full_relations_,        // Cumulative LP relations committed (device)
+        d_witness_dual_counter,       // GPU reads witness count directly
+        d_last_witness_count_,        // Previous snapshot for delta computation (device)
         d_pinned_stats,
         d_slab_overflow_count,
         d_witness_overflow_count,
         d_output_overflow_count
     );
-
-    // Update last_witness_count_ from pinned stats written by the PREVIOUS kernel.
-    // Safe: updateStats() is only called after the prior LP dispatch completes (event wait).
-    // On first call, h_pinned_stats->total_witnesses is 0 (matching last_witness_count_ init).
-    last_witness_count_ = h_pinned_stats->total_witnesses;
 
     // NO cudaStreamSynchronize here — telemetry uses __threadfence_system.
     // Host reads telemetry via getTelemetry() with generation ticket polling.
@@ -1468,6 +1549,12 @@ void LargePrimeVariant::processAndCommit(
         // shows only the ETA/throughput/buffer-fill telemetry during sieving.
         LOG(LOG_DEBUG_1) << "Combined " << found_full_count << " full relations in this batch.";
         persistent_storage->append(*d_output_batch, found_full_count, lp_stream);
+        // Same accounting as the async path's device_append_kernel: count at commit.
+        kernels::record_appended_kernel<<<1, 1, 0, lp_stream>>>(
+            d_cum_full_relations_, d_last_batch_full_, found_full_count);
+    } else {
+        kernels::record_appended_kernel<<<1, 1, 0, lp_stream>>>(
+            d_cum_full_relations_, d_last_batch_full_, 0ull);
     }
     
     // Clear Output Batch for the next run (Counters reset)
@@ -1668,7 +1755,9 @@ void LargePrimeVariant::launchDeviceAppend(
         output_view.global_factor_idx,   // src factor count (device)
         persistent_view.global_count,    // dst count (device)
         persistent_view.global_factor_idx, // dst factor count (device)
-        d_pinned_appended_count          // mapped pinned (telemetry)
+        d_pinned_appended_count,         // mapped pinned (telemetry)
+        d_cum_full_relations_,           // device: cumulative LP relations committed
+        d_last_batch_full_               // device: this append's contribution
     );
 
     // Reset output batch on the same stream (ordered after append completes)

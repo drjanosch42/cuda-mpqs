@@ -9,7 +9,7 @@
 #include "hpc_logger.h"
 #include <cuda_runtime.h>
 #include <algorithm>
-#include <chrono>   // S3/S4 wide-path per-candidate wall-clock budget management
+#include <chrono>   // wide-path per-candidate wall-clock budget management
 #include <cmath>
 
 namespace mpqs::autotune {
@@ -26,7 +26,7 @@ struct CandidateRange {
 };
 
 CandidateRange getCandidates(uint32_t param_idx, bool use_wide = false) {
-    // S5 (WIDE only): subCubeSize (pidx 0) drops the 1024 candidate — clampWideNumPolys caps
+    // WIDE only: subCubeSize (pidx 0) drops the 1024 candidate — clampWideNumPolys caps
     // num_polys at 512, so probing 1024 re-tests the 512 geometry. Every other dim shares the
     // narrow candidate arrays (the wide sweep just visits a SUBSET of indices; see the
     // WIDE_*_PARAM_INDICES lists), so the arrays themselves are unchanged for them.
@@ -59,12 +59,13 @@ KernelParamResult optimizeKernelLaunchParams(
     double probe_budget_sec)
 {
     // 1. Build validator from device properties and factoring data.
-    //    S2 (wide-autotune foundation): build the WIDE geometry when the siever resolved to
+    //    Wide-autotune foundation: build the WIDE geometry when the siever resolved to
     //    the uint16 accumulator, so the pre-filter (isValid / OOM guard) ranks each config as
-    //    it will actually run. Narrow (uint8) -> use_wide=false -> byte-identical to pre-S2.
+    //    it will actually run. Narrow (uint8) -> use_wide=false -> byte-identical to the
+    //    narrow baseline.
     const bool use_wide = siever.isWideAccumulator();
 
-    // ----- S3/S4 (WIDE only): the objective is a survivors/sec RATE (higher=better) measured
+    // ----- WIDE only: the objective is a survivors/sec RATE (higher=better) measured
     //       over a wall-clock window that auto-scales and honours the autotune budget. All of
     //       the following is gated on use_wide; the NARROW path never touches it and keeps its
     //       isolated-kernel-µs objective + lower-is-better accept byte-for-byte. -----
@@ -74,7 +75,7 @@ KernelParamResult optimizeKernelLaunchParams(
     auto wideElapsed = [&]() {
         return std::chrono::duration<double>(wclk::now() - wide_t0).count();
     };
-    // Reserve enough tail budget for the mandatory S4 floor eval (warmup + a floor window).
+    // Reserve enough tail budget for the mandatory floor eval (warmup + a floor window).
     const double wide_floor_reserve = WIDE_PROBE_WARMUP_SEC + WIDE_PROBE_WINDOW_FLOOR_SEC + 5.0;
     // Set this candidate's window from the remaining budget. Returns false ⇒ out of budget:
     // stop adding search candidates (the floor is still timed afterward). On narrow: no-op/true.
@@ -102,7 +103,7 @@ KernelParamResult optimizeKernelLaunchParams(
     cudaGetDeviceProperties(&prop, device_id);
     SieveConstants sc = buildSieveConstants(
         f_data.a_factors.size(), f_data.M, prop.sharedMemPerBlock, use_wide,
-        siever.isWideU8Sat());  // Option A: match the saturating-uint8 wide geometry when selected
+        siever.isWideU8Sat());  // match the saturating-uint8 wide geometry when selected
     KernelLaunchValidator validator(device_id, sc);
 
     // On wide, loadPartialCustomConfig OVERRIDES num_sievingBlocksPerSieveCall to 2M/SB_wide
@@ -114,7 +115,7 @@ KernelParamResult optimizeKernelLaunchParams(
 
     uint32_t configs_tested = 0;
 
-    // OOM guard (S2): a candidate's COMPLETE device footprint (estimateSieveFootprint
+    // OOM guard: a candidate's COMPLETE device footprint (estimateSieveFootprint
     // + the postprocessing/LP + context reserve in non_sieve_bytes) must fit the 0.80
     // budget of free VRAM. Amortize ONE cudaMemGetInfo for the whole Stage-1 — free is
     // ~constant across the sweep (loadSievingDataParamTest frees the bucket before
@@ -142,10 +143,10 @@ KernelParamResult optimizeKernelLaunchParams(
     // 2. Phase 1: Seed selection — start from heuristic defaults, clamp to feasible
     Params8 best = HEURISTIC_DEFAULTS;
 
-    // ----- S5 (WIDE only): occupancy-seeded start. -------------------------------------------
+    // ----- WIDE only: occupancy-seeded start. -------------------------------------------
     // Descending from HEURISTIC_DEFAULTS on wide starts in the WRONG geometry region (SCATTER
     // blockDim 1024, no A1 SM-aware SCATTER grid, GATHER blockDim hardcoded 1024) — so the search
-    // never reaches, hence never beats, the shipping loadStandardConfig-wide default, and the S4
+    // never reaches, hence never beats, the shipping loadStandardConfig-wide default, and the
     // floor gate always falls back. Instead SEED the search AT the known-good default: read the
     // live loadStandardConfig-wide tuple (the autotune caller ran loadStandardConfig() +
     // loadData() before this optimizer, so gs/gms/ss ARE the standard-wide geometry) and override
@@ -220,7 +221,7 @@ KernelParamResult optimizeKernelLaunchParams(
         best = all_valid[0];
     }
 
-    // OOM guard (S2, design §2.4(B)/m2): gate the optimizer's OWN seed `best` through
+    // OOM guard: gate the optimizer's OWN seed `best` through
     // the total-footprint check before the first evaluateConfig (→ loadSievingDataParamTest
     // → kernel.cu:613). `best` passed only the bucket-only isValid above; this is a
     // distinct siever from the runStage1 seed guard, so it needs its own gate. If `best`
@@ -247,9 +248,9 @@ KernelParamResult optimizeKernelLaunchParams(
     }
 
     // 3. Evaluate seed with coarse mini-benchmark.
-    //    WIDE (S3): set the probe window first. If we are already budget-tight, evaluate the
+    //    WIDE: set the probe window first. If we are already budget-tight, evaluate the
     //    seed at the floor window (it is the mandatory search baseline) and skip the sweep,
-    //    heading straight to the S4 floor gate.
+    //    heading straight to the floor gate.
     if (use_wide && !prepareWideWindow()) {
         siever.setProbeWindow(WIDE_PROBE_WINDOW_FLOOR_SEC, WIDE_PROBE_WARMUP_SEC);
         wide_budget_stop = true;
@@ -268,7 +269,7 @@ KernelParamResult optimizeKernelLaunchParams(
 
     // 4. Phase 2: Coordinate descent on weakly-convergent parameters
     //    NARROW: sweep sasGridDim (6), metaGridDim (4), polyBlockSize (2).
-    //    WIDE (S5): sweep GATHER blockDim (7), SCATTER grid (4), subCubeSize/num_polys (0) —
+    //    WIDE: sweep GATHER blockDim (7), SCATTER grid (4), subCubeSize/num_polys (0) —
     //    the throughput-relevant wide dims — starting from the occupancy-seeded standard-wide
     //    config; the inert numIntervals (1) is not in the wide list, so it is never swept.
     //    These have nearly independent, unimodal 1D slices.
@@ -292,10 +293,10 @@ KernelParamResult optimizeKernelLaunchParams(
                 // pre-filter and the real config agree (incl. the pidx==1 thorough sweep).
                 if (use_wide) candidate[P_NUM_INTERVALS] = canonical_intervals;
                 if (!validator.isValid(candidate)) continue;
-                // WIDE (S3): size this candidate's probe window from the remaining budget;
-                // out of budget ⇒ stop searching (the S4 floor is still timed afterward).
+                // WIDE: size this candidate's probe window from the remaining budget;
+                // out of budget ⇒ stop searching (the floor is still timed afterward).
                 if (use_wide && !prepareWideWindow()) { wide_budget_stop = true; break; }
-                // OOM guard (S2): skip candidates whose COMPLETE footprint exceeds the
+                // OOM guard: skip candidates whose COMPLETE footprint exceeds the
                 // 0.80 budget (additive to the bucket-only isValid above). No-op when
                 // the guard is inactive or the candidate fits.
                 {
@@ -335,7 +336,7 @@ KernelParamResult optimizeKernelLaunchParams(
 
     // 4.5 Optional: sweep strongly-convergent params (thorough mode).
     //     NARROW: {sasBlockDim, metaBlockDim, numIntervals, blocksPerCycle, subCubeSize}.
-    //     WIDE (S5): {metaBlockDim} only — every other wide-relevant dim is already in Phase 2,
+    //     WIDE: {metaBlockDim} only — every other wide-relevant dim is already in Phase 2,
     //     and numIntervals (1) is inert on wide. These normally don't need searching, but new
     //     GPU architectures may differ.
     const uint32_t* strong_idx = use_wide ? WIDE_STRONG_PARAM_INDICES : STRONG_PARAM_INDICES;
@@ -354,9 +355,9 @@ KernelParamResult optimizeKernelLaunchParams(
                 candidate[pidx] = values[v];
                 if (use_wide) candidate[P_NUM_INTERVALS] = canonical_intervals;  // inert on wide (see Phase 2)
                 if (!validator.isValid(candidate)) continue;
-                // WIDE (S3): budget-size this candidate's window (see Phase 2).
+                // WIDE: budget-size this candidate's window (see Phase 2).
                 if (use_wide && !prepareWideWindow()) { wide_budget_stop = true; break; }
-                // OOM guard (S2): same total-footprint skip as Phase 2.
+                // OOM guard: same total-footprint skip as Phase 2.
                 {
                     uint64_t est_total = 0;
                     if (!fitsFootprint(candidate, &est_total)) {
@@ -386,8 +387,8 @@ KernelParamResult optimizeKernelLaunchParams(
     }
 
     // 5. Phase 3: Fine verification with a longer mini-benchmark.
-    //    WIDE (S3/S4): measure the winner AND the loadStandardConfig-wide floor with ONE
-    //    consistent decision window, so the S4 accept comparison is apples-to-apples. Choose it
+    //    WIDE: measure the winner AND the loadStandardConfig-wide floor with ONE
+    //    consistent decision window, so the accept comparison is apples-to-apples. Choose it
     //    from the remaining budget: the full window if two more evals (verify + floor) fit, else
     //    the floor window (the floor MUST still be timed even over budget — the parity guarantee).
     if (use_wide) {
@@ -406,7 +407,7 @@ KernelParamResult optimizeKernelLaunchParams(
 
     if (verified_time < 0.0f) verified_time = best_time;  // fallback
 
-    // 5b. S4 FLOOR GATE (WIDE only). Time loadStandardConfig-wide (the exact config that ships
+    // 5b. FLOOR GATE (WIDE only). Time loadStandardConfig-wide (the exact config that ships
     //     when autotune is OFF) under the SAME decision window, and accept the search winner IFF
     //     its rate ≥ floor·(1+WIDE_FLOOR_MARGIN). Otherwise the caller keeps loadStandardConfig
     //     verbatim (useParams=false) — worst case is provably parity with the shipping wide
@@ -448,7 +449,7 @@ KernelParamResult optimizeKernelLaunchParams(
                   << verified_time << (use_wide ? " survivors/s (" : " us (")
                   << configs_tested << " configs tested)";
 
-    // OOM-guard summary (S2): how many candidates the total-footprint guard skipped.
+    // OOM-guard summary: how many candidates the total-footprint guard skipped.
     // 0 at the validated operating points (no-regression assertion / committed CTest).
     if (guard_active) {
         LOG(LOG_INFO) << "[Autotune][OOM-guard] candidate footprint skips: " << footprint_skips;

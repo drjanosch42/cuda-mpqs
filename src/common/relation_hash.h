@@ -28,13 +28,13 @@ namespace mpqs {
 ///   hash = (len << 48) | (exp_xor << 32) | body_xor
 /// where body_xor folds factor_indices*MAGIC, sign, and val_2_exp.
 ///
-/// Stage-4 invariant (M12-S5/S5b analogue): batch.char_bits is DELIBERATELY NOT folded
+/// Stage-4 invariant: batch.char_bits is DELIBERATELY NOT folded
 /// into this hash. char_bits is a deterministic function of (ax+b), so two relations with
 /// identical factorization share identical char vectors — including it cannot change dedup
 /// identity, and excluding it keeps this hash byte-for-byte equivalent to the GPU hash
 /// regardless of char_mode.
 ///
-/// Sign encoding (canonical, see matrix-module audit Appendix A): batch.signs[i] is uint8_t
+/// Sign encoding (canonical): batch.signs[i] is uint8_t
 /// with {1 = positive Q, 0xFF/other = negative Q}. The M11c encoding-agnostic "negative iff
 /// != 1" extraction matches the GPU path in postprocessing.cu:594.
 inline uint64_t computeRelationHash(const structures::HostRelationBatch& batch, size_t i) {

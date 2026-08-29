@@ -5,10 +5,12 @@
 
 set(CUDAMPQS_VERSION_MAJOR 1)
 set(CUDAMPQS_VERSION_MINOR 0)
-set(CUDAMPQS_VERSION_PATCH 5)
+set(CUDAMPQS_VERSION_PATCH 6)
 # Numeric MAJOR.MINOR.PATCH only — consumed by project(... VERSION ...), so it must
 # stay strictly numeric. The non-numeric pre-release suffix (e.g. "a") lives in
 # CUDAMPQS_VERSION_SUFFIX and is appended in the human-facing display string below.
+# An EMPTY suffix marks a RELEASED version: the display string then equals the
+# numeric version exactly (1.0.6), which is also what tools/release/ reads.
 set(CUDAMPQS_VERSION "${CUDAMPQS_VERSION_MAJOR}.${CUDAMPQS_VERSION_MINOR}.${CUDAMPQS_VERSION_PATCH}")
 set(CUDAMPQS_VERSION_SUFFIX "")
 # Display string with suffix — this is what the binary prints (--version / banner).

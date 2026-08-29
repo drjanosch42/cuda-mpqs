@@ -14,12 +14,12 @@
 /// @file sieve_checkpoint.h
 /// @brief Atomic, crash-safe mid-sieve checkpoint artifact (`sieve.ckpt`).
 ///
-/// Layout (plan §2.3):
-///   [ serialize_v2 payload (verbatim) ] [ progress trailer ] [ cluster block (S3) ]
+/// Layout:
+///   [ serialize_v2 payload (verbatim) ] [ progress trailer ] [ cluster block ]
 ///   [ fixed-size EOF footer ]
 ///
 /// The trailer is read by SEEKING from the trailer_offset recorded in the fixed-size EOF
-/// footer (the trailer is variable-size once the S3 cluster block lands, so "read a
+/// footer (the trailer is variable-size once the cluster block is present, so "read a
 /// fixed-size struct at EOF" does not work — the footer is the only fixed-position record).
 /// The footer magic at the very end of the file is the COMPLETENESS SENTINEL: a torn write
 /// never has it, so a partially-written checkpoint is never loadable.
@@ -50,11 +50,11 @@ struct CheckpointTrailer {
     uint64_t lp1_bound            = 0;   ///< LP bound (0 = no-LP run).
     uint32_t sieve_bound          = 0;   ///< M (sieve interval half-width).
     mpqs::uint512 N{};                   ///< Modulus (64 B, redundant sanity vs the v2 metadata).
-    uint8_t  cluster_section_present = 0;///< 0 = solo file; 1 = an S3 cluster block follows (S3).
+    uint8_t  cluster_section_present = 0;///< 0 = solo file; 1 = a cluster block follows.
     uint64_t elapsed_sieve_sec    = 0;   ///< Wall-clock sieve time accumulated so far.
 };
 
-/// Variable-size cluster resume block (S3 — coordinator only). Appended between the
+/// Variable-size cluster resume block (coordinator only). Appended between the
 /// progress trailer and the fixed EOF footer, present iff trailer.cluster_section_present
 /// == 1. Its size grows with node count, which is exactly why the EOF footer carries
 /// {trailer_offset, trailer_len}: the trailer+cluster-block region is addressable by
@@ -74,7 +74,7 @@ struct CheckpointClusterBlock {
 struct CheckpointLoadResult {
     bool ok = false;
     CheckpointTrailer trailer;
-    CheckpointClusterBlock cluster;   ///< Populated iff trailer.cluster_section_present == 1 (S3).
+    CheckpointClusterBlock cluster;   ///< Populated iff trailer.cluster_section_present == 1.
     mpqs::structures::HostRelationBatch smooths;
     mpqs::structures::HostRelationBatch partials;
     mpqs::io::V2Metadata meta;
@@ -85,19 +85,19 @@ struct CheckpointLoadResult {
 /// — it operates on a SCRATCH host copy and never touches live device state (B1).
 void dedupRelationsInPlace(mpqs::structures::HostRelationBatch& b);
 
-/// Write `<ckpt_dir>/sieve.ckpt` atomically and crash-safely (plan §2.3):
+/// Write `<ckpt_dir>/sieve.ckpt` atomically and crash-safely:
 ///   0. unlink any stale `sieve.ckpt.tmp`
 ///   1. serialize_v2(smooths, partials, meta) → `sieve.ckpt.tmp`  (intra-FS tmp)
-///   2. append trailer (+ S3 cluster block) + fixed EOF footer; fflush + fsync(fd)
+///   2. append trailer (+ cluster block) + fixed EOF footer; fflush + fsync(fd)
 ///   3. rename existing `sieve.ckpt` → `sieve.ckpt.prev`, then rename tmp → `sieve.ckpt`
 ///   4. fsync the containing directory
 /// A kill at any earlier point leaves only `sieve.ckpt.tmp` (ignored + unlinked next write)
 /// and the previous committed `sieve.ckpt` intact. Returns false on any I/O failure.
 ///
-/// `cluster` (S3): when non-null AND `trailer.cluster_section_present == 1`, the variable-
+/// `cluster`: when non-null AND `trailer.cluster_section_present == 1`, the variable-
 /// size cluster block is serialized between the trailer and the fixed EOF footer (the
 /// footer's trailer_len then spans trailer + cluster block). Pass nullptr (the default,
-/// used by the solo S1 path) to write a solo file with no cluster block.
+/// used by the solo path) to write a solo file with no cluster block.
 bool writeCheckpointAtomic(const std::string& ckpt_dir,
                            const mpqs::structures::HostRelationBatch& smooths,
                            const mpqs::structures::HostRelationBatch& partials,
@@ -108,7 +108,7 @@ bool writeCheckpointAtomic(const std::string& ckpt_dir,
 /// Read+validate a single checkpoint file: footer (fixed offset from EOF) → trailer (at
 /// footer.trailer_offset) → `deserialize_v2` payload. A missing/garbled footer magic or a
 /// failed schema/offset sanity check returns false (treat as torn/incomplete). Fully
-/// consumed by S2 resume; S1 ships enough for the validator.
+/// consumed by solo resume; the fields the validator needs are always present.
 bool readCheckpoint(const std::string& path, CheckpointLoadResult& out);
 
 /// Pick the freshest valid checkpoint in `dir`: try `sieve.ckpt`, fall back to
@@ -116,7 +116,7 @@ bool readCheckpoint(const std::string& path, CheckpointLoadResult& out);
 bool loadLatestCheckpoint(const std::string& dir, CheckpointLoadResult& out);
 
 // ============================================================================
-// S4 cluster-resume pure helpers (testable in isolation — no orchestrator deps)
+// Cluster-resume pure helpers (testable in isolation — no orchestrator deps)
 // ============================================================================
 
 /// Result of trimming one node's initial contiguous range by its loaded high-water.
@@ -128,13 +128,13 @@ struct ResumeTrim {
                        ///< high-water for the NEXT checkpoint (so multi-resume never mis-trims).
 };
 
-/// Compute the resumed initial-range assignment for one node (M1, plan §2.6.4, corrected
-/// option (a)): re-issue `[orig_start + hw, orig_count − hw)`. `hw` is the per-node
-/// initial-range contiguous high-water loaded from the cluster block. It is **conservative**
+/// Compute the resumed initial-range assignment for one node: re-issue
+/// `[orig_start + hw, orig_count − hw)`. `hw` is the per-node initial-range
+/// contiguous high-water loaded from the cluster block. It is **conservative**
 /// (telemetry can lag a CHUNK_COMPLETE by a beat — N1), so re-sieving from it never skips
 /// un-sieved a-values; dedup absorbs the small overlap.
 ///
-/// **Boundary hardening (S4):** a trimmed `count == 0` would set the DataTap range limit to 0,
+/// **Boundary hardening:** a trimmed `count == 0` would set the DataTap range limit to 0,
 /// which BOTH `DirectChannel::setRange` and `AsyncNetworkDataTap::setRange` interpret as
 /// "UNBOUNDED" (`range_a_limit_ == 0` disables the bound) — a node whose initial range is
 /// exactly complete would then sieve the WHOLE a-space. So when the trim would zero the count,
@@ -158,7 +158,7 @@ inline ResumeTrim computeResumeTrim(uint64_t orig_start, uint64_t orig_count,
     return ResumeTrim{ orig_start + eff_hw, count, eff_hw };
 }
 
-/// N2 topology/geometry guard (plan §2.6, S4 audit carry). A cluster checkpoint's per-node
+/// N2 topology/geometry guard. A cluster checkpoint's per-node
 /// high-water array is indexed by node_id, so the trim is valid ONLY under the SAME node
 /// topology AND the SAME overflow-pool geometry. Returns true iff the loaded block may be
 /// safely consumed:
@@ -172,7 +172,7 @@ inline ResumeTrim computeResumeTrim(uint64_t orig_start, uint64_t orig_count,
 /// fresh run re-sieves everything, never skips). NB this catches topology AND the common
 /// geometry shifts; it cannot catch a same-node-count, same-overflow-start run whose target
 /// changed without moving overflow_start (an unusual operator error) — the trailer-N check and
-/// prefix-bounds give partial cover; documented in the S4 report.
+/// prefix-bounds give partial cover.
 inline bool clusterResumeTopologyOk(uint64_t loaded_node_count, uint64_t current_node_count,
                                     uint64_t completed_prefix_cursor,
                                     uint64_t overflow_start, uint64_t overflow_end) {

@@ -400,12 +400,12 @@ void AutotuneController::runStage1_KernelParams() {
     // 1. Create ephemeral DeviceSievingController for mini-benchmarking
     auto siever = std::make_unique<mpqs::sieve::DeviceSievingController>(
         pipeline_config_.device_id);
-    siever->setAccumulatorMode(pipeline_config_.sieve_accumulator_mode);  // S1: honour CLI override in autotune probe path
-    siever->setWideAccumMode(pipeline_config_.sieve_wide_accum_mode);     // Option A: wide-accumulator width override
+    siever->setAccumulatorMode(pipeline_config_.sieve_accumulator_mode);  // honour CLI override in autotune probe path
+    siever->setWideAccumMode(pipeline_config_.sieve_wide_accum_mode);     // wide-accumulator width override
     siever->setAutotuneProbePolys(pipeline_config_.autotune_probe_polys);  // wide-probe sample size (0 = auto-scale by N)
     siever->initiate(f_data_);
 
-    // ----- OOM-guard seed budget (S2, design §2.4(A)). -------------------------------
+    // ----- OOM-guard seed budget. ----------------------------------------------------
     // loadData() -> loadSievingData() allocates ALL sieve buffers (FB, primeData,
     // bucket, scratch) in ONE call, so free VRAM read NOW reflects a device with no
     // sieve buffers resident — we must budget the ENTIRE sieve footprint, not just
@@ -446,12 +446,12 @@ void AutotuneController::runStage1_KernelParams() {
 
     siever->loadStandardConfig();
 
-    // M1 seed-geometry log (log-only, behavior-neutral). The loadStandardConfig seed
+    // Seed-geometry log (log-only, behavior-neutral). The loadStandardConfig seed
     // num_polysPerSieveCall is otherwise logged NOWHERE in --autotune_stage1 mode (this
     // ephemeral siever never calls printConfigs(); the production logs show the
     // loadPartialCustomConfig params[0], not this seed). This line is the directly-
-    // checkable source the S1 byte-identity gate / S2 no-regression gate diffs against the
-    // S0 analytically-predicted seed num_polys (512 for the ~79d default, 1024 for RSA-100).
+    // checkable source to diff against the analytically-predicted seed num_polys
+    // (512 for the ~79d default, 1024 for RSA-100).
     {
         const auto gs  = siever->getGeneralConfig();
         const auto ss  = siever->getSieveAndScanConfig();
@@ -475,7 +475,7 @@ void AutotuneController::runStage1_KernelParams() {
                          << " est total bytes=" << fp.total()
                          << " (" << (fp.total() / (1024 * 1024)) << " MB)";
 
-        // OOM-guard clamp report (S2): when the knob reduced the seed num_polys.
+        // OOM-guard clamp report: when the knob reduced the seed num_polys.
         const auto clamp = siever->getLastSeedClamp();
         if (clamp.clamped) {
             LOG(LOG_INFO) << "[Autotune][OOM-guard] seed bucket reduced num_polys "
@@ -488,7 +488,7 @@ void AutotuneController::runStage1_KernelParams() {
         }
     }
 
-    // OOM-guard fallback (S2, design §2.6). If even the reduced seed geometry still
+    // OOM-guard fallback. If even the reduced seed geometry still
     // does not fit the sieve budget (genuinely under-provisioned GPU for this M),
     // do NOT allocate (loadData would OOM). Skip Stage-1 cleanly and let the real
     // SieveStage's own loadStandardConfig reduction (now at 0.80) govern. Mirrors the
@@ -528,10 +528,10 @@ void AutotuneController::runStage1_KernelParams() {
     // 2. Run coordinate descent optimizer. Pass the non-sieve footprint
     //    (postprocessing/LP + CUDA-context reserve) so the optimizer's candidate
     //    guard (and its own seed eval) budget the COMPLETE footprint against 0.80
-    //    of free VRAM (OOM-guard S2, design §2.4(B)).
+    //    of free VRAM (the OOM guard).
     const uint64_t guard_non_sieve_bytes =
         computePostprocessingLpBytes() + memory_costs::CUDA_CONTEXT_RESERVE_BYTES;
-    // S3/S4 (wide): hand the optimizer the remaining Stage-1 wall-clock budget so its wide
+    // Wide: hand the optimizer the remaining Stage-1 wall-clock budget so its wide
     // survivors/sec probe can shrink the per-candidate window when time is tight (while always
     // reserving the mandatory loadStandardConfig-wide floor eval). Ignored on the narrow path
     // (probe_budget_sec > 0 only engages when isWideAccumulator()), so narrow is unchanged.
@@ -540,7 +540,7 @@ void AutotuneController::runStage1_KernelParams() {
         *siever, f_data_, pipeline_config_.device_id, atcfg_.thorough,
         guard_non_sieve_bytes, probe_budget_sec);
 
-    // S2: capture the resolved accumulator width before teardown so the winner preflight
+    // Capture the resolved accumulator width before teardown so the winner preflight
     // (below) validates with the SAME geometry the optimizer used (wide winner => wide check).
     const bool stage1_wide = siever->isWideAccumulator();
 
@@ -552,7 +552,7 @@ void AutotuneController::runStage1_KernelParams() {
     cudaDeviceSynchronize();
     cudaGetLastError();
 
-    // WIDE no-signal guard (S4 robustness). On the wide path `timing_us` is a survivors/sec
+    // WIDE no-signal guard. On the wide path `timing_us` is a survivors/sec
     // RATE, so a measured 0.0f means the autotune got NO signal (0 survivors/s across every
     // candidate — e.g. LP off / too-tight threshold at this scale, so no full smooths survived).
     // The apply/floor-gate block below is entered only on `timing_us > 0.0f`, so without this
@@ -583,12 +583,12 @@ void AutotuneController::runStage1_KernelParams() {
     //    before applying to the pipeline. Should never fail (optimizer uses
     //    isValid() internally), but guards against validator/optimizer bugs.
     if (kp_result.timing_us > 0.0f) {
-        // S4 FLOOR GATE (WIDE only). If the coordinate-descent winner did NOT beat the
+        // FLOOR GATE (WIDE only). If the coordinate-descent winner did NOT beat the
         // loadStandardConfig-wide floor by the margin, keep loadStandardConfig verbatim
         // (useParams=false → SieveStage calls loadStandardConfig()) — provable parity with the
         // shipping wide default, so the wide-autotune regression cannot recur. NARROW:
         // objective_is_rate==false and beats_floor==true, so this branch is never taken and the
-        // apply path below is byte-for-byte the pre-S4 behaviour.
+        // apply path below is byte-for-byte the pre-gate behaviour.
         if (kp_result.objective_is_rate && !kp_result.beats_floor) {
             LOG(LOG_INFO) << "wide autotune: floor not beaten (winner "
                           << kp_result.timing_us << " survivors/s vs floor "
@@ -1154,7 +1154,7 @@ void AutotuneController::printBufferRecommendations() {
             num_polys = std::min<uint64_t>(32768u, (1ull << (shc_dim ? shc_dim - 1 : 0)));
             // Routed through the single source-of-truth reduction helper
             // (sieve_memory_model.h). sieveBucketBudget(totalGlobalMem,0,4,5) ==
-            // (4*totalGlobalMem)/5 == 0.80*VRAM (S2; kSieveBudget flipped 3/4 -> 4/5);
+            // (4*totalGlobalMem)/5 == 0.80*VRAM (kSieveBudget flipped 3/4 -> 4/5);
             // reduceNumPolysToBudget with min_num_polys=1 mirrors this loop's `num_polys > 1`
             // floor. Matches loadStandardConfig's reduction, so the printed estimate uses the
             // same seed num_polys the production fallback path would.

@@ -1,6 +1,6 @@
 # Matrix Module (`src/matrix/`)
 
-Converts SoA relation data to a sparse GF(2) CSR matrix for the Block Wiedemann solver. Two preprocessing pipelines: **V1** (binary CSR + merge tree, M2-M8) for cluster/replay modes, and **V2** (packed 24+8 bit entries + GPU batch merges + compact-merge cycles, M9v2/M10-M12) for solo mode.
+Converts SoA relation data to a sparse GF(2) CSR matrix for the Block Wiedemann solver. Two preprocessing pipelines: **V1** (binary CSR + merge tree, M2-M8) for cluster/replay modes, and **V2** (packed 24+8 bit entries + GPU batch merges + compact-merge cycles, M9v2/M10-M11) for solo mode.
 
 ## Files
 
@@ -30,8 +30,6 @@ Converts SoA relation data to a sparse GF(2) CSR matrix for the Block Wiedemann 
 | `gpu_packed_expanded.cu` | E1-E4 kernels + Thrust LP column assignment + host driver |
 | `gpu_singleton_packed.cuh` | `gpuRemoveSingletons_packed()` — packed CSR singleton removal (M9b) |
 | `gpu_singleton_packed.cu` | Adapted S1-S5 kernels for packed entries + metadata compaction |
-| `gpu_truncation_packed.cuh` | `gpuTruncate_packed()` — packed CSR row truncation (M9c) |
-| `gpu_truncation_packed.cu` | Weight-sorted row selection + entry/metadata compaction |
 | `gpu_batch_merge.cuh` | `gpuBatchMerge()`, `MergeCandidate`, `MontgomeryContext`, `DeviceMergeWorkspace`, `BatchMergeResult` (M9e); dual `d_col_weight`/`d_gf2_col_weight` (M11a) |
 | `gpu_batch_merge.cu` | `execute_merges_kernel`, GF(2)-aware merge planner, workspace RAII |
 | `gpu_compact_packed.cuh` | `gpuCompactPackedCSR()` (M10a), `gpuCompactMergeCycles()` (M10b), `CompactResult`, `CompactMergeResult` |
@@ -174,7 +172,7 @@ the combined vector is the **XOR** of its constituents:
 
 The V2 pipeline carries **packed 1-partial entries** through all preprocessing stages, computing `sqrt_Q` products incrementally via Montgomery multiplication during merges. The merge tree is eliminated entirely. The GF(2) matrix for BW is extracted at the end by an odd-exponent filter.
 
-**Activation conditions** (gate in `orchestrator.cpp:1789`, `use_packed_pipeline`):
+**Activation conditions** (gate in `orchestrator.cpp:1822`, `use_packed_pipeline`):
 - `cluster_mode == SOLO` (workers/coordinator use the CPU V1 pipeline)
 - GPU backend selected (`--matrix_backend gpu` or `auto`)
 - **Either** a live sieve postprocessor exists (device-resident smooth + LP witness batches),
@@ -182,7 +180,7 @@ The V2 pipeline carries **packed 1-partial entries** through all preprocessing s
 
 `LINALG_ONLY` and cluster mode always use the CPU V1 pipeline.
 
-**Pipeline (current, M9v2 + M10–M12 — chained by `gpuPreprocessMatrix_packed()` in `preprocess.cpp`):**
+**Pipeline (current, M9v2 + M10–M11 — chained by `gpuPreprocessMatrix_packed()` in `preprocess.cpp`):**
 
 ```
 M9a:  gpuBuildPackedMatrix()          — packed (F+2+L)-column CSR on device
@@ -193,13 +191,15 @@ M10b: gpuCompactMergeCycles()         — merge → compact → merge … (M11a 
 M9f:  gpuExtractGF2()                 — odd-exponent filter -> binary CSR for BW
 M11b: MergeFilterPipeline::removeSingletons()
                                       — post-merge GF(2) singleton removal on host CSR
-M9c-post: truncateMatrix()            — M12-S1 coverage-greedy, char-col-aware row truncation
+M9c-post: truncateMatrix()            — coverage-greedy, char-col-aware row truncation
 M9f:  gpuProductCharCols_packed()     — Jacobi-only product character columns (appended last)
 ```
 
-The standalone `gpuTruncate_packed()` packed-pre-merge truncation (M9c) was removed from the
-driver in M11c-S1 (it preferentially dropped LP-combined rows and broke LP column pairs);
-truncation now runs once, post-merge, on the clean GF(2) CSR.
+The standalone `gpuTruncate_packed()` packed-pre-merge truncation (M9c) was removed because it
+preferentially dropped LP-combined rows and broke LP column pairs; truncation now runs once,
+post-merge, on the clean GF(2) CSR. The `gpu_truncation_packed.{cuh,cu}` sources were
+**deleted from the tree** by that same commit (`8cc411d`) and are no longer in `CMakeLists.txt` —
+no `gpuTruncate_packed` symbol exists in the build.
 
 ### Packed Entry Format
 
@@ -227,6 +227,9 @@ struct DevicePackedCSR {
     uint512*     d_sqrt_Q;       // [n_rows] — Montgomery product of constituent sqrt_Q
     uint8_t*     d_signs;        // [n_rows] — product of signs
     int32_t*     d_val_2_exps;   // [n_rows] — sum of val_2 exponents
+    uint32_t*    d_char_bits;    // [n_rows] — XOR-composed branch char vector (Stage 6);
+                                 //            always 0 in norm/none mode; passive metadata,
+                                 //            never an input to planning/singleton/truncation
 
     uint32_t n_rows, n_cols, nnz;
     bool use_managed;            // true on Jetson (cudaMallocManaged)
@@ -267,13 +270,16 @@ new_entry = make_packed(col_map[packed_col(old_entry)], packed_exp(old_entry))
 
 Returns `PackedSingletonResult` with reduced `DevicePackedCSR` (device-resident), host `row_map` and `col_map`.
 
-### M9c: Packed Truncation (legacy — not in current driver)
+### M9c: Packed Truncation (HISTORICAL — deleted from the tree)
 
-`gpuTruncate_packed()` selects the k = ceil(`truncation_factor` * `n_cols`) sparsest rows. Entries copied verbatim (no column remapping -- only rows removed). Per-row metadata compacted in parallel. Input consumed.
-
-Algorithm: compute row weights from CSR offsets, `thrust::sort_by_key` ascending, mark first k as alive, prefix-sum scatter, compact CSR + metadata.
-
-> **Removed from the V2 driver in M11c-S1.** Pre-merge packed truncation preferentially removed LP-combined rows (which carry more columns), breaking LP column pairs and collapsing ~99.98% of columns on high-LP data. The driver now truncates *once*, post-merge, on the host GF(2) CSR via the coverage-greedy `truncateMatrix()` (M9c-post / M12-S1, below). The `gpu_truncation_packed.*` files remain in-tree but are unused by `gpuPreprocessMatrix_packed()`.
+> **Removed in `8cc411d` — code and sources both.** `gpuTruncate_packed()` selected the
+> k = ceil(`truncation_factor` * `n_cols`) sparsest rows on the packed CSR *before* merging. That
+> preferentially removed LP-combined rows (which carry more columns), breaking LP column pairs and
+> collapsing ~99.98% of columns on high-LP data. The driver now truncates *once*, post-merge, on the
+> host GF(2) CSR via the coverage-greedy `truncateMatrix()` (M9c-post, below).
+> `src/matrix/gpu_truncation_packed.{cuh,cu}` were **deleted** by that commit (624 lines) and
+> dropped from `CMakeLists.txt`; the label "M9c" survives only as a stage name in log lines and in
+> the `M9c-post` designation for the host truncation that replaced it.
 
 ### M9e: Batch-Planned GPU Merge Execution
 
@@ -293,14 +299,14 @@ GPU:  one thread per candidate:
       release locks
 ```
 
-**Merge semantics:** For packed entries, matching columns get `exp_sum = e1 + e2` (exponent addition), unlike binary CSR where matching columns cancel (XOR). The merged row is strictly a union of columns with summed exponents. The GF(2) equivalence is recovered by the odd-exponent filter in M9f: `exp_sum` even implies both original exponents had the same parity, hence XOR cancellation. Proof: see audit v4 Section 10.5.
+**Merge semantics:** For packed entries, matching columns get `exp_sum = e1 + e2` (exponent addition), unlike binary CSR where matching columns cancel (XOR). The merged row is strictly a union of columns with summed exponents. The GF(2) equivalence is recovered by the odd-exponent filter in M9f: `exp_sum` even implies both original exponents had the same parity, hence XOR cancellation.
 
 **M11c — sign-encoding fix.** The merge kernel (and cluster CPU LP matching) originally assumed a
 `{1, 255}` sign encoding, but the relation data uses `{0, 1}`. The merged sign is now computed with
 encoding-agnostic XOR boolean logic (`signs[r] = signs[r1] ^ signs[r2]` at the boolean level), and
 the cluster CPU LP path was switched from XOR-on-the-wrong-encoding to a multiply. This eliminated a
-53% `HalveExponents` validity-check failure rate downstream in sqrt. M11c-S2 also hardened the
-merge: defensive `cudaMemset` of `d_ws_signs`/`d_ws_val_2_exps`/`d_ws_sqrt_Q`, and a
+53% `HalveExponents` validity-check failure rate downstream in sqrt. The same fix also hardened
+the merge: defensive `cudaMemset` of `d_ws_signs`/`d_ws_val_2_exps`/`d_ws_sqrt_Q`, and a
 `__threadfence()` before merge-lock release.
 
 **`MergeCandidate`**
@@ -352,7 +358,7 @@ because a column that is GF(2)-trivial cannot pivot a kernel vector even if it c
 even-exponent entries. Merge *execution* and compaction remain parity-agnostic and update the
 structural `d_col_weight`. The inverted-index builders that feed the planner filter by
 odd-exponent parity. `BatchMergeResult::h_gf2_col_weight` exposes the final GF(2) weights to the
-driver for the GF(2) dimension estimate (`M11a:` log line) and the M12-S2 floor.
+driver for the GF(2) dimension estimate (`M11a:` log line) and the GF(2) diversity floor.
 
 **Row indirection (`d_row_ptr`):**
 - MSB=0: original CSR row index (read from `DevicePackedCSR`)
@@ -385,7 +391,7 @@ plus the `BatchMergeResult` (workspace + `h_row_ptr`) and produces a fresh conti
 `DevicePackedCSR` with: only alive rows (`d_row_ptr[r] != ROW_DEAD`), workspace rows resolved
 inline, columns remapped to drop empty columns, and per-row metadata (`sqrt_Q`, `signs`,
 `val_2_exps`) preserved. It returns a `CompactResult` carrying per-cycle `row_map` /`col_map`
-(for cumulative composition) and `gf2_n_cols` (alive GF(2) column count, for the M12-S2 floor).
+(for cumulative composition) and `gf2_n_cols` (alive GF(2) column count, for the diversity floor).
 
 **4 compaction kernels** (`gpu_compact_packed.cu`):
 
@@ -397,14 +403,14 @@ inline, columns remapped to drop empty columns, and per-row metadata (`sqrt_Q`, 
 | K4: `compute_col_weight_alive_kernel` | Accurate column weights from alive rows only |
 
 A parallel K4-GF2 kernel (`compute_gf2_col_weight_alive_kernel`) recomputes GF(2) column weights
-(odd-exponent parity guard) so the next cycle's planner and the M12-S2 floor see accurate GF(2)
+(odd-exponent parity guard) so the next cycle's planner and the diversity floor see accurate GF(2)
 diversity.
 
 **`gpuCompactMergeCycles()`** (`gpu_compact_packed.cuh:119`) drives the loop. Termination criteria:
 
 1. **Convergence** — `cycle_merges < 0.02 × alive_rows` (less than 2% of rows merged this cycle).
 2. **Budget exhausted** — `cycle >= max_cycles` (the `--compact_cycles` value, default 5).
-3. **GF(2) column-diversity floor (M12-S2)** — stop when post-compaction GF(2) columns drop below
+3. **GF(2) column-diversity floor** — stop when post-compaction GF(2) columns drop below
    `max(gf2_min_floor, gf2_floor_factor × initial_gf2_cols)`.
 
 Per-cycle merge budget: `computeCycleBudget() = n_rows − ceil(truncation_factor × n_cols)`. The
@@ -435,11 +441,11 @@ GF(2) CSR from M9f. When rows are removed, the singleton `row_map` is **composed
 `row_map` (`composed[i] = gf2.row_map[sr.row_map[i]]`) so the final reduced rows still trace back to
 merged-row indices for sqrt. A zero-dimension guard prevents CUDA crashes on degenerate matrices.
 
-### M9c-post / M12-S1: Coverage-Greedy Truncation
+### M9c-post: Coverage-Greedy Truncation
 
 `truncateMatrix()` (`matrix_truncation.h`) runs on the clean host GF(2) CSR, *before* product
-character columns are appended. M12-S1 replaced the old sparsest-row bias with a **coverage-greedy**
-selector and a **char-col-aware** target:
+character columns are appended. The **coverage-greedy** selector replaced an earlier sparsest-row
+bias, and is paired with a **char-col-aware** target:
 
 ```
 target_rows = max(n_cols + n_extra_cols + k_excess, <coverage minimum>)
@@ -511,7 +517,7 @@ std::vector<uint32_t> selectKernelVectorRows(
 
 Top-level V2 pipeline driver (`preprocess.h:160`). Chains
 M9a -> M9b -> M10b (compact-merge cycles) -> M9f (GF(2) extract) -> M11b (post-merge GF(2)
-singleton) -> M9c-post (M12-S1 truncation) -> M9f (product char cols).
+singleton) -> M9c-post (truncation) -> M9f (product char cols).
 
 ```cpp
 PreprocessResultV2 gpuPreprocessMatrix_packed(
@@ -524,17 +530,17 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
     uint32_t max_weight = 200,          // fill-in limit for higher-weight merges
     double   truncation_factor = 1.05,  // > 0 enables M9c-post truncation, 0 disables
     uint32_t compact_cycles = 5,        // M10 max compact-merge cycles; 0 = single pass
-    uint32_t truncation_excess = 200,   // M12-S1 excess rows over (n_cols + char cols)
-    double   gf2_floor_factor = 0.5,    // M12-S2 floor as fraction of initial GF(2) col count
-    uint32_t gf2_min_floor = 8192,      // M12-S2 absolute GF(2) col floor
+    uint32_t truncation_excess = 200,   // excess rows over (n_cols + char cols)
+    double   gf2_floor_factor = 0.5,    // GF(2) floor as fraction of initial GF(2) col count
+    uint32_t gf2_min_floor = 8192,      // absolute GF(2) col floor
     CharMode char_mode = CharMode::NORM,// product char-col symbol: NORM | BRANCH | NONE (skip)
     uint64_t lp1_bound = 0);            // BRANCH aux-prime selection bound (q > lp1_bound)
 ```
 
 > The legacy `k_max=10, max_weight=200, truncation_factor=1.05` defaults still seed the merge
 > planner, but `truncation_factor` now acts as an on/off switch (the real truncation target is the
-> excess-based M12-S1 formula). The four trailing parameters (`compact_cycles`, `truncation_excess`,
-> `gf2_floor_factor`, `gf2_min_floor`) drive the M10 compact-merge loop and the M12-S2 GF(2) floor.
+> excess-based formula). The four trailing parameters (`compact_cycles`, `truncation_excess`,
+> `gf2_floor_factor`, `gf2_min_floor`) drive the M10 compact-merge loop and the GF(2) diversity floor.
 
 ### Sqrt Consumption
 
@@ -580,13 +586,13 @@ longer trigger any auto-switch.
 | Mode | Pipeline | Reason |
 |---|---|---|
 | AUTO (default), normal run | V1 legacy (projected FB+2 columns) | AUTO no longer auto-selects preprocess from LP fraction |
-| Explicit `--matrix_mode preprocess`, solo, GPU backend | V2 (packed + M10–M12) | Device-resident data, full GPU acceleration |
+| Explicit `--matrix_mode preprocess`, solo, GPU backend | V2 (packed + M10–M11) | Device-resident data, full GPU acceleration |
 | Explicit `--matrix_mode preprocess`, CPU backend | V1 (binary CSR + merge tree) | Explicit `--matrix_backend cpu` |
 | Cluster | V1 (binary CSR + merge tree) | Relations arrive on host via TCP |
 | `LINALG_ONLY` | V1 (binary CSR + merge tree) | Relations loaded from disk to host |
 | `MATRIX_ONLY` (`--matrix_only`) | Load v2 relations → Matrix → BW → Sqrt | Replay device-saved v2 relations; AUTO expands only here (raw partials present) |
 
-> **`MATRIX_ONLY` mode** (`ExecutionMode::MATRIX_ONLY`, `orchestrator.h:66`): loads device-format
+> **`MATRIX_ONLY` mode** (`ExecutionMode::MATRIX_ONLY`, `orchestrator.h:68`): loads device-format
 > `relations.v2` and runs Matrix → BW → Sqrt without sieving. Combined with `--partial_subsample` /
 > `--smooth_subsample` it is the standard harness for matrix-preprocessing experiments against
 > stored relation sets (`mpqs_work/*.v2`). `--matrix_lp1_bound <L>` additionally applies a true
@@ -595,12 +601,19 @@ longer trigger any auto-switch.
 > relation set a sieve at bound `L` would have produced — the primary Phase-2 LP-reduction lever
 > (no re-sieve). Pure smooths are never dropped; composes with `--partial_subsample` (filter first);
 > zero effect on the sieve path.
+>
+> ⚠ **Magnitude caveat — the dropped fraction is ≈ `fb_max / L`.** LP-combined rows cluster at
+> *small* large primes (combines form near `fb_max`, not near the sieve bound), so lowering `L`
+> a little below the sieve bound drops almost nothing. **Meaningful LP reduction needs `L` far
+> below the sieve bound.** Measured on RSA-110: `L = 1T → 200G` barely moved the LP fraction,
+> while `L = 20M` reached 32.0 %. Budget the flag accordingly.
 
 ### CLI
 
 Flag spellings and defaults below are the single source of truth as parsed in
-`tests/cuda-mpqs.cpp` (matrix block ~lines 510–680, `--matrix_only` at line 419) and mapped to
-`MPQSConfig` fields in `include/orchestrator.h:124–182`.
+`tests/cuda-mpqs.cpp` (matrix block ~lines 530–710, `--matrix_only` at line 441,
+`--dump_matrix` at 424, `--force_preprocess` at 431) and mapped to `MPQSConfig` fields in
+`include/orchestrator.h:125–185` (plus `dump_matrix` at `:100`).
 
 | Flag | Default | Description |
 |---|---|---|
@@ -608,19 +621,42 @@ Flag spellings and defaults below are the single source of truth as parsed in
 | `--matrix_mode <legacy\|preprocess>` | auto | `legacy` = projected FB+2 columns; `preprocess` = expanded + merges. **AUTO resolves to legacy** for normal runs (preprocess only via explicit flag or `--matrix_only`) |
 | `--char_mode <norm\|branch\|none>` | `none` | Character-column symbol. `none` = zero char cols (default); `norm` = legacy NORM symbol; `branch` = branch-fixed field-element symbol. See [Character Columns](#character-columns) |
 | `--truncation_factor <float>` | 1.05 | Truncation enable flag (>0 enabled, 0 disabled). Actual target is excess-based — see `--matrix_truncation_excess` |
-| `--matrix_truncation_excess <N>` | 200 | M12-S1 excess rows above `(n_cols + n_extra_cols)` after truncation |
-| `--matrix_gf2_floor_factor <float>` | 0.5 | M12-S2: stop compact-merge cycles when GF(2) cols fall below `factor × initial_gf2_cols` [0.0–1.0] |
-| `--matrix_gf2_min_floor <N>` | 8192 | M12-S2 absolute minimum GF(2) column floor |
+| `--matrix_truncation_excess <N>` | 200 | Excess rows above `(n_cols + n_extra_cols)` after truncation |
+| `--matrix_gf2_floor_factor <float>` | 0.5 | Stop compact-merge cycles when GF(2) cols fall below `factor × initial_gf2_cols` [0.0–1.0] |
+| `--matrix_gf2_min_floor <N>` | 8192 | Absolute minimum GF(2) column floor |
 | `--compact_cycles <N>` | 5 | M10 max compact-merge cycles (GPU backend); 0 = single pass (pre-M10 behavior) |
 | `--merge_max_weight <K>` | 10 | **DIAGNOSTIC** (CPU preprocess `mergeHigherWeight` `k_max`). `K=2` disables all weight≥3 multi-cycle merges (singleton + weight-2 only, legacy-like 2-cycles). See [Preprocessing Collapse](#preprocessing-collapse--cpu-merge-tree-path-3-facet-investigation-2026-06-08) |
 | `--force_preprocess` | off | **DIAGNOSTIC** — force the preprocess expand+merge path even with 0 raw partials (else the orchestrator force-legacies). Runs the reduction on a smooths-only set to isolate reduction vs. partial inclusion |
 | `--lp_preprocess_threshold <float>` | 0.55 | **DEPRECATED / INERT.** Formerly the LP fraction above which AUTO selected preprocess; the auto-switch was removed. Still parsed, no effect |
 | `--lp_matrix_threshold <float>` | — | **DEPRECATED** alias for `--lp_preprocess_threshold` (backwards compatibility; also inert) |
 | `--matrix_only` | off | Load v2 relations, run matrix preprocessing + BW + sqrt (no sieving) |
-| `--matrix_lp1_bound <L>` | 0 (inert) | `matrix_only` LP-magnitude down-filter (suffix-aware K/M/B/T): drop LP-combined relations with large prime > L (and matching partials) after `.v2` load. Pure smooths never dropped. Primary Phase-2 LP-reduction lever — trials a lower effective L with no re-sieve |
-| `--matrix_max_rows <N>` | 0 (off) | Cap the legacy relation batch to the first `N` rows (suffix-drop) before matrix build / `pad_to_square`, preserving row↔relation↔FB-column alignment (incl. the factor CSR). Used to keep padded `n_cols ≤ 2^24-1` so TiledCOO-256 stays admissible on very large matrices (e.g. the RSA-155 truncated-fallback LA run, `--matrix_max_rows 16700000`) |
+| `--matrix_lp1_bound <L>` | 0 (inert) | `matrix_only` LP-magnitude down-filter (suffix-aware K/M/B/T): drop LP-combined relations with large prime > L (and matching partials) after `.v2` load. Pure smooths never dropped. Primary Phase-2 LP-reduction lever — trials a lower effective L with no re-sieve. ⚠ Dropped fraction ≈ `fb_max/L` — see the magnitude caveat above |
+| `--matrix_max_rows <N>` | 0 (off) | Cap the legacy relation batch to the first `N` rows (suffix-drop) before matrix build / `pad_to_square`, preserving row↔relation↔FB-column alignment (incl. the factor CSR). ~~Used to keep padded `n_cols ≤ 2^24-1` so TiledCOO-256 stays admissible on very large matrices~~ (**superseded 2026-08-25 — see the note below; the columns-only framing is wrong and the stated purpose went unclaimed**) (e.g. the RSA-155 truncated-fallback LA run, `--matrix_max_rows 16700000`) |
+| `--dump_matrix` | off | **DIAGNOSTIC** — after the matrix stage, write the finalized `matrix_A_` to `work_dir` as a CSR binary plus a human-readable column legend (`orchestrator.cpp:2022-2037`): `work_dir/matrix.csr` via `DumpHostMatrixCSR()` and `work_dir/matrix_columns.txt` via `DumpMatrixColumnLegend()`. Fires on every path (legacy `MatrixStage`, inline GPU/CPU preprocess); strictly additive and zero-overhead when unset |
 | `--partial_subsample <float>` | 1.0 | `matrix_only` experiments: fraction of partials/LP-combined to retain [0.0–1.0] |
 | `--smooth_subsample <float>` | 1.0 | `matrix_only` experiments: fraction of pure smooths to retain (LP-combined always kept) [0.0–1.0] |
+
+#### ⚠ `--matrix_max_rows` binds on ROWS as well as columns — check BOTH dims against 2^24−1 (corrected 2026-08-25)
+
+The flag caps **rows** directly: `orchestrator.cpp:1600-1618` suffix-drops
+`host_relations_soa_` to the first `matrix_max_rows` relations. The column effect is only
+*indirect*, via `pad_to_square` (`src/linalg/src/lingen/bw_solver.cu:128`), which pads to
+`D = max(n_rows, n_cols)` — so **whichever dimension is larger sets the padded dimension**, and
+`n_rows` alone can push `D` past the TiledCOO-256 limit even when `n_cols` is comfortably inside it.
+
+The RSA-150 handoff reasoned only about `n_cols` (15,663,546 < 2^24−1 = **16,777,215**) and called
+the cap an **expected no-op**. It was not: the sieve delivered **17,269,643 rows**, which *exceeds*
+2^24−1, so the cap was **load-bearing** and dropped **569,643 rows**. Matrix excess fell from the
+projected **+10.25 %** to **+6.62 %** — still amply overdetermined, so the run was unharmed, but the
+reasoning that predicted "no-op" was wrong for the right-hand dimension.
+
+**The cap's stated purpose went unclaimed.** In that same run the SpMM autotuner selected
+**M4RM / PForDelta / Warp-CSR** and never chose **TiledCOO** or **Delta-16** — the very formats the
+`n_cols ≤ 2^24−1` argument exists to keep admissible. So the cap's benefit in practice was
+incidental (trimming sieve surplus), not the format-admissibility guarantee it was justified by.
+
+**Rule:** before setting or omitting `--matrix_max_rows`, check **`n_rows` and `n_cols`
+independently** against 2^24−1.
 
 ---
 
@@ -791,6 +827,3 @@ expansion rewrite, **unverified here, and not currently warranted** given AUTO �
 - **Flags:** `--truncation_min_rows`, `--preprocess_lp_materialize_max` (fixes); `--merge_max_weight`,
   `--force_preprocess` (diagnostics) — see the [CLI](#cli) table.
 - **Release notes:** the three fixes are summarized in the CHANGELOG.
-- The full diagnosis, the factorization / raw-root / genus-signature verifiers, the reproduction
-  harness, and the theory writeups live in the project's internal preprocessing investigation (not
-  part of the public release).

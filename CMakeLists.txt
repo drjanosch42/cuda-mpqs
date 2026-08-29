@@ -182,7 +182,7 @@ add_subdirectory(src/autotune)
 add_subdirectory(src/orchestrator)
 add_subdirectory(src/cluster)
 
-# P0.b coordinator-LP replay + load-generator harness (campaign sign-off S1).
+# Coordinator-LP replay + load-generator harness.
 # Test-harness targets only; host-only (no kernels). Not part of the release allowlist.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/lp_replay/CMakeLists.txt")
     add_subdirectory(tools/lp_replay)

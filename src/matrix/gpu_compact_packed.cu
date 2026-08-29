@@ -118,7 +118,7 @@ void compute_col_weight_alive_kernel(
 }
 
 // ============================================================================
-// Plain-CSR GF(2) column weight kernel (for M12-S2 initial count)
+// Plain-CSR GF(2) column weight kernel (for the diversity-floor initial count)
 // ============================================================================
 
 /// One thread per row over a plain (no indirection) CSR. Atomically
@@ -141,7 +141,7 @@ void compute_gf2_col_weights_plain_kernel(
 }
 
 /// Helper: count GF(2)-alive columns (i.e. columns with at least one
-/// odd-exponent entry) in a plain DevicePackedCSR. Used by M12-S2 to
+/// odd-exponent entry) in a plain DevicePackedCSR. Used by the GF(2) column-diversity floor to
 /// snapshot `initial_gf2_cols` before any merge. Cost: one kernel launch
 /// + one D→H of n_cols uint32_t.
 static uint32_t countGf2AliveCols(const DevicePackedCSR& csr) {
@@ -577,14 +577,14 @@ CompactMergeResult gpuCompactMergeCycles(
     uint32_t total_merges = 0;
     uint32_t cycles_run   = 0;
 
-    // [M12-S2] Snapshot initial GF(2) col count (post-singleton, pre-merge) and
+    // Snapshot the initial GF(2) col count (post-singleton, pre-merge) and
     // derive the diversity floor. Cost: one extra kernel launch + small D→H copy.
     const uint32_t initial_gf2_cols = countGf2AliveCols(csr);
     const uint32_t computed_floor =
         static_cast<uint32_t>(gf2_floor_factor *
                               static_cast<double>(initial_gf2_cols));
     const uint32_t gf2_floor = std::max(gf2_min_floor, computed_floor);
-    LOG(LOG_INFO) << "  [M12-S2] Initial GF(2) cols (post-singleton): "
+    LOG(LOG_INFO) << "  [GF2-Floor] Initial GF(2) cols (post-singleton): "
                   << initial_gf2_cols
                   << ", floor=" << gf2_floor
                   << " (factor=" << std::fixed << std::setprecision(3)
@@ -624,7 +624,7 @@ CompactMergeResult gpuCompactMergeCycles(
                     total_merges, cycles_run};
         }
 
-        // [M12-S2] GF(2) column-diversity floor: count GF(2)-alive columns from
+        // GF(2) column-diversity floor: count GF(2)-alive columns from
         // the merge's GF(2) col-weight vector (post-merge, pre-compaction).
         // If below the floor, exit BEFORE compacting and return this cycle's
         // merge directly — mirrors the convergence-return path so that
@@ -640,7 +640,7 @@ CompactMergeResult gpuCompactMergeCycles(
             ? 100.0 * static_cast<double>(gf2_alive_pre_compact)
                     / static_cast<double>(initial_gf2_cols)
             : 0.0;
-        LOG(LOG_INFO) << "  [M12-S2] cycle " << cycle
+        LOG(LOG_INFO) << "  [GF2-Floor] cycle " << cycle
                       << ": rows_merged=" << cycle_merges
                       << " (" << std::fixed << std::setprecision(1) << rows_merged_pct << "%)"
                       << ", gf2_cols_alive=" << gf2_alive_pre_compact
@@ -648,7 +648,7 @@ CompactMergeResult gpuCompactMergeCycles(
                       << ", floor=" << gf2_floor;
 
         if (gf2_alive_pre_compact < gf2_floor) {
-            LOG(LOG_WARNING) << "  [M12-S2] diversity floor reached, stopping compact-merge"
+            LOG(LOG_WARNING) << "  [GF2-Floor] diversity floor reached, stopping compact-merge"
                              << " (gf2_cols_alive=" << gf2_alive_pre_compact
                              << " < floor=" << gf2_floor << ").";
             ++cycles_run;

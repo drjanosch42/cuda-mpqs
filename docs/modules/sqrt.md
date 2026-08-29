@@ -21,7 +21,7 @@ Static library `mpqs_sqrt`. Separable CUDA compilation ON. Links `mpqs_common`, 
 1. **Unpack** packed `uint64_t` solution bits into a per-relation binary mask.
 2. **ComputeX** (CPU oracle): X = Π sqrt\_Q[i] (mod N) for selected relations, in Montgomery arithmetic. `sqrt_Q[i] = |a_i·x_i + b_i|`.
 3. **ComputeY** (CPU oracle): Y = (-1)^s · 2^(e₂/2) · Π p_j^(e_j/2) · LP (mod N), where 2·e_j = sum of factor exponents across selected relations; s = total sign count / 2. All exponents guaranteed even by the GF(2) null space.
-4. **GPU validation** (inline in `Perform()`): constructs a single-solution `BWKernelSolutionView`, runs `ComputeXBatchedGPU` (M2) / `ComputeYBatchedGPU` (M3) and compares against CPU oracles; also verifies X²_gpu ≡ Y²_gpu (mod N). This is a debug/verification step ensuring GPU and CPU paths agree.
+4. **GPU validation** (inline in `Perform()`, **`#ifdef MPQS_DEBUG` only** — `sqrt_step.cu:1676-1707` and `:1711-1750`; `MPQS_DEBUG` is defined nowhere in the build system, so this is compiled out of every normal build): constructs a single-solution `BWKernelSolutionView`, runs `ComputeXBatchedGPU` (M2) / `ComputeYBatchedGPU` (M3) and compares against CPU oracles; also verifies X²_gpu ≡ Y²_gpu (mod N).
 5. **SanityCheck**: verify X² ≡ Y² (mod N) using `modpow`. On failure, calls `RelationBatch::validate_host_batch()` for diagnostics.
 6. **Factor extraction**: `BatchedGCDKernel` computes gcd(|X−Y|, N) and gcd(X+Y, N) per solution. `RefineFactorsKernel` (M10) then extracts pairwise-coprime factors via iterative GCD refinement.
 
@@ -90,17 +90,38 @@ Grid: `<<<n_solutions, 256>>>`. Shared memory: `256 × sizeof(uint512)`.
 ### Factor Extraction
 
 #### `BatchedGCDKernel` (M4)
-One thread per solution. Computes `diff = |X[j]−Y[j]|` (explicit comparison to avoid unsigned wrap), `f1 = gcd(diff, N)`. If trivial, computes `sum = X[j]+Y[j]`, `f2 = gcd(sum, N)`. Sets `d_factor_status[j]` to 0 (trivial), 1 (via |X−Y|), or 2 (via X+Y). Uses `mpqs::math::gcd()` (`__host__ __device__`).
+One thread per solution, **single block** — launched `<<<1, n>>>` (`sqrt_step.cu:1449`), so `n` is hard-capped at 1024 and a larger `n` throws (`:1442-1448`). Computes `diff = |X[j]−Y[j]|` (explicit comparison to avoid unsigned wrap), `f1 = gcd(diff, N)`. If trivial, computes `sum = (X[j]+Y[j]) mod N` via `uint512::add_mod` (`:753-754`) — output-identical to a bare add for N < 2^511 and **overflow-safe at N ≥ 2^511 (RSA-155)**, where X+Y reaches ~2N and a plain 512-bit add would wrap — then `f2 = gcd(sum, N)`. Sets `d_factor_status[j]` to 0 (trivial), 1 (via |X−Y|), or 2 (via X+Y). Uses `mpqs::math::gcd()` (`__host__ __device__`). The host `Perform()` path performs the identical `add_mod` step (`:1803-1804`).
 
 **Per-solution nontrivial-GCD rate (unconditional).** After `BatchedGCD` downloads
 `d_factor_status`, the host counts how many of the `n` Block-Wiedemann solutions yielded a
 nontrivial factor and logs the rate `k/n` (with the distinct factor pairs found) at `LOG_DEBUG_1`
-(statistics block `sqrt_step.cu:1478-1545`). This block runs unconditionally on every `BatchedGCD`
+(statistics block `sqrt_step.cu:1478-1543`). This block runs unconditionally on every `BatchedGCD`
 call — it is **not** gated by `--sqrt_diagnostic`. This is the diagnostic for the high-LP collapse:
 an unobstructed run sits near the ~50% theoretical cap, whereas an obstructed (2-cycle-dominated) run
 collapses to 0%. Capture it with `--debug --log_file <path>` (or `--log_level 1`) — it is suppressed
 at the default `--verbose`/info level. (`--sqrt_diagnostic` instead gates a separate
-solution-diversity diagnostic, logged at `LOG_INFO` in `orchestrator.cpp:2302-2320`.)
+solution-diversity diagnostic, logged at `LOG_INFO` in `orchestrator.cpp:2302-2318`; `sqrt_diagnostic` appears nowhere under `src/sqrt/`.)
+
+**Measured shift in that rate at v1.0.6 — an upstream relation-set change, not a sqrt change.**
+`src/sqrt/` is byte-identical to v1.0.5; what changed is the input. v1.0.6 activated
+the device-side `sqrt_Q` identity guard in `global_combine_kernel`
+(`src/largeprimes/largeprime.cu:449`, inside the kernel at `:402`; rationale comment `:433-437`).
+At v1.0.5 that exact line was present but **commented out**, so the GPU LP path could combine a
+partial with its own witness copy. Such a row has `Q_res = sqrt_Q(P)^2` and an all-even exponent
+vector, making it a **guaranteed-trivial** dependency (`X ≡ ±Y`) — and, because the product is
+distinct from every other row, it is **unique and therefore survives dedup into the matrix**. It was
+roughly **2 % of every solo `--cuda_graph_unroll 0` LP matrix**: pure ballast that consumed BW
+solutions without ever being able to yield a factor.
+
+Measured at RSA-100 solo: per-solution nontrivial-GCD rate **48.2 % (105/218) → 52.2 % (118/226)**.
+
+**Scope: solo GPU-LP only.** Cluster runs were never exposed — workers sieve NO-LP, and the
+coordinator has carried the equivalent **host** guard since 1.0.3a (`src/cluster/cpu_lp.cu:69`,
+counted as `total_dup_dropped_`).
+
+⚠ **This does not touch the 2-cycle cliff below.** It removes a fixed ~2 % of trivial ballast and
+nudges an already-healthy rate toward the ~50 % theoretical cap. The cliff is a separate,
+near-discontinuous collapse to 0 % and is unaffected by this guard.
 
 #### `RefineFactorsKernel` (M10)
 Extracts finest factorization from BatchedGCDKernel output via coprime refinement.
@@ -167,10 +188,10 @@ Pre-allocated device buffer pool, defined in `sqrt_step.h`. Allocated lazily on 
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `Perform` | `pair<uint512,uint512>(const vector<uint64_t>& solution_bits, const HostRelationBatch& batch, const vector<FBType>& fb)` | CPU fallback path: unpacks solution bits, runs CPU X/Y oracles, GPU validation (M2/M3), sanity check (X²≡Y² mod N), CPU-side GCD. Returns `{factor, cofactor}` or `{0,0}`/`{1,N}`. Templated on `FBType` (instantiated for `uint32_t`). |
+| `Perform` | `pair<uint512,uint512>(const vector<uint64_t>& solution_bits, const HostRelationBatch& batch, const vector<FBType>& fb, const uint512* lp_correction = nullptr)` | CPU path, selected by `--sqrt_legacy` and used as the fallback when the batched GPU path finds no nontrivial factor. The optional 4th argument (`sqrt_step.h:97`) is the Montgomery-domain LP Y-correction for the expanded-matrix path, applied at `sqrt_step.cu:1752-1757`. Behaviour: unpacks solution bits, runs CPU X/Y oracles, GPU validation (M2/M3, **debug builds only**), sanity check (X²≡Y² mod N), CPU-side GCD. Returns `{factor, cofactor}` or `{0,0}`/`{1,N}`. Templated on `FBType` (instantiated for `uint32_t`). |
 | `ComputeXBatchedGPU` | `void(const BWKernelSolutionView& solutions, const HostRelationBatch& batch)` | 3-phase GPU pipeline: TransformSqrtQ → ComputeX_ChunkReduce → FinalReduce. Results on device, retrieve via `getDeviceX()`. |
 | `ComputeYBatchedGPU` | `void(const BWKernelSolutionView& solutions, const HostRelationBatch& batch, const vector<FBType>& fb)` | GPU pipeline: LP transform/reduce, AccumExponents_Parallel, HalveExponents, BatchedExponentiateY. Results on device, retrieve via `getDeviceY()`. Templated on `FBType`. |
-| `BatchedGCD` | `pair<uint512,uint512>(const uint512* d_X, const uint512* d_Y, int n)` | Launches BatchedGCDKernel + RefineFactorsKernel (M10). Host-side statistics, coprimality verification, product-divides-N check. Returns `{factor, cofactor}`. |
+| `BatchedGCD` | `pair<uint512,uint512>(const uint512* d_X, const uint512* d_Y, int n)` | Launches BatchedGCDKernel (`<<<1, n>>>`, `n ≤ 1024` enforced by a throw) + RefineFactorsKernel (M10). Host-side per-solution nontrivial-rate statistics run **unconditionally** (`sqrt_step.cu:1478-1543`); the pairwise-coprimality and product-divides-N checks are **`#ifdef MPQS_DEBUG` only** (`:1546-1587`), as is the redundant `factor * cofactor == N` re-check (`:1596-1615`). Returns `{factor, cofactor}`. |
 | `ApplyLPCorrection` | `void(const uint512* d_correction_mont, uint32_t n_solutions)` | Multiplies each `d_Y[sol]` by a precomputed Montgomery-domain LP correction (M5, expanded-matrix path). |
 | `getDeviceX` | `const uint512*() const` | Device pointer to X results (valid after ComputeXBatchedGPU). |
 | `getDeviceY` | `const uint512*() const` | Device pointer to Y results (valid after ComputeYBatchedGPU). |
@@ -201,7 +222,10 @@ The class owns a dedicated CUDA stream (`stream_`) created in the constructor an
 
 ## NVCC Workaround
 
-The `__noinline__` attribute may be required on certain device functions to work around NVCC code generation issues with deeply nested template instantiations in Montgomery arithmetic.
+⚠ **Not in this module.** `src/sqrt/` contains no `__noinline__` and no NVCC workaround. The
+project's only one lives in the common module — `__device__ __noinline__ square_uint512()`
+(`src/common/mpqs_soa.cu:618-623`), split out of the SoA validation kernel to stop NVCC 13.0
+miscompiling the inlined `uint512::mult` at `-O3` on SM 12.0. See [common.md](common.md).
 
 ## `BWKernelSolutionView` (from `src/linalg/include/bw_solution_view.h`)
 
@@ -209,10 +233,10 @@ Lightweight device-side view passed to kernels:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `d_data` | `uint64_t*` | Device pointer to packed solution bit-matrix (row-major: solution × words_per_vec) |
-| `num_solutions` | `uint32_t` | Number of solution vectors (≤ 64) |
-| `words_per_vec` | `uint32_t` | `ceil(num_relations / 64)` |
-| `num_relations` | `uint32_t` | Number of relations |
+| `d_data` | `const uint64_t*` | Device pointer to packed solution bit-matrix (row-major: solution × words_per_vec) |
+| `num_solutions` | `uint32_t` | Number of kernel vectors K. **No 64 cap in the struct** — the binding limit is `BatchedGCDKernel`'s single-block launch, `n ≤ 1024` (`sqrt_step.cu:1442-1448`). |
+| `words_per_vec` | `uint32_t` | `ceil(num_rows / 64)` |
+| `num_rows` | `uint32_t` | Original (unpadded) matrix row count. ⚠ The field is `num_rows`, **not** `num_relations`. |
 
 ## `FakeRelationGenerator` (testing)
 
@@ -241,9 +265,9 @@ The sqrt stage consumes the output of the Block Wiedemann linear algebra solver 
 
 1. **`Perform()` path (single solution):** accepts a packed `std::vector<uint64_t>` bitmask (`solution_bits`) where bit _i_ indicates that relation _i_ is selected by the kernel vector. Internally unpacks to a per-relation `uint8_t` mask via `unpack_bits_local()`.
 
-2. **Batched GPU path (`ComputeXBatchedGPU` / `ComputeYBatchedGPU` / `BatchedGCD`):** accepts a `BWKernelSolutionView` — a device-resident packed bit-matrix where row _j_ is solution _j_ and column _i_ is relation _i_. This enables processing all kernel vectors (≤ 64) simultaneously in a single kernel launch.
+2. **Batched GPU path (`ComputeXBatchedGPU` / `ComputeYBatchedGPU` / `BatchedGCD`):** accepts a `BWKernelSolutionView` — a device-resident packed bit-matrix where row _j_ is solution _j_ and column _i_ is relation _i_. This enables processing all kernel vectors simultaneously in a single kernel launch (bounded by `BatchedGCDKernel`'s `n ≤ 1024`, not by 64; RSA-150 at `BW_BLOCK=256` produced 56 solutions in one batch).
 
-The orchestrator calls the batched GPU path for all solutions simultaneously, falling back to the `Perform()` CPU loop if no nontrivial factors are found.
+The orchestrator calls the batched GPU path for all solutions simultaneously, falling back to the `Perform()` CPU loop if no nontrivial factors are found. `--sqrt_legacy` (`MPQSConfig::sqrt_legacy`, `include/orchestrator.h:328`) takes the `Perform()` CPU loop directly instead, one kernel vector at a time (`orchestrator.cpp:7025-7045`); it is a debug/benchmark switch, default off.
 
 ## Failure Modes (mathematical, not bugs)
 

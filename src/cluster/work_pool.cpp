@@ -4,7 +4,7 @@
 // See LICENSE at the repository root for licensing terms, including the NVIDIA CUDA Toolkit exception.
 
 /// @file work_pool.cpp
-/// @brief WorkPool implementation — tracked-checkout model (S5).
+/// @brief WorkPool implementation — tracked-checkout model.
 
 #include "work_pool.h"
 
@@ -14,7 +14,7 @@ WorkPool::WorkPool(uint64_t a_start, uint64_t total_a, uint32_t unit_size)
     : next_(a_start), end_(a_start + total_a), unit_size_(unit_size) {}
 
 // ============================================================================
-// S2 legacy interface (wraps checkoutWork with worker_id=0)
+// Legacy interface (wraps checkoutWork with worker_id=0)
 // ============================================================================
 
 std::optional<WorkUnit> WorkPool::requestWork() {
@@ -30,7 +30,7 @@ std::optional<WorkUnit> WorkPool::requestWork(uint64_t requested_count) {
 }
 
 // ============================================================================
-// S5: tracked checkout
+// Tracked checkout
 // ============================================================================
 
 std::optional<WorkPool::CheckedOutWork> WorkPool::checkoutWork(uint64_t count, uint8_t worker_id) {

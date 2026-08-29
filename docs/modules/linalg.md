@@ -51,7 +51,6 @@ src/linalg/
 ├── benchmarks/                            # Standalone benchmark executables
 ├── python/                                # verify_bw_pipeline.py, block_wiedemann_lingen_v5.py (CPU reference)
 ├── logs/                                  # Run logs and golden reference outputs
-├── tools/release/                         # Independent public-release pipeline (allowlist extraction, sweep, verify)
 └── CMakeLists.txt                         # Dual-mode: standalone & submodule
 ```
 
@@ -68,6 +67,14 @@ Finds generator polynomial Pi(x) in F_2[x]^((m+n) × (m+n)) such that S(x) · Pi
 ### Stage 3: Solution Reconstruction
 
 For each candidate column u(x) from Pi, computes w = sum_k B^(deg-k) · Z · u_k via Horner evaluation, then strips valuation (w ← B·w) until B·w = 0. Batch mode processes multiple candidates in parallel. Circular history buffer (default depth 64) enables backtracking to recover solutions that annihilate during stripping. If `stage3_perform_unpermutation` is true (default), applies inverse row permutation P^T to results before output. Outputs linearly independent kernel vectors — both host-side (`get_solutions()`) and device-side packed bit-matrix (`get_device_solutions()` → `BWKernelSolutionView`).
+
+⚠ **Stage 3 looks silent for hours at production scale, and that is a logging artefact.** The Horner
+loop's per-degree progress line (`[SolutionReconstructor] Horner Loop Degree = k (…%)`,
+`src/lingen/stage3/solution_reconstructor.cu:441`) is emitted at **`LOG_DEBUG_2`**, which `--debug`
+(= `LOG_DEBUG_1`) does **not** reach; only the per-batch header (`:421`, `LOG_DEBUG_1`) and the
+per-solution hits (`:674`) show up at `--debug`. Run the LA stage at **`--log_level 2`** to watch
+reconstruction advance. The multi-hour "silent init" observed on RSA-155 was this loop, not lingen
+Stage-2 initialisation.
 
 ## BlockWiedemannSolver API
 
@@ -101,13 +108,13 @@ Single source of truth. Field naming convention: no prefix = invariant, `autotun
 | Stage 2 verification | annihilation checks (GPU/legacy), oracle verification, post-run legacy check | all false |
 | Stage 3 | `stage3_skip`, `stage3_batch_mode`, `stage3_max_solutions`, `stage3_perform_unpermutation`, `stage3_history_depth`, `stage3_check_interval`, `stage3_stripping_limit` | false, true, -1 (all), true, 64, 16, 0 (heuristic) |
 
-**Parent project overrides** (`MPQSOrchestrator::LinearAlgebraStage()`, `src/orchestrator/orchestrator.cpp:6262-6300`): `m_block = n_block = 256` from `--bw_m`/`--bw_n` (submodule default: 64), adaptively downscaled to 64 (matrix dim < 4000) or 128 (dim < 16000) when neither flag is pinned (`block_size_pinned` records CLI pinning); `stage2_gpu_mode = true`; `solve_transposed = true`; `stage1_gpu_batch_size = 8`; `autotune_tune_spmm = false` when matrix dim < 100000 (autotune overhead dominates); `checkpoint_prefix = <work_dir>/bw`; `stage3_save_solutions = true` under `--dump_kernel_vectors`.
+**Parent project overrides** (`MPQSOrchestrator::LinearAlgebraStage()`, `src/orchestrator/orchestrator.cpp:6883-6941`): `m_block = n_block = 256` from `--bw_m`/`--bw_n` (submodule default: 64), adaptively downscaled to 64 (matrix dim < 4000) or 128 (dim < 16000) when neither flag is pinned (`block_size_pinned` records CLI pinning); `stage2_gpu_mode = true`; `solve_transposed = true`; `stage1_gpu_batch_size = 8`; `autotune_tune_spmm = false` when matrix dim < 100000 (autotune overhead dominates); `checkpoint_prefix = <work_dir>/bw`; `stage3_save_solutions = true` under `--dump_kernel_vectors`.
 
-**Note on the Stage 1 I/O row above:** the submodule's own default is `stage1_load_checkpoints = true` (`stage2_load_checkpoints`/`stage3_load_checkpoints` default `false`), but as of the `--bw_checkpoint_dir`/`--bw_resume` wiring (`orchestrator.cpp:6300-6331`) the parent now forces **all three** (`stage1/2/3_load_checkpoints`) to `false` unless `--bw_resume` is explicitly passed — this closes a latent hazard where a default work-dir checkpoint prefix plus the submodule's own `load=true` default could silently consume a stale/partial checkpoint. So in the shipped pipeline, loading never happens implicitly; see below.
+**Note on the Stage 1 I/O row above:** the submodule's own default is `stage1_load_checkpoints = true` (`stage2_load_checkpoints`/`stage3_load_checkpoints` default `false`), but as of the `--bw_checkpoint_dir`/`--bw_resume` wiring (`orchestrator.cpp:6894-6907`) the parent now forces **all three** (`stage1/2/3_load_checkpoints`) to `false` unless `--bw_resume` is explicitly passed — this closes a latent hazard where a default work-dir checkpoint prefix plus the submodule's own `load=true` default could silently consume a stale/partial checkpoint. So in the shipped pipeline, loading never happens implicitly; see below.
 
 ### BW Stage-Boundary Checkpointing (`--bw_checkpoint_dir`, `--bw_resume`, `--bw_max_solutions`)
 
-Three orchestrator-level flags (parsed `tests/cuda-mpqs.cpp:860-871`, wired `src/orchestrator/orchestrator.cpp:6300-6331`), independent of the submodule's own always-on Stage-1 S/Z/X checkpoint mechanism described above:
+Three orchestrator-level flags (parsed `tests/cuda-mpqs.cpp:926-945`, wired `src/orchestrator/orchestrator.cpp:6894-6907`; config fields `include/orchestrator.h:294-296`), independent of the submodule's own always-on Stage-1 S/Z/X checkpoint mechanism described above:
 
 | Flag | Config field | Default | Description |
 |---|---|---|---|
@@ -115,9 +122,74 @@ Three orchestrator-level flags (parsed `tests/cuda-mpqs.cpp:860-871`, wired `src
 | `--bw_checkpoint_dir <path>` | `bw_checkpoint_dir` (string) | `""` (off) | Save Krylov S-sequence / lingen Π-polynomial / final solutions at stage boundaries under `<path>/bw*`. Sets `checkpoint_prefix` and enables the save flags for all three stages. |
 | `--bw_resume` | `bw_resume` (bool) | `false` | Load previously-completed-stage artifacts from `--bw_checkpoint_dir` and skip them. Without this flag, `--bw_checkpoint_dir` alone only **saves** — it never loads (see the note above). |
 
-**Scope — Tier-1 only:** resumes from the last **completed** stage, not mid-stage — a crash partway through a multi-hour Stage-3 reconstruction still restarts Stage 3 from scratch; it only saves re-running Stage 1 and/or Stage 2 if those had already finished. Integrity is checked via an FNV-1a `_ckpt_tag.bin` hash on load (mismatch → recompute, never load stale data).
+**Scope — stage boundaries only:** resumes from the last **completed** stage, not mid-stage — a crash partway through a multi-hour Stage-3 reconstruction still restarts Stage 3 from scratch; it only saves re-running Stage 1 and/or Stage 2 if those had already finished. Integrity is checked via an FNV-1a `_ckpt_tag.bin` hash on load (mismatch → recompute, never load stale data).
 
-**Status: newly written, NOT yet validated end-to-end** (as of 2026-07-15) — needs a kill/resume smoke test (checkpoint, kill mid-run, resume, confirm stage-skip + bit-identical factors) before production reliance; that validation is a pending follow-up.
+**Status: NOT yet validated end-to-end** (as of 2026-07-15; still open at 2026-08-25) — needs a kill/resume smoke test (checkpoint, kill mid-run, resume, confirm stage-skip + bit-identical factors) before production reliance; that validation is a pending follow-up. Specifically, **`--bw_resume`'s load path has never been exercised**: every production LA run to date (including both RSA-150 LA jobs, 2592783 and 2618471) was a fresh run with `resume=none`, so only the *save* side has ever executed in anger.
+
+⚠ **`--bw_max_solutions` is a solution-COUNT stop, not a batch cap — and that gap is real, not theoretical.** Because the stop counts solutions rather than bounding batches, a config that under-delivers in batch 1 will still *enter* a later batch and can burn hours there for zero yield. Measured at RSA-150: at `BW_BLOCK=128` the solver found only **3** solutions in batch 1 and then spent **3 h 25 m** on a completely zero-yield batch 2. At `BW_BLOCK=256` the same matrix produced **56** solutions in batch 1, the cap (`--bw_max_solutions 24`) bound for the first time in production, and batch 2 was skipped entirely. See the block-width section below.
+
+### Block Width: `BW_BLOCK=256` is the production default, bracketed from both sides (2026-08-25)
+
+`--bw_m` / `--bw_n` both default to **256** (`include/orchestrator.h:292-293`; the submodule's own
+`BWSolverConfig` default is 64, overridden by the orchestrator). At RSA-150 scale this is now
+measured from **both** directions, and 256 is the only value that works.
+
+**Below — `BW_BLOCK=128` is a 2.687× total LA regression.** Measured on the **same matrix, same
+binary, same relation file** (RSA-150, job 2618471 at n=256 vs 2592783 at n=128; only uncontrolled
+variable = a different H100 node, far too small to explain the effect):
+
+| Stage | bw128 | bw256 | Ratio 128/256 |
+|---|---|---|---|
+| Stage 1 Krylov | 9,240.63 s | 5,013.48 s | **1.843×** |
+| Stage 2 lingen | 43,016.44 s | 15,259.05 s | **2.819×** |
+| Stage 3 reconstruction | 20,164.96 s | 5,684.18 s | **3.548×** |
+| **BW total** | 74,107.01 s | 27,580.40 s | **2.687×** |
+
+The launcher's old rationale — *"reconstruction cost ∝ n, so a smaller block halves it"* — is
+**REFUTED**. The sequence length is `L = 2N/n`, so the step count scales ∝ 1/n and exactly cancels
+the per-step Horner halving; reconstruction is therefore ~invariant in n by that argument, while
+Stages 1–2 blow up outright. Every degree-like quantity (`L`, `deg Π`, Stage-3 `MaxDeg`) halves to
+within 0.5 % when n doubles. Reconstruction did not merely fail to improve — it got **3.548× worse**.
+
+**Above — `BW_BLOCK=512` OOMs in Stage 3.** Job 2607723 died 27.7 s into Stage 3 on a single
+**63.71 GiB** `cudaMalloc` at `src/lingen/stage3/solution_reconstructor.cu:264` — verified in source
+as `cudaMalloc(&d_history_, total_bytes * history_depth_)`, i.e. the depth-64 backtracking history
+buffer. n=512 does not fit 94 GB under any accounting. lingen additionally hits a **~16×**
+generic-matmul cliff at `dim = m+n = 1024` (the specialized basecase kernels stop at dim 512), which
+also **pre-emptively refutes** the `m=512 / n=256` mitigation — dim 768 is on the same generic path.
+
+**A second, independent reason for 256: solution supply.** bw128 yielded only **3** solutions in
+batch 1 (2 nontrivial); bw256 on the identical matrix yielded **56** — 18.7× the supply — capped to
+24 by `--bw_max_solutions`, of which **11/24 = 45.8 %** were nontrivial (identical to RSA-155's
+rate). At the measured per-solution rate, bw128's 3-solution batch was a ~1-in-6 chance of finding
+no factor at all after 20.6 GPU-h; at n=256 that risk falls to ≈4×10⁻⁷.
+
+### ⚠ Dead Asymmetric Krylov Dispatch Branches — STILL OPEN (found 2026-08-23)
+
+`dispatch_batch_proj()` in `src/lingen/stage1/krylov_generator.cu` selects the templated batch
+projection kernel by `(m_block_, n_block_)`. Three branches **repeat the `n_block_ == 256` condition
+where 512 was intended**, so they can never be reached — the preceding `== 256` branch always wins:
+
+| Line | Source condition | Kernel it launches | Status |
+|---|---|---|---|
+| **122** | `m_block_ == 64 && n_block_ == 256` | `LAUNCH_KERNEL(64, 512)` | **unreachable** |
+| **126** | `m_block_ == 128 && n_block_ == 256` | `LAUNCH_KERNEL(128, 512)` | **unreachable** |
+| **130** | `m_block_ == 256 && n_block_ == 256` | `LAUNCH_KERNEL(256, 512)` | **unreachable** |
+
+Consequently `(m,n) = (64,512)`, `(128,512)` and `(256,512)` fall through to the `else` at `:135`
+and throw — `[KrylovGen] Uninstantiated Kernel M=… N=…` (`:136`) plus a `std::runtime_error`
+(`:137`) — **even though `krylov_kernels.cu` explicitly instantiates all three**
+(`INSTANTIATE(64,512)` `:154`, `INSTANTIATE(128,512)` `:158`, `INSTANTIATE(256,512)` `:162`). The
+kernels exist and are compiled in; only the dispatcher cannot reach them.
+
+`m=512 / n=256` (`:133`) and `m=n=512` (`:134`) are **unaffected** — their conditions are correct.
+The fix is one line each (`256` → `512` in the second half of the three conditions).
+
+**Status: unfixed and untouched.** This is a **submodule** defect and `src/linalg` is out of scope
+for edits under the parent repo's Code Rule 1. Verified identical at both the gitlink recorded by
+the parent at HEAD (`7dab002`) and the currently checked-out submodule working tree (`dc48659`) —
+those two commits differ only under `tools/release/`. Practical impact today is nil: production
+runs symmetric `m = n = 256`.
 
 ### Delta-16 SpMM Autotuner uint32 Overflow Guard
 
@@ -211,7 +283,7 @@ Build options:
 - `-DENABLE_LINGEN_DEVICE_SYNC=ON` — defines `BASECASE_SOLVER_CUDA_STREAM_SYNC`, enabling periodic `cudaStreamSynchronize` (every 10 steps) in Stage 2 basecase loop. Required on Turing where too many sequential kernel launches cause failures.
 - `-DENABLE_CUDA_GRAPHS=ON` (default OFF) — defines `BW_ENABLE_CUDA_GRAPHS`, enabling CUDA graph capture paths in the solver; when OFF all graph code is compiled out.
 
-**Version management:** `cmake/version.cmake` is the single source of truth for `LINALGBW_VERSION_{MAJOR,MINOR,PATCH}` (independent namespace from the parent); configured into a generated `bw_version.h` exposed via the `bw_version_header` interface library. The submodule carries its own public-release pipeline under `tools/release/` (allowlist extraction, anti-leakage sweep, build verify) targeting the standalone `block-wiedemann` mirror.
+**Version management:** `cmake/version.cmake` is the single source of truth for `LINALGBW_VERSION_{MAJOR,MINOR,PATCH}` (independent namespace from the parent); configured into a generated `bw_version.h` exposed via the `bw_version_header` interface library.
 
 ## Integration
 
@@ -235,4 +307,6 @@ Receives `HostMatrix` (converted from CSR by matrix stage). Outputs kernel vecto
 - Non-square matrices are padded automatically by `pad_to_square`.
 - SpMM tuning cache (CSV) may be stale if matrix dimensions or density change significantly.
 - Golomb-Rice kernel is disabled by default in `GPUAutoTuner::Config` (`enable_golomb = false`) due to CPU fallback producing incorrect format data.
-- 
+- **Asymmetric block pairs `(64,512)`, `(128,512)`, `(256,512)` throw `Uninstantiated Kernel`** despite being instantiated — dead dispatch branches at `krylov_generator.cu:122/126/130`. Unfixed (submodule). See the section above.
+- **Block width is effectively pinned to `m = n = 256` at RSA-150/155 scale:** 128 is a 2.687× LA regression and 512 OOMs in Stage 3. See the block-width section above.
+- **`--bw_resume` has never been exercised** — only the checkpoint *save* path has run in production.

@@ -302,6 +302,11 @@ public:
 
     /// @brief Returns a pointer to the currently active accumulation DoubleBuffer.
     DoubleBuffer* getActiveAccumulationBuffer() { return &buffers[active_accum_idx]; }
+    /// Indexed access to either accumulation buffer (i is taken mod 2). Needed by the graph
+    /// path's post-capture event re-arm, which must touch BOTH buffers regardless of
+    /// active_accum_idx (an event last recorded inside a capture is unusable from the host
+    /// until re-recorded from a non-capturing stream).
+    DoubleBuffer* getAccumulationBuffer(int i) { return &buffers[i & 1]; }
 
     /**
      * @brief Explicitly overrides the internal pipeline flush state.
@@ -332,9 +337,16 @@ public:
         prediction_target_ = target;
         d_lp_stats_ = lp_stats_device_ptr;
     }
-    // total_steps is u64: the solo cursor `current_step` was widened u32→u64 for the
-    // mid-sieve checkpoint (RSA-140 scale exceeds 2^32 a-values), and it flows in here.
-    void updatePredictionSteps(uint64_t total_steps) { prediction_total_steps_ = total_steps; }
+    /**
+     * @brief Seeds the device step counter (s_0 = initial_steps) and fixes the per-batch
+     *        increment delta, so that s_k = s_0 + k*delta after k post-processed batches.
+     *
+     * The counter lives in device memory (not a by-value kernel argument) so that it keeps
+     * advancing across CUDA-graph replays, where arguments are baked at capture time.
+     * Issued OUTSIDE any capture, once per sieve leg — a resumed leg seeds with the restored
+     * global a-index (u64: RSA-140 scale exceeds 2^32 a-values).
+     */
+    void seedPredictionSteps(uint64_t initial_steps, uint32_t per_batch_increment);
 
     /// @brief Lock-free accessor for buffer fill snapshot (mapped pinned memory).
     const BufferFillSnapshot* getBufferFillSnapshot() const { return h_buffer_fill_; }
@@ -392,7 +404,8 @@ private:
     // --- Prediction kernel state ---
     PredictionResult* d_prediction_result = nullptr;
     uint32_t prediction_target_ = 0;
-    uint64_t prediction_total_steps_ = 0;
+    uint64_t* d_prediction_steps_ = nullptr;   ///< Device cumulative sieve-step counter (1 x uint64).
+    uint32_t  prediction_step_increment_ = 0;  ///< a-values per batch; 0 disables the advance node.
     const mpqs::lp::SLPPinnedStats* d_lp_stats_ = nullptr;
 
     // --- Buffer fill telemetry (mapped pinned memory) ---

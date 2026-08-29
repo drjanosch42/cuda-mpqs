@@ -117,7 +117,7 @@ std::vector<ChunkScheduler::ContiguousRange> ChunkScheduler::computeContiguousRa
 }
 
 // ============================================================================
-// Throughput-proportional contiguous range computation (M4-S7)
+// Throughput-proportional contiguous range computation
 // ============================================================================
 
 std::vector<ChunkScheduler::ContiguousRange> ChunkScheduler::computeContiguousRanges(

@@ -117,7 +117,7 @@ int main() {
     std::printf("  sc: sievingBlockSize=%u globalBucketSize=%u\n",
                 sc.sievingBlockSize, sc.globalBucketSize);
 
-    // A validated kernel tuple (the S0/S1 baseline winner). Must be isValid here.
+    // A validated kernel tuple (the baseline winner). Must be isValid here.
     Params8 baseline = {512, 8, 4, 8, 128, 1024, 256, 1024};
     CHECK(validator.isValid(baseline), "baseline tuple is valid at M=131072");
 

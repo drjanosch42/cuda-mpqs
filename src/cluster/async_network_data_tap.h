@@ -12,8 +12,7 @@
 /// Background I/O thread drains ring, coalesces batches via mergeRelationBatches(),
 /// serializes once, and sends once per coalesce group. Heartbeat consolidated into
 /// the I/O thread — single background thread total.
-///
-/// Spec reference: cluster_v2_spec.md Section 4.4, M4-S3
+
 
 #include "data_tap.h"
 #include "comm_backend.h"
