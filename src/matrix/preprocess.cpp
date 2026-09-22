@@ -148,7 +148,7 @@ PreprocessResultV2 gpuPreprocessMatrix_packed(
     uint64_t lp1_bound)
 {
     LOG_SET_MODULE("Matrix");
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
     auto t_start = clock::now();
 
     LOG(LOG_INFO) << "M9v2: Packed GPU preprocessing pipeline (solo mode).";

@@ -16,6 +16,7 @@
 #include <string>
 #include "kernel.cuh"
 #include "common.h"
+#include "dynamicMask.cuh"
 
 // CUDA error-check helper (sieve module). Wraps cudaMalloc/cudaMemcpy/etc.
 // On failure, logs file:line and throws so callers see a clean diagnostic.
@@ -34,10 +35,10 @@
 #include "uint512.cuh"
 
 #define STARTTIMER(var) \
-    auto var = std::chrono::high_resolution_clock::now()
+    auto var = std::chrono::steady_clock::now()
 
 #define ENDTIMER(var, label) \
-        std::cout << label << " : " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - var).count() << " ms" << std::endl
+        std::cout << label << " : " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - var).count() << " ms" << std::endl
 
 #define ATOMIC_BYTE_ADD(array, index, x) \
     atomicAdd((uint32_t*)((array) + ((index) & (~3))), ((uint32_t)(x)) << (8 * ((index) & 3)))
@@ -119,6 +120,28 @@ Thus we can ignore subCubeId for memory accesses and the id of the bucket contai
 
 globalBucketId = [polyBlockId] -> [polyId] -> [cycle] -> [sieveBlock]
 */
+/*
+ * Records prime index `primeIndex` as a factor of the candidate at `localOffset`.
+ *
+ * blockEntries does double duty: excludeNonRelations leaves 1 at a candidate position, and
+ * every factor recorded here bumps it, so the atomic's RETURNED value is that candidate's
+ * running factor count and doubles as the slot allocator. Pulled out of the four copies that
+ * used to inline it so the backward sieve's two strategies (walk a prime's residue class /
+ * test a candidate directly) share one definition of what recording means.
+ */
+__device__ __forceinline__
+void recordBackwardFactor(uint8_t* __restrict__ blockEntries,
+                          const int32_t* __restrict__ indexToCandidate,
+                          candidateRelation* __restrict__ candidates,
+                          int localOffset,
+                          int primeIndex)
+{
+    const int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
+    const int globalIdx = indexToCandidate[localOffset];
+    candidates[globalIdx].factors[31 & newPrimeIndex] = primeIndex;
+    atomicAdd((uint32_t*)&candidates[globalIdx].num_factors, 1);
+}
+
 __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_pointers, fixedSievingParams fs_params, dynamicSievingParams ds_params, generalSievingConfig gs_conf, sieveAndScanConfig ss_conf)//We want gridDim.x blocks with size of blockDim.x
 {
     primeDataSIQS* primeData = dev_pointers.dev_primeData;
@@ -129,9 +152,30 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
 
     extern __shared__ uint8_t sharedByteData[];
     // Cast to int* preserves signed logic for offsets (coordinates) and primes (sign flag)
-    int* offsets1 = (int*)sharedByteData;
-    int* offsets2 = offsets1 + gs_conf.bigPrimeStartIndex;
-    int* primes = offsets2 + gs_conf.bigPrimeStartIndex;
+    // offsets1/offsets2/primes live either in this block's shared allocation or in its private
+    // slice of dev_sieveOffsets (ss_conf.offsetsInGlobal). Every thread indexes a DIFFERENT
+    // prime in the hot loops, so the arrays are ordinary strided storage rather than a
+    // broadcast structure -- they do not need to be shared. Only blockEntries does: it is the
+    // accumulator the sieve atomically adds into and the backward scan re-reads.
+    // __syncthreads() fences global as well as shared, so the existing barriers already order
+    // the writes below; a block never leaves its SM, so its own L1 is coherent for its slice.
+    int* offsets1;
+    int* offsets2;
+    int* primes;
+    uint8_t* blockEntries;
+    if (ss_conf.offsetsInGlobal) {
+        int* slice = dev_pointers.dev_sieveOffsets
+                   + (size_t)blockIdx.x * gatherOffsetsStride(gs_conf.bigPrimeStartIndex);
+        offsets1 = slice;
+        offsets2 = offsets1 + gs_conf.bigPrimeStartIndex;
+        primes   = offsets2 + gs_conf.bigPrimeStartIndex;
+        blockEntries = (uint8_t*)sharedByteData;
+    } else {
+        offsets1 = (int*)sharedByteData;
+        offsets2 = offsets1 + gs_conf.bigPrimeStartIndex;
+        primes   = offsets2 + gs_conf.bigPrimeStartIndex;
+        blockEntries = (uint8_t*)(primes + gs_conf.bigPrimeStartIndex);
+    }
     uint32_t candidatesFound;
     if(ds_params.newCube){
         candidatesFound = 0;
@@ -145,7 +189,6 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
     p_data.threshold = fs_params.threshold;
     p_data.log2_a = ds_params.log2_a;
 
-    uint8_t* blockEntries = (uint8_t*)(primes + gs_conf.bigPrimeStartIndex);
     uint512 b;
     int sieveIntervalStart = ds_params.startIndex;
     int reducedSieveStart = 0;
@@ -209,12 +252,24 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
         __syncthreads();
 
         for (int sieveBlock = 0; sieveBlock < gs_conf.num_sievingBlocksPerSieveCall; sieveBlock++) {
-            for (int i = threadIdx.x; i < gs_conf.sievingBlockSize; i += blockDim.x) {
-                blockEntries[i] = 0;
-            }
             int sieveBlockStart = sieveIntervalStart + sieveBlock * gs_conf.sievingBlockSize;
             int sieveBlockEnd = sieveBlockStart + gs_conf.sievingBlockSize;
+
+            uint32_t* smallPrimeMask = dev_pointers.dev_smallPrimeMask;
+            uint32_t* CRT_baseElements = dev_pointers.dev_CRT_baseElements;
+            uint32_t maskOffset1;
+            uint32_t maskOffset2;
+            findMaskOffsets(sieveBlockStart,  offsets1, offsets2, primes, maskOffset1, maskOffset2, fs_params.smallPrimesUsed, fs_params.period, CRT_baseElements);
+
+            uint32_t* blockEntries32 = reinterpret_cast<uint32_t*>(blockEntries);
+            for (int i = threadIdx.x; i < gs_conf.sievingBlockSize/4; i += blockDim.x) {
+                blockEntries32[i] = smallPrimeMask[(maskOffset1 + i) % fs_params.period] + smallPrimeMask[(maskOffset2 + i) % fs_params.period];
+            }
             __syncthreads();
+            if(threadIdx.x < fs_params.smallPrimesUsed){
+                offsets1[threadIdx.x] = offsets1[threadIdx.x] + ((sieveBlockEnd - offsets1[threadIdx.x] + primes[threadIdx.x] - 1) / primes[threadIdx.x]) * primes[threadIdx.x];
+                offsets2[threadIdx.x] = offsets2[threadIdx.x] + ((sieveBlockEnd - offsets2[threadIdx.x] + primes[threadIdx.x] - 1) / primes[threadIdx.x]) * primes[threadIdx.x];
+            }
 
             uint64_t globalBucketId = (((long long)truncatedPolyId) * gs_conf.num_sievingBlocksPerSieveCall + sieveBlock);
             uint64_t listStart = globalBucketId * gs_conf.globalBucketSize; //CHANGE TO THE CURRENT GLOBAL BUCKET
@@ -227,12 +282,12 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
             }
             int midPrimeStart = gs_conf.midPrimeStartIndex;
             __syncthreads();
-            for (int i = 0; i < midPrimeStart; i++) {
+            constexpr uint32_t parNum = 32;
+            for (int i = fs_params.smallPrimesUsed + (threadIdx.x / parNum); i < midPrimeStart; i += blockDim.x / parNum) {
                 int p = primes[i];
 		        // If p is inactive, we do not touch blockEntries at all
 		        // This prevents useless indexing work.
 		        if (p < 0) {
-		            __syncthreads();
 		            continue;
 		        }
 		        // Here p is guaranteed > 0.
@@ -241,21 +296,22 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
                 int offset1 = offsets1[i];
                 int offset2 = offsets2[i];
 		        // Forward Sieve: Offset is signed int, loop terminates when offset >= sieveBlockEnd
-                int offset = offset1 + threadIdx.x * p;
-                for (; offset < sieveBlockEnd; offset += blockDim.x * p) {
-                    blockEntries[offset - sieveBlockStart] += log_p;
+                int offset = offset1 + (threadIdx.x % parNum) * p;
+                for (; offset < sieveBlockEnd; offset += parNum * p) {
+                    //blockEntries[offset - sieveBlockStart] += log_p;
+                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
                 }
                 if (offset - p < sieveBlockEnd) {
                     offsets1[i] = offset; //exactly one thread has the correct "last" offset, keep it for the next iteration
                 }
-                offset = offset2 + threadIdx.x * p;
-                for (; offset < sieveBlockEnd; offset += blockDim.x * p) {
-                    blockEntries[offset - sieveBlockStart] += log_p;
+                offset = offset2 + (threadIdx.x % parNum) * p;
+                for (; offset < sieveBlockEnd; offset += parNum * p) {
+                    //blockEntries[offset - sieveBlockStart] += log_p;
+                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
                 }
                 if (offset - p < sieveBlockEnd) {
                     offsets2[i] = offset; //exactly one thread has the correct "last" offset, keep it for the next iteration
                 }
-                __syncthreads();
             }
 	    // Small primes handling
             for (int i = midPrimeStart + threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
@@ -297,45 +353,68 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
             }
 
 	    // Backward Sieve (Scanning candidates for factors)
-            for (int i = 0; i < midPrimeStart; i++) {
-                int p = primes[i];
-                bool active = p > 0;
-                p = abs(p);
-                int offset1 = offsets1[i];
-                int offset2 = offsets2[i];
-                __syncthreads();
-                if (active) {
-                    // Backward loop using signed arithmetic.
-                    // Loop terminates when offset <= sieveBlockStart.
-                    // Safe because offset is int and subtracts p.
-                    int offset = offset1 - threadIdx.x * p - p;
-                    for (; offset >= sieveBlockStart; offset -= blockDim.x * p) {
-                        int localOffset = offset - sieveBlockStart;
-                        if (blockEntries[localOffset]) {
-                            int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
-			    int globalIdx = indexToCandidate[localOffset];
-			    // Store factor
-			    candidates[globalIdx].factors[31 & newPrimeIndex] = i;
-			    // Update count
-			    atomicAdd((uint32_t*)&candidates[globalIdx].num_factors, 1);
-                        }
+	    // Backward Sieve (Scanning candidates for factors)
+            //
+            // Unlike the FORWARD sieve, which must touch every position, this pass only has to
+            // decide which primes divide the handful of candidates this sieveBlock produced --
+            // ~4, against SB = tens of thousands of positions. Walking a prime's whole residue
+            // class to find them costs 2*SB/p tests; testing the candidates directly costs
+            // 2*nCandidates modular tests, independent of p. Walking therefore only wins above
+            // p ~ SB*(cost_walk/cost_mod)/nCandidates, which with an integer modulo lands near
+            // the existing midPrimeStart. Below that the loop nest belongs the other way round.
+            //
+            // [0, smallPrimesUsed): candidate-driven. These are the mask primes, the smallest in
+            // the factor base, so they carry most of sum(1/p) over the whole band -- walking p=2
+            // alone is SB/2 tests to service ~4 candidates.
+            {
+                const int spu = (int)fs_params.smallPrimesUsed;
+                const int candLo = (int)candidatesFound - newCandidateCount;
+                const int work = newCandidateCount * spu;
+                for (int w = threadIdx.x; w < work; w += blockDim.x) {
+                    const int c = candLo + (w / spu);
+                    const int i = w - (c - candLo) * spu;
+                    const int p = primes[i];
+                    if (p <= 0) continue;                 // inactive: an a-factor, never a factor of Q
+                    const int x = candidates[c].sieve_offset;
+                    const int localOffset = x - sieveBlockStart;
+                    // offsets1/offsets2 were advanced past sieveBlockEnd by the forward pass, so
+                    // they are positions congruent to the two roots; p divides Q(x) exactly when
+                    // x is congruent to one of them.
+                    if ((offsets1[i] - x) % p == 0)
+                        recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
+                    if ((offsets2[i] - x) % p == 0)
+                        recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
+                }
+            }
+            __syncthreads();
+            // [smallPrimesUsed, midPrimeStart): walked, but in 32-lane groups like the forward
+            // band rather than one prime at a time across the whole block. The two barriers the
+            // old serial version carried per prime (264 of them at midPrimeStart = 132, in a
+            // kernel that is barrier-bound) were protecting nothing: this pass only READS
+            // offsets/primes, and slot allocation is atomic -- which is exactly why the
+            // [midPrimeStart, bigPrimeStart) loop below already runs without them.
+            {
+                constexpr uint32_t parNum = 32;
+                for (int i = (int)fs_params.smallPrimesUsed + (int)(threadIdx.x / parNum);
+                     i < midPrimeStart; i += blockDim.x / parNum) {
+                    const int p = primes[i];
+                    if (p <= 0) continue;                 // inactive
+                    // Backward loop using signed arithmetic; terminates at sieveBlockStart.
+                    int offset = offsets1[i] - (int)(threadIdx.x % parNum) * p - p;
+                    for (; offset >= sieveBlockStart; offset -= parNum * p) {
+                        const int localOffset = offset - sieveBlockStart;
+                        if (blockEntries[localOffset])
+                            recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
                     }
-                    offset = offset2 - threadIdx.x * p - p;
-                    for (; offset >= sieveBlockStart; offset -= blockDim.x * p) {
-                        int localOffset = offset - sieveBlockStart;
-                        if (blockEntries[localOffset]) {
-                            int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
-			    int globalIdx = indexToCandidate[localOffset];
-			    // Store factor
-			    candidates[globalIdx].factors[31 & newPrimeIndex] = i;
-			    // Update count
-			    atomicAdd((uint32_t*)&candidates[globalIdx].num_factors, 1);
-                        }
+                    offset = offsets2[i] - (int)(threadIdx.x % parNum) * p - p;
+                    for (; offset >= sieveBlockStart; offset -= parNum * p) {
+                        const int localOffset = offset - sieveBlockStart;
+                        if (blockEntries[localOffset])
+                            recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
                     }
                 }
-                __syncthreads();
             }
-	    // Small primes backward scan
+            __syncthreads();	    // Small primes backward scan
             for (int i = midPrimeStart + threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
                 int p = primes[i];
                 bool active = p > 0;
@@ -646,6 +725,12 @@ void loadSievingData(std::vector<uint32_t>& factorBase,
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_blockRelationCounts, ss_conf.num_threadBlocks * sizeof(uint32_t)));
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_candidateRelations, gs_conf.maxRelationsPerBlock * ss_conf.num_threadBlocks * sizeof(candidateRelation)));
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_indexToCandidate, gs_conf.sievingBlockSize * ss_conf.num_threadBlocks * sizeof(uint32_t)));
+    // GATHER offsets/primes backing store, one slice per thread block (see offsetsInGlobal).
+    if (ss_conf.offsetsInGlobal) {
+        const size_t offsetsBytes = (size_t)ss_conf.num_threadBlocks
+                                  * gatherOffsetsStride(gs_conf.bigPrimeStartIndex) * sizeof(int);
+        SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_sieveOffsets, offsetsBytes));
+    }
     //copy once
     SIEVE_CUDA_CHECK(cudaMemcpy(dev_pointers.dev_factorBase, factorBase.data(), factorBase.size() * sizeof(int), cudaMemcpyHostToDevice));
     SIEVE_CUDA_CHECK(cudaMemcpy(dev_pointers.dev_rootN, rootN.data(), rootN.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -696,6 +781,16 @@ void loadSievingDataParamTest(std::vector<uint32_t>& factorBase,
     cudaFree(dev_pointers.dev_indexToCandidate);
     SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_indexToCandidate, indexBytes));
     SIEVE_CUDA_CHECK(cudaMemset(dev_pointers.dev_indexToCandidate, 0, indexBytes));
+    // Sized by num_threadBlocks AND bigPrimeStartIndex, both of which a parameter search varies
+    // per candidate, so it is reallocated here like every other config-dependent buffer.
+    cudaFree(dev_pointers.dev_sieveOffsets);
+    dev_pointers.dev_sieveOffsets = nullptr;
+    if (ss_conf.offsetsInGlobal) {
+        const size_t offsetsBytes = (size_t)ss_conf.num_threadBlocks
+                                  * gatherOffsetsStride(gs_conf.bigPrimeStartIndex) * sizeof(int);
+        SIEVE_CUDA_CHECK(cudaMalloc((void**)&dev_pointers.dev_sieveOffsets, offsetsBytes));
+        SIEVE_CUDA_CHECK(cudaMemset(dev_pointers.dev_sieveOffsets, 0, offsetsBytes));
+    }
 }
 
 void warmup(){
@@ -1147,15 +1242,28 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
     // Reserve space for B_values at the START (Alignment safe: uint512 is 16/8 byte aligned)
     mpqs::uint512* s_B_values = (mpqs::uint512*)sharedByteData;
 
-    // Shift integer arrays to start AFTER the B_values
-    // offset bytes = shc_dim * sizeof(uint512)
-    // Cast to int* preserves signed logic for offsets (coordinates) and primes (sign flag)
-    int* offsets1 = (int*)(s_B_values + fs_params.shc_dim);
-    int* offsets2 = offsets1 + gs_conf.bigPrimeStartIndex;
-    int* primes = offsets2 + gs_conf.bigPrimeStartIndex;
-
-    // BlockEntries starts after primes
-    uint8_t* blockEntries = (uint8_t*)(primes + gs_conf.bigPrimeStartIndex);
+    // Cast to int* preserves signed logic for offsets (coordinates) and primes (sign flag).
+    // With ss_conf.offsetsInGlobal the three arrays move to this block's private slice of
+    // dev_sieveOffsets and only blockEntries (plus B_values) stays in shared memory -- see the
+    // note in sieveAndScanKernel. B_values keeps its shared slot either way: it IS read
+    // broadcast-style by every thread.
+    int* offsets1;
+    int* offsets2;
+    int* primes;
+    uint8_t* blockEntries;
+    if (ss_conf.offsetsInGlobal) {
+        int* slice = dev_pointers.dev_sieveOffsets
+                   + (size_t)blockIdx.x * gatherOffsetsStride(gs_conf.bigPrimeStartIndex);
+        offsets1 = slice;
+        offsets2 = offsets1 + gs_conf.bigPrimeStartIndex;
+        primes   = offsets2 + gs_conf.bigPrimeStartIndex;
+        blockEntries = (uint8_t*)(s_B_values + fs_params.shc_dim);
+    } else {
+        offsets1 = (int*)(s_B_values + fs_params.shc_dim);
+        offsets2 = offsets1 + gs_conf.bigPrimeStartIndex;
+        primes   = offsets2 + gs_conf.bigPrimeStartIndex;
+        blockEntries = (uint8_t*)(primes + gs_conf.bigPrimeStartIndex);
+    }
 
     // Load 'a' for this step into local register/stack
     mpqs::uint512 current_a = batch_a_array[step_index];
@@ -1241,12 +1349,24 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
         __syncthreads();
 
         for (int sieveBlock = 0; sieveBlock < gs_conf.num_sievingBlocksPerSieveCall; sieveBlock++) {
-            for (int i = threadIdx.x; i < gs_conf.sievingBlockSize; i += blockDim.x) {
-                blockEntries[i] = 0;
-            }
             int sieveBlockStart = sieveIntervalStart + sieveBlock * gs_conf.sievingBlockSize;
             int sieveBlockEnd = sieveBlockStart + gs_conf.sievingBlockSize;
+
+            uint32_t* smallPrimeMask = dev_pointers.dev_smallPrimeMask;
+            uint32_t* CRT_baseElements = dev_pointers.dev_CRT_baseElements;
+            uint32_t maskOffset1;
+            uint32_t maskOffset2;
+            findMaskOffsets(sieveBlockStart,  offsets1, offsets2, primes, maskOffset1, maskOffset2, fs_params.smallPrimesUsed, fs_params.period, CRT_baseElements);
+
+            uint32_t* blockEntries32 = reinterpret_cast<uint32_t*>(blockEntries);
+            for (int i = threadIdx.x; i < gs_conf.sievingBlockSize/4; i += blockDim.x) {
+                blockEntries32[i] = smallPrimeMask[(maskOffset1 + i) % fs_params.period] + smallPrimeMask[(maskOffset2 + i) % fs_params.period];
+            }
             __syncthreads();
+            if(threadIdx.x < fs_params.smallPrimesUsed){
+                offsets1[threadIdx.x] = offsets1[threadIdx.x] + ((sieveBlockEnd - offsets1[threadIdx.x] + primes[threadIdx.x] - 1) / primes[threadIdx.x]) * primes[threadIdx.x];
+                offsets2[threadIdx.x] = offsets2[threadIdx.x] + ((sieveBlockEnd - offsets2[threadIdx.x] + primes[threadIdx.x] - 1) / primes[threadIdx.x]) * primes[threadIdx.x];
+            }
 
             uint64_t globalBucketId = (((long long)polyId) * gs_conf.num_sievingBlocksPerSieveCall + sieveBlock);
             uint64_t listStart = globalBucketId * gs_conf.globalBucketSize; //CHANGE TO THE CURRENT GLOBAL BUCKET
@@ -1259,12 +1379,12 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
             }
             int midPrimeStart = gs_conf.midPrimeStartIndex;
             __syncthreads();
-            for (int i = 0; i < midPrimeStart; i++) {
+            constexpr uint32_t parNum = 32;
+            for (int i = fs_params.smallPrimesUsed + (threadIdx.x / parNum); i < midPrimeStart; i += blockDim.x / parNum) {
                 int p = primes[i];
 		        // If p is inactive, we do not touch blockEntries at all
 		        // This prevents useless indexing work.
 		        if (p < 0) {
-		            __syncthreads();
 		            continue;
 		        }
 		        // Here p is guaranteed > 0.
@@ -1273,21 +1393,22 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                 int offset1 = offsets1[i];
                 int offset2 = offsets2[i];
 		        // Forward Sieve: Offset is signed int, loop terminates when offset >= sieveBlockEnd
-                int offset = offset1 + threadIdx.x * p;
-                for (; offset < sieveBlockEnd; offset += blockDim.x * p) {
-                    blockEntries[offset - sieveBlockStart] += log_p;
+                int offset = offset1 + (threadIdx.x % parNum) * p;
+                for (; offset < sieveBlockEnd; offset += parNum * p) {
+                    //blockEntries[offset - sieveBlockStart] += log_p;
+                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
                 }
                 if (offset - p < sieveBlockEnd) {
                     offsets1[i] = offset; //exactly one thread has the correct "last" offset, keep it for the next iteration
                 }
-                offset = offset2 + threadIdx.x * p;
-                for (; offset < sieveBlockEnd; offset += blockDim.x * p) {
-                    blockEntries[offset - sieveBlockStart] += log_p;
+                offset = offset2 + (threadIdx.x % parNum) * p;
+                for (; offset < sieveBlockEnd; offset += parNum * p) {
+                    //blockEntries[offset - sieveBlockStart] += log_p;
+                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
                 }
                 if (offset - p < sieveBlockEnd) {
                     offsets2[i] = offset; //exactly one thread has the correct "last" offset, keep it for the next iteration
                 }
-                __syncthreads();
             }
 	    // Small primes handling
             for (int i = midPrimeStart + threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
@@ -1329,45 +1450,68 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
             }
 
 	    // Backward Sieve (Scanning candidates for factors)
-            for (int i = 0; i < midPrimeStart; i++) {
-                int p = primes[i];
-                bool active = p > 0;
-                p = abs(p);
-                int offset1 = offsets1[i];
-                int offset2 = offsets2[i];
-                __syncthreads();
-                if (active) {
-                    // Backward loop using signed arithmetic.
-                    // Loop terminates when offset <= sieveBlockStart.
-                    // Safe because offset is int and subtracts p.
-                    int offset = offset1 - threadIdx.x * p - p;
-                    for (; offset >= sieveBlockStart; offset -= blockDim.x * p) {
-                        int localOffset = offset - sieveBlockStart;
-                        if (blockEntries[localOffset]) {
-                            int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
-			    int globalIdx = indexToCandidate[localOffset];
-			    // Store factor
-			    candidates[globalIdx].factors[31 & newPrimeIndex] = i;
-			    // Update count
-			    atomicAdd((uint32_t*)&candidates[globalIdx].num_factors, 1);
-                        }
+	    // Backward Sieve (Scanning candidates for factors)
+            //
+            // Unlike the FORWARD sieve, which must touch every position, this pass only has to
+            // decide which primes divide the handful of candidates this sieveBlock produced --
+            // ~4, against SB = tens of thousands of positions. Walking a prime's whole residue
+            // class to find them costs 2*SB/p tests; testing the candidates directly costs
+            // 2*nCandidates modular tests, independent of p. Walking therefore only wins above
+            // p ~ SB*(cost_walk/cost_mod)/nCandidates, which with an integer modulo lands near
+            // the existing midPrimeStart. Below that the loop nest belongs the other way round.
+            //
+            // [0, smallPrimesUsed): candidate-driven. These are the mask primes, the smallest in
+            // the factor base, so they carry most of sum(1/p) over the whole band -- walking p=2
+            // alone is SB/2 tests to service ~4 candidates.
+            {
+                const int spu = (int)fs_params.smallPrimesUsed;
+                const int candLo = (int)candidatesFound - newCandidateCount;
+                const int work = newCandidateCount * spu;
+                for (int w = threadIdx.x; w < work; w += blockDim.x) {
+                    const int c = candLo + (w / spu);
+                    const int i = w - (c - candLo) * spu;
+                    const int p = primes[i];
+                    if (p <= 0) continue;                 // inactive: an a-factor, never a factor of Q
+                    const int x = candidates[c].sieve_offset;
+                    const int localOffset = x - sieveBlockStart;
+                    // offsets1/offsets2 were advanced past sieveBlockEnd by the forward pass, so
+                    // they are positions congruent to the two roots; p divides Q(x) exactly when
+                    // x is congruent to one of them.
+                    if ((offsets1[i] - x) % p == 0)
+                        recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
+                    if ((offsets2[i] - x) % p == 0)
+                        recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
+                }
+            }
+            __syncthreads();
+            // [smallPrimesUsed, midPrimeStart): walked, but in 32-lane groups like the forward
+            // band rather than one prime at a time across the whole block. The two barriers the
+            // old serial version carried per prime (264 of them at midPrimeStart = 132, in a
+            // kernel that is barrier-bound) were protecting nothing: this pass only READS
+            // offsets/primes, and slot allocation is atomic -- which is exactly why the
+            // [midPrimeStart, bigPrimeStart) loop below already runs without them.
+            {
+                constexpr uint32_t parNum = 32;
+                for (int i = (int)fs_params.smallPrimesUsed + (int)(threadIdx.x / parNum);
+                     i < midPrimeStart; i += blockDim.x / parNum) {
+                    const int p = primes[i];
+                    if (p <= 0) continue;                 // inactive
+                    // Backward loop using signed arithmetic; terminates at sieveBlockStart.
+                    int offset = offsets1[i] - (int)(threadIdx.x % parNum) * p - p;
+                    for (; offset >= sieveBlockStart; offset -= parNum * p) {
+                        const int localOffset = offset - sieveBlockStart;
+                        if (blockEntries[localOffset])
+                            recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
                     }
-                    offset = offset2 - threadIdx.x * p - p;
-                    for (; offset >= sieveBlockStart; offset -= blockDim.x * p) {
-                        int localOffset = offset - sieveBlockStart;
-                        if (blockEntries[localOffset]) {
-                            int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
-			    int globalIdx = indexToCandidate[localOffset];
-			    // Store factor
-			    candidates[globalIdx].factors[31 & newPrimeIndex] = i;
-			    // Update count
-			    atomicAdd((uint32_t*)&candidates[globalIdx].num_factors, 1);
-                        }
+                    offset = offsets2[i] - (int)(threadIdx.x % parNum) * p - p;
+                    for (; offset >= sieveBlockStart; offset -= parNum * p) {
+                        const int localOffset = offset - sieveBlockStart;
+                        if (blockEntries[localOffset])
+                            recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
                     }
                 }
-                __syncthreads();
             }
-	    // Small primes backward scan
+            __syncthreads();	    // Small primes backward scan
             for (int i = midPrimeStart + threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
                 int p = primes[i];
                 bool active = p > 0;
@@ -2723,6 +2867,20 @@ void runSievingBatch(
             *gs_conf_ptr,
             *ss_conf_ptr
         );
+        }
+
+        // A GATHER launch that is rejected (shared memory over the opt-in limit, bad grid) is
+        // otherwise INVISIBLE outside SIEVING_DEBUG_FLAG: the batch loop keeps running, every
+        // batch yields 0 candidates, and the run looks healthy while producing nothing. This is
+        // host-side only (no sync), so it costs nothing per batch.
+        {
+            const cudaError_t launch_err = cudaGetLastError();
+            if (launch_err != cudaSuccess) {
+                LOG(LOG_ERROR_CRITICAL) << "[Sieve] GATHER launch FAILED: "
+                    << cudaGetErrorString(launch_err) << " (grid " << sieve_grid.x
+                    << ", block " << sieve_block.x << ", shared " << sieve_smem
+                    << " B). No candidates can be produced.";
+            }
         }
 
         #ifdef SIEVING_DEBUG_FLAG

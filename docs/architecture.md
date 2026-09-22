@@ -113,13 +113,18 @@ flag. Only one mode is active at a time.
 | `--linalg_only`     | `LINALG_ONLY`    | Tuning, Matrix, LA, √                     | Loads previously saved relations           |
 | `--matrix_only`     | `MATRIX_ONLY`    | Matrix replay over stored relations       | Loads previously saved relations           |
 | `--autotune_only`   | `AUTOTUNE_ONLY`  | Tuning, Autotune                          | Reads/writes autotune history              |
-| `--param_test`      | `PARAM_TEST`     | Tuning, sieve grid search                 | None                                       |
+| `--param_test_legacy` | `PARAM_TEST_LEGACY` | Tuning, sieve grid search              | None                                       |
 | `--estimate_only`   | (special)        | Truncated sieve probe + estimation        | None                                       |
 
 `--sieve_only` followed by `--linalg_only` (or `--matrix_only`) provides a
 clean split between the long-running sieve phase and the matrix/linear
 algebra phases, which is useful for re-running the back end with different
 parameters without re-sieving.
+
+The current sieve-geometry search, `--param_test`, is a flag inside the full
+pipeline rather than a mode: it searches at the configured operating point,
+prints the winning `--params11` tuple and exits. `--param_test_legacy` is the
+superseded exhaustive grid search it replaced.
 
 ---
 
@@ -176,20 +181,29 @@ resolved across static libraries.
 
 The following figures are wall-clock times for the full pipeline (sieve +
 matrix + linear algebra + square root) on a single RTX 5070 Ti (Blackwell,
-SM 12.0), using autotuned parameters and the single large prime variant
-where applicable.
+SM 12.0) under v1.0.7, with the parameters chosen at run time by
+`--autotune_stage1` rather than pinned, and the single large prime variant
+where applicable. Each is the median of three timed runs. The `F`, `M` and `L`
+columns give the bounds each row was launched with.
 
 | Input         | Digits | `F`   | `M`    | `L`   | Time (s) |
 |---------------|--------|-------|--------|-------|----------|
-| 70d composite | 70     | 300K  | 262K   | 0     | 1.60     |
-| 80d composite | 80     | 700K  | 65K    | 0     | 7.72     |
-| 90d composite | 90     | 3M    | 262K   | 300M  | 41.36    |
-| RSA-100       | 100    | 7M    | 262K   | 1T    | 84.72    |
-| RSA-110       | 110    | 9M    | 262K   | 1T    | 1040.03  |
+| 70d composite | 70     | 300K  | 262K   | 0     | 2.88     |
+| 80d composite | 80     | 700K  | 65K    | 0     | 9.88     |
+| 90d composite | 90     | 3M    | 262K   | 300M  | 19.63    |
+| RSA-100       | 100    | 7M    | 262K   | 1T    | 75.01    |
+| RSA-110       | 110    | 9M    | 262K   | 1T    | 638.67   |
 
-RSA-100 factors in **51.12 s** on an NVIDIA H100 SXM and **1 m 25 s** on the
-RTX 5070 Ti; the cross-GPU record table and per-stage breakdowns are in
-[`README.md`](../README.md).
+These are the same measurements as the input-size table in
+[`README.md`](../README.md), which carries the full protocol, the comparison
+against the earlier release and the note that the 70d and 80d rows are slower
+than their 1.0.1-era figures, with the added cost falling entirely outside the
+sieve. Treat the README as the authoritative copy and update both together.
+
+RSA-100 factors in **38.30 s** on an NVIDIA H100 SXM and **66.38 s** on the
+RTX 5070 Ti, each with that device's pinned parameter tuple — faster than the
+75.01 s above, which autotunes instead; the cross-GPU record table and
+per-stage breakdowns are in [`README.md`](../README.md).
 
 Below ~85 digits the large prime variant is disabled; above that threshold,
 enabling LP dramatically increases relation yield.

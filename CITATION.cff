@@ -15,8 +15,13 @@ authors:
   - family-names: Heinrichs
     given-names: Christoph
     affiliation: "Paderborn University"
-version: "1.0.6"
-date-released: "2026-08-29"
+version: "1.0.7"
+date-released: "2026-09-18"
+doi: "10.5281/zenodo.21619473"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.21619473"
+    description: "Concept DOI — always resolves to the latest cuda-mpqs release."
 license: LGPL-3.0-only
 repository-code: "https://github.com/drjanosch42/cuda-mpqs"
 url: "https://github.com/drjanosch42/cuda-mpqs"

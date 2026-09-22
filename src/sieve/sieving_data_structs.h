@@ -212,6 +212,12 @@ struct devicePointers {
     void* dev_pp_accumulation_buffer = nullptr; // Pointer to DenseCandidate buffer
     uint32_t* dev_pp_counter = nullptr;         // Pointer to atomic fill counter
     uint32_t pp_max_capacity = 0;               // Value, not pointer (config)
+    uint32_t* dev_smallPrimeMask = nullptr;
+    uint32_t* dev_CRT_baseElements = nullptr;
+    /// GATHER per-block offsets1|offsets2|primes when sieveAndScanConfig::offsetsInGlobal.
+    /// One gatherOffsetsStride(bigPrimeStartIndex)-int slice per GATHER thread block; slices
+    /// are private to a block (which lives on one SM), so no cross-SM coherence is involved.
+    int* dev_sieveOffsets = nullptr;
 };
 
 // =============================================================================
@@ -296,6 +302,13 @@ struct sieveAndScanConfig {
     uint32_t num_threadBlocks;
     uint32_t batch_size;                    ///< Parameter for batch sieving
 
+    /// 1 = the GATHER kernel keeps offsets1/offsets2/primes in GLOBAL memory
+    /// (devicePointers::dev_sieveOffsets) instead of shared. Frees 3*bigPrimeStartIndex*4
+    /// bytes of shared memory per block, which is what otherwise ties bigPrimeStartIndex to
+    /// the shared-memory budget and holds GATHER at one resident block per SM. NARROW only:
+    /// the wide kernels keep the shared layout, so this is forced to 0 there.
+    uint32_t offsetsInGlobal = 0;
+
     size_t sharedMemReq;
 };
 
@@ -310,12 +323,24 @@ struct polyData {
     uint32_t threshold;      ///< Logarithmic threshold for identifying smooth numbers.
 };
 
+/// Per-block stride of dev_sieveOffsets, in ints: the three arrays of bigPrimeStartIndex
+/// entries, rounded up to 32 ints so every block's slice starts 128-byte aligned and the
+/// strided loops over it stay coalesced. Host and device must agree, hence one definition.
+__host__ __device__ inline size_t gatherOffsetsStride(uint32_t bigPrimeStartIndex) {
+    return (((size_t)3 * bigPrimeStartIndex + 31u) / 32u) * 32u;
+}
+
 struct fixedSievingParams {
     uint32_t fb_size;        ///< Factor base size.
     uint32_t shc_dim;        ///< Dimension of the hypercube (number of factors in 'a').
     uint32_t M;              ///< Sieve interval radius.
     uint32_t approxPolyRoot;
     uint32_t threshold;
+
+    //Small prime routine parameters (set by generateMask() in loadData(); zero-initialised so
+    //a validator running before loadData() sees a harmless 0 rather than an indeterminate value)
+    uint32_t period = 0;
+    uint32_t smallPrimesUsed = 0;
 };
 
 struct dynamicSievingParams {

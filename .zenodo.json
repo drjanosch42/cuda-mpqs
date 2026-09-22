@@ -1,6 +1,6 @@
 {
-  "title": "CUDA-MPQS: a fully GPU-resident quadratic sieve - v1.0.6",
-  "version": "1.0.6",
+  "title": "CUDA-MPQS: a fully GPU-resident quadratic sieve - v1.0.7",
+  "version": "1.0.7",
   "upload_type": "software",
   "access_right": "open",
   "license": "lgpl-3.0-only",
@@ -17,6 +17,14 @@
     }
   ],
   "description": "CUDA-MPQS is a high-performance, fully GPU-resident implementation of the Self-Initializing Multiple Polynomial Quadratic Sieve (SIQS/MPQS) for integer factorization. The entire pipeline runs on the GPU: parameter tuning and autotuning, polynomial sieving, large-prime postprocessing, sparse GF(2) matrix construction and preprocessing, Block Wiedemann linear algebra, and the square-root stage. It runs on a single device or across a GPU cluster, and factors general composite integers of up to 512 bits.",
+  "related_identifiers": [
+    {
+      "identifier": "10.5281/zenodo.21619473",
+      "relation": "isVersionOf",
+      "scheme": "doi",
+      "resource_type": "software"
+    }
+  ],
   "keywords": [
     "integer factorization",
     "quadratic sieve",

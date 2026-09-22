@@ -564,7 +564,7 @@ CompactMergeResult gpuCompactMergeCycles(
     // Stop when fewer than this fraction of alive rows were merged in a cycle.
     constexpr double kConvergenceThreshold = 0.02;
 
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
     auto t_total_start = clock::now();
 
     // Cumulative maps: initialized to identity (cycle 0 operates on post-singleton rows/cols).

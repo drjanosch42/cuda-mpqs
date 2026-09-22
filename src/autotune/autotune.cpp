@@ -26,8 +26,8 @@
 
 namespace mpqs::autotune {
 
-using Clock = std::chrono::high_resolution_clock;
-inline double duration(std::chrono::high_resolution_clock::duration d) {
+using Clock = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
+inline double duration(std::chrono::steady_clock::duration d) {
     return std::chrono::duration<double>(d).count();
 }
 
@@ -104,7 +104,7 @@ bool AutotuneController::run() {
     }
 
     LOG(LOG_INFO) << "Starting autotune procedure";
-    start_time_ = std::chrono::high_resolution_clock::now();
+    start_time_ = std::chrono::steady_clock::now();
 
     // History short-circuit
     if (atcfg_.load_history && loadHistory()) {
@@ -395,7 +395,7 @@ void AutotuneController::runStage0_Projection() {
 }
 
 void AutotuneController::runStage1_KernelParams() {
-    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
 
     // 1. Create ephemeral DeviceSievingController for mini-benchmarking
     auto siever = std::make_unique<mpqs::sieve::DeviceSievingController>(
@@ -655,12 +655,12 @@ void AutotuneController::runStage1_KernelParams() {
     result_.stages[1].ran = true;
     result_.stages[1].time_sec =
         std::chrono::duration<double>(
-            std::chrono::high_resolution_clock::now() - t0).count();
+            std::chrono::steady_clock::now() - t0).count();
     std::copy(kp_result.params.begin(), kp_result.params.end(), result_.best_params);
 }
 
 void AutotuneController::runStage2_RuntimeEstimation() {
-    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
 
     // Build probe config. Always carry forward Stage 1 kernel params so
     // probes reflect the optimized launch configuration regardless of LP status.
@@ -695,13 +695,13 @@ void AutotuneController::runStage2_RuntimeEstimation() {
 
     // Record
     result_.stages[2].ran = true;
-    auto t1 = std::chrono::high_resolution_clock::now();
+    auto t1 = std::chrono::steady_clock::now();
     result_.stages[2].time_sec =
         std::chrono::duration<double>(t1 - t0).count();
 }
 
 void AutotuneController::runStage3_SieveParams() {
-    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
 
     // Warm start from current pipeline config
     auto warm_start = std::make_tuple(
@@ -725,7 +725,7 @@ void AutotuneController::runStage3_SieveParams() {
 
     // Compute remaining wall-clock budget; skip if insufficient
     double elapsed_total = std::chrono::duration<double>(
-        std::chrono::high_resolution_clock::now() - start_time_).count();
+        std::chrono::steady_clock::now() - start_time_).count();
     double remaining = atcfg_.timeout_sec - elapsed_total;
     if (remaining < 30.0) {
         LOG(LOG_INFO) << "Stage 3: Skipped (< 30s remaining)";
@@ -808,7 +808,7 @@ void AutotuneController::runStage3_SieveParams() {
     // Record stage timing
     result_.stages[3].ran = true;
     result_.stages[3].time_sec = std::chrono::duration<double>(
-        std::chrono::high_resolution_clock::now() - t0).count();
+        std::chrono::steady_clock::now() - t0).count();
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +917,7 @@ bool AutotuneController::hasTimedOut() const {
 
 double AutotuneController::elapsed() const {
     return std::chrono::duration<double>(
-        std::chrono::high_resolution_clock::now() - start_time_).count();
+        std::chrono::steady_clock::now() - start_time_).count();
 }
 
 // ---------------------------------------------------------------------------

@@ -7,19 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Documentation only. **No product source changed** — `src/`, the linear-algebra
-submodule and the build system are untouched.
+## [1.0.7] - 2026-09-18
+This release speeds up the narrow (8-bit) sieve with a precomputed small-prime
+mask and a restructured backward sieve, and adds a new parameter search together
+with an 11-field parameter pin that exposes the sieving block size and both
+prime-band boundaries. The kernel changes are confined to the two narrow
+gathering kernels; the scattering kernels and both wide-accumulator kernels are
+unchanged, so the RSA-150/155 production path (wide, saturating 8-bit) is
+unaffected by construction. The linear-algebra submodule keeps its independent
+version, 1.0.1.
+
+### Added
+- **Small-prime log mask (always on, narrow path, legacy and batch kernels).**
+  The contribution of the smallest factor-base primes is precomputed once as a
+  periodic mask in global memory, and each sieving block initialises its
+  accumulator from it — aligned to both roots by the Chinese remainder theorem —
+  instead of zeroing the accumulator and sieving those primes. The mask carries
+  the sieve's own logarithms, so the relations found are unchanged. Measured at
+  RSA-100 with pinned parameters: −7.76 % sieve wall on an RTX 5070 Ti; −14.1 %
+  on H100 at 6.79 % less board energy; −21.3 % on A100 at 11.23 % less.
+- **`--params11 <np,numIntervals,polyBlockSize,blocksPerCycle,metaGridDim,metaBlockDim,sasGridDim,sasBlockDim,sievingBlockSize,bigPrimeStart,midPrimeStart>`**:
+  an 11-field pin whose first eight fields are exactly `--params`. The six grid
+  and partition fields must be given; a zero elsewhere keeps the derived value.
+  Unless `--bucket_size_factor` is set, the large-prime bucket is sized to the
+  predicted peak occupancy for the chosen block size and large-prime start.
+  Takes precedence over `--params`, autotune and history; exercised on the
+  narrow accumulator path only.
+- **`--param_test`** now runs a new parameter search over nine axes — the eight
+  kernel parameters minus the two interval-derived ones, plus sieving block size,
+  large-prime start and mid-prime start. Axes that share a constraint are swept
+  together as the faces of a "tuning complex", and a candidate is adopted only if
+  it wins an alternating duel against the incumbent measured beside it by at
+  least 0.5 %, so clock and thermal drift cannot masquerade as a gain. It seeds
+  from `--params11` if given, prints a ready-to-use `--params11` line and exits.
+  **`--param_test_radius <R>`** (default 3) bounds the largest face dimension
+  swept; the previous exhaustive grid search is now **`--param_test_legacy`**.
+- **`--sieve_offsets_global`** (default off, narrow path only): keeps the
+  gathering kernel's per-prime offset arrays in global memory, so the large-prime
+  start no longer consumes the shared-memory budget. Experimental.
+
+### Changed
+- **Backward sieve restructured (narrow path).** Mask primes are identified by
+  testing each candidate directly instead of walking every multiple in the block,
+  and the remaining small primes are walked 32 lanes per prime with no per-prime
+  barrier, in the forward and the backward pass alike.
+- **The mid-prime start index is 96 (was 32)** for pinned, autotuned and
+  history-applied configurations; a default configuration used without `--params`
+  still uses 32. The prime bands are now validated to be ordered — mask primes
+  end at or before the mid-prime start, which is at or before the large-prime
+  start — so a `--sieve_big_prime_start` below 96 is rejected before sieving.
+- **Interval coverage must now equal `2M` exactly on the narrow path, in batch
+  and legacy mode alike** (1.0.6 required at least `2M`, in batch mode only).
+  Over-coverage sieves past the interval, where relations are rare, and would
+  otherwise look fast to a timing probe; autotune probes that over-cover, or
+  under-cover in legacy mode, are rejected rather than measured.
+- The legacy sieve derives its per-prime inverse tables once per hypercube rather
+  than once per sieve call, and validation runs silently when it is screening
+  parameter candidates rather than checking a configuration.
+
+### Fixed
+- **A sieve configuration could pass validation and then fail to launch,
+  producing zero relations without an error.** The shared-memory check omitted
+  the batch kernel's per-block polynomial coefficients; it now uses the launched
+  size, and a failed gathering-kernel launch is logged as a critical error.
+- **All elapsed-time measurement in the main tree now uses a monotonic clock
+  instead of the wall clock.** `std::chrono::high_resolution_clock` is
+  `system_clock` under libstdc++, so a host whose wall clock is stepped backwards
+  mid-run — an NTP correction, or a virtualized guest's time sync — could report
+  a negative stage time or a total shorter than the core time. Log and history
+  timestamps are unaffected; the linear-algebra submodule still times itself
+  against the wall clock.
+- A warning is logged when the large-prime bucket is smaller than its predicted
+  peak occupancy, since overflow discards large-prime hits silently.
 
 ### Documented
-- `README.md` gained a performance refresh and a full table of the factorization
-  records, from a cross-architecture RSA-100 benchmark of 1.0.6 over five devices
-  and eight configurations, every run product-verified.
-- **A measured limitation of the multiprocessor-aligned launch geometry added in
-  1.0.6: it does not transfer to H100.** On a 108-multiprocessor A100 the
-  technique is worth −17.4 % of the RSA-100 sieve wall; on a 132-multiprocessor
-  H100 the aligned configuration measures **+2.5 % total and +3.6 % sieve wall**,
-  i.e. a loss, for the structural reason recorded in the 1.0.6 entry. H100 keeps
-  its power-of-two configuration.
+- **Benchmark protocol:** the RSA-100 benchmark launchers now pass
+  `--lp1_max_witnesses 8388608 --bw_max_solutions 64`. Capping the Block
+  Wiedemann solutions carried into reconstruction (default: all, typically
+  200-235 at RSA-100) to 64 cuts reconstruction and the batched square-root work
+  by 3.8-4.7 % of the end-to-end total at no sieve-side cost, while about half of
+  the retained solutions stay nontrivial; the larger witness table clears a
+  silent overflow seen at the 4,194,304 capacity the binary sizes for itself when
+  the flag is absent. The launchers pass the literal `8388608` rather than `8M`
+  only for legibility: `--lp1_max_witnesses` takes a `K`/`M`/`B`/`T` suffix in
+  base 1000 and then snaps the result to the nearest power of two, so both
+  spellings select 2^23. At this protocol the end-to-end RSA-100
+  medians are 38.30 s on an H100 SXM, 66.38 s on an RTX 5070 Ti, 83.80 s on an
+  A100 SXM4 and 137.76 s on a TITAN RTX, each at that device's own tuned tuple.
+- **The multiprocessor-aligned launch geometry added in 1.0.6 does not transfer
+  to H100.** Worth −17.4 % of the RSA-100 sieve wall on a 108-multiprocessor
+  A100, the aligned configuration measures **+2.5 % total and +3.6 % sieve wall**
+  on a 132-multiprocessor H100 — a loss, for the structural reason recorded in
+  the 1.0.6 entry. H100 keeps its power-of-two configuration.
 
 ## [1.0.6] - 2026-08-25
 This release extends CUDA-graph replay from the sieving kernels to the whole
@@ -275,7 +354,12 @@ milestone factorizations: RSA-140 (463-bit) on 2026-06-29 in about 104 GPU-hours
 on a 16× NVIDIA H100 cluster, and RSA-155 (512-bit) on 2026-07-14 in 700.64
 GPU-hours total — a 689.74 GPU-hour distributed sieve on 64× NVIDIA H100 GPUs
 (16 nodes) plus 10.90 GPU-hours of single-H100 linear algebra — yielding two
-product-verified 78-digit prime factors.
+78-digit prime factors. This release's binary also produced the RSA-150
+(496-bit) factorization on 2026-08-23, after the release: 17,269,643 relations
+at 44.90 % large-prime fraction sieved in 4.61 h wall-clock on the same 64× H100
+configuration (295.18 GPU-hours), then a 16,700,000 × 15,663,546 GF(2) matrix
+with 690,586,752 nonzeros solved in 7.68 GPU-hours on a single H100, for
+302.86 GPU-hours and 107.506 kWh in total, yielding two 75-digit prime factors.
 
 ### Added
 - **Wide sieve-accumulator path for 512-bit inputs** (`--wide_accum

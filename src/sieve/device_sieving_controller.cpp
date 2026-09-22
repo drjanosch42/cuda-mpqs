@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include "json_helper.h"
+#include "dynamicMask.cuh"
 
 // CUDA error-check helper specific to the sieve module.
 // Wraps any CUDA runtime call that returns cudaError_t. On failure,
@@ -66,6 +67,7 @@ DeviceSievingController::DeviceSievingController(int device)
 DeviceSievingController::~DeviceSievingController()
 {
     // Proper cleanup of device pointers
+    if (dev_pointers.dev_sieveOffsets) cudaFree(dev_pointers.dev_sieveOffsets);
     if (dev_pointers.dev_factorBase) cudaFree(dev_pointers.dev_factorBase);
     if (dev_pointers.dev_rootN) cudaFree(dev_pointers.dev_rootN);
     if (dev_pointers.dev_a_factors) cudaFree(dev_pointers.dev_a_factors);
@@ -317,6 +319,10 @@ void DeviceSievingController::updateState()
 {
     ds_params.a = f_data.a;
     ds_params.log2_a = ds_params.a.msb();
+    // A new 'a' invalidates everything initPrimeData() derives, so this IS a new cube. Set it
+    // here rather than relying on each sweep entry to do so: sieveStep() gates the (expensive)
+    // re-derivation on this flag, and updateState() is the only place 'a' ever changes.
+    ds_params.newCube = true;
     ds_params.startIndex = -((int32_t)f_data.M);
     ds_params.subCube = 0; // Default to 0 for single step
 
@@ -336,6 +342,10 @@ void DeviceSievingController::loadData(){
         gs_conf,
         ss_conf,
         dev_pointers);
+
+    maskData MD = generateMask(f_data.factorBase.data(), dev_pointers);
+    fs_params.period = MD.period;
+    fs_params.smallPrimesUsed = MD.smallPrimesUsed;
 }
 
 void DeviceSievingController::clearCandidates() {
@@ -505,7 +515,17 @@ void DeviceSievingController::sieveFullCube()
 
 void DeviceSievingController::sieveStep()
 {
-    initPrimeData(dev_pointers, init_conf, gs_conf, fs_params, ds_params, stream);
+    // initPrimeData() depends ONLY on 'a' (via ds_params.a / dev_B_values / factorBase / rootN):
+    // mod_inverse_a, inv_aN and the whole dev_primeBValues table are fixed for the lifetime of
+    // one hypercube, and nothing in the sieve writes primeData back. Re-deriving it per call
+    // costs fb_size * (a 32-round modular exponentiation + shc_dim uint512 reductions), repeated
+    // once per subCube and per sievingBlockBatch of the SAME 'a'. Gate it on newCube — set by
+    // updateState() whenever 'a' changes, cleared below after the first call of each cube.
+    // The whole wrapper is gated deliberately: initPrimeDataKernel writes a value-initialised
+    // primeDataSIQS (clearing `inactive`), so its paired markInactivePrimesKernel must run with
+    // it or the a-factors would come back active.
+    if (ds_params.newCube)
+        initPrimeData(dev_pointers, init_conf, gs_conf, fs_params, ds_params, stream);
     globalMetaSieve(dev_pointers, fs_params, ds_params, gs_conf, gms_conf, stream);
     sieveAndScan(dev_pointers, fs_params, ds_params, gs_conf, ss_conf, stream);
     ds_params.newCube = false; //A sieving call was made locally, so the cube is not "new" anymore
@@ -534,7 +554,36 @@ float DeviceSievingController::sieveMini(uint32_t num_subcubes) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    // UNTIMED SETUP PASS. Two things used to sit inside the measured window and should not:
+    //
+    //   initPrimeData() -- newCube is set here, so the first sieveStep() re-derives
+    //     mod_inverse_a, inv_aN and the whole dev_primeBValues table: fb_size primes x (a
+    //     32-round modular exponentiation + shc_dim uint512 reductions). That cost depends on
+    //     'a' alone, NOT on the geometry under test, so it is the same constant for every
+    //     candidate -- it compresses the spread between them and, because the score is divided
+    //     by work, penalises small np. Production amortises it over a whole hypercube; charging
+    //     each probe one full copy is the unrepresentative choice.
+    //
+    //   the cold start -- first-touch caches, clock ramp and JIT all land on the first pass.
+    //     sieveMiniBatch has discarded a warm-up prefix for exactly this reason since the wide
+    //     autotune work; narrow sieveMini never did, which is why a seed's first draw reads
+    //     well above its own later draws.
+    //
+    // One full sieveStep() outside the window covers both: it performs the derivation, clears
+    // newCube, and warms the machine. The timed passes then measure steady-state sieving.
     ds_params.newCube = true;
+    ds_params.subCube = 0;
+    ds_params.startIndex = -((int32_t)f_data.M);
+    sieveStep();                       // setup + warm-up, deliberately not measured
+
+    // The GATHER kernel resumes candidatesFound from dev_blockRelationCounts whenever newCube
+    // is false, and a block that has spent its maxRelationsPerBlock budget stops emitting (and
+    // stops running the backward sieve). Zero the counters so the timed region starts from the
+    // same state the untimed pass did -- otherwise the warm-up would leave every block full and
+    // the measurement would skip the backward sieve entirely.
+    cudaMemsetAsync(dev_pointers.dev_blockRelationCounts, 0,
+                    (size_t)ss_conf.num_threadBlocks * sizeof(uint32_t), stream);
+
     cudaEventRecord(start, stream);
 
     for (uint32_t sc = 0; sc < num_subcubes; ++sc) {
@@ -806,8 +855,588 @@ float DeviceSievingController::evaluateConfig(const Params8& params,
     return sieveMini(num_subcubes);
 }
 
+// Smallest power of two >= x (the loaders keep their own local copies of this).
+static inline uint32_t pow2geqU32(uint32_t x) {
+    if (x <= 1) return 1u;
+    return 1u << (32 - std::countl_zero(x - 1u));
+}
+
+void DeviceSievingController::runParamTest(factoringData& f_data, const ParamSet* seed,
+                                                      uint32_t radius)
+{
+    LOG_SET_SUBMODULE("PARAM_TEST");
+
+    const int          kRadius        = (int)(radius ? radius : 1u);  // --param_test_radius
+    constexpr int      kMaxRounds     = 64;  // cycles over the face complex
+    constexpr double   kJumpMargin    = 0.005; // a face must beat the record by this to be adopted
+    constexpr uint64_t kProgressProbes = 100; // heartbeat cadence within a face, in probes
+    constexpr uint32_t kMaxSubCubes = 2;     // sieve calls per hypercube; see the prune below
+    constexpr uint64_t kRefEvery   = 25;     // re-probe the incumbent every N candidates
+    constexpr int      kRefWindow  = 3;      // reference = min of the last N such draws
+    constexpr int      kReps          = 2;   // draws a contender gets; judged on their minimum
+    constexpr uint32_t kProbeSubCubes = 2;   // subcubes per timing probe
+
+    using clk = std::chrono::steady_clock;
+    auto secs = [](clk::duration d) {
+        return std::chrono::duration_cast<std::chrono::duration<double>>(d).count();
+    };
+
+    if (use_wide_accumulator_) {
+        LOG(LOG_ERROR_CRITICAL) << "Param test: narrow (uint8) path only";
+        return;
+    }
+
+    const uint32_t hyperCubeSize = 1u << (f_data.a_factors.size() - 1);
+    const uint32_t M  = f_data.M;
+    const uint32_t mp = (uint32_t)g_info.multiProcessorCount;
+
+    auto pow2Range = [](std::vector<uint32_t>& out, uint32_t lo, uint32_t hi) {
+        out.clear();
+        for (uint32_t v = 1u; v <= hi; v <<= 1) {
+            if (v >= lo) out.push_back(v);
+            if (v == (1u << 31)) break;
+        }
+    };
+    auto addRung = [](std::vector<uint32_t>& v, uint32_t x) {
+        if (x && std::find(v.begin(), v.end(), x) == v.end()) v.push_back(x);
+    };
+
+    // ---- rung ladders ---------------------------------------------------------------
+    std::vector<uint32_t> rSB, rNP, rSASG, rPBS, rBPSI, rMETAG, rMETAB, rSASB;
+    pow2Range(rSB,    8192, std::min(M, 131072u));
+    pow2Range(rNP,      32, hyperCubeSize);
+    pow2Range(rSASG,    32, 1024);
+    pow2Range(rPBS,      1, 32);
+    pow2Range(rMETAG,   32, 1024);
+    pow2Range(rMETAB,  128, 1024);
+    pow2Range(rSASB,   128, 1024);
+
+    // ---- prime-band boundaries: an arithmetic ladder, NOT a power-of-two one ---------
+    // midPrimeStartIndex and bigPrimeStartIndex are prime-INDEX band boundaries, and the
+    // small->mid band is walked in groups of 32 consecutive primes (kernel.cu:1276 strides
+    // blockDim/32 such groups over [smallPrimesUsed, midPrimeStart)), so both boundaries
+    // belong on the lattice  smallPrimesUsed + k*32  (the mask covers the first
+    // smallPrimesUsed primes, so the groups start there); a power-of-two ladder both misses
+    // every lattice point and steps far too coarsely.
+    const uint32_t spu = fs_params.smallPrimesUsed;
+    auto snapBand = [spu](long v) -> uint32_t {   // nearest lattice point, >= spu + 32
+        return spu + 32u * (uint32_t)std::max<long>(((v - (long)spu) + 16) / 32, 1);
+    };
+    auto bandRange = [&](std::vector<uint32_t>& out, long lo, long hi, long step) {
+        out.clear();
+        for (long v = lo; v <= hi; v += step) addRung(out, snapBand(v));
+        std::sort(out.begin(), out.end());
+    };
+    // midPrimeStart: ranged well past the 128 heuristic -- the Turing and H100 searches BOTH
+    // pinned this axis at the old top rung (196), which says the range was the binding
+    // constraint rather than the optimum.
+    std::vector<uint32_t> rMIDPS;
+    bandRange(rMIDPS, 128 - 2*32, 128 + 8*32, 16);
+
+    // bigPrimeStart: bounded by what the GATHER shared-memory budget actually permits, not by a
+    // fixed offset from the SB heuristic. The old top (rSB.back()/32 + 256) stopped at 4324 on
+    // H100 while the hardware allows ~8389, and the search pinned there. The bound is taken at
+    // the SMALLEST SB rung, i.e. the largest headroom any SB could use; rungs that do not fit at
+    // the SB actually chosen are rejected by validateConfigs for free. With offsetsInGlobal the
+    // shared-memory term disappears entirely, so only the factor base bounds it.
+    {
+        const long smemForBands = (long)g_info.maxSharedMemPerBlock
+                                - (long)fs_params.shc_dim * (long)sizeof(mpqs::uint512);
+        const long fbCap = (long)f_data.factorBase.size() / 2;
+        const long hiFit = offsets_in_global_ ? fbCap
+                         : std::min((smemForBands - (long)rSB.front()) / 12, fbCap);
+        const long lo    = std::max((long)rSB.front()/32 - 2*128, (long)rMIDPS.back() + 32);
+        const long hi    = std::max(hiFit, (long)rSB.back()/32 + 2*128);
+        // Bound the rung COUNT (~48), not the step: a fixed 128 would give ~140 rungs on H100,
+        // and the occupancy face is 5 x |bPSI| x 4 -- it would become the entire search.
+        const long step  = std::max(128L, (((hi - lo) / 48 + 31) / 32) * 32);
+        bandRange(rBPSI, lo, hi, step);
+    }
+
+    // The exact-wave family is not on a power-of-two ladder: add SM-derived rungs so the
+    // neighbourhood can reach it. SM counts are read from the device, never hardcoded.
+    for (uint32_t k : {1u, 2u}) { addRung(rMETAG, mp*k); addRung(rSASG, mp*k); }
+    for (uint32_t k : {1u, 2u, 4u, 8u, 16u}) if (mp*k <= hyperCubeSize) addRung(rNP, mp*k);
+    std::sort(rMETAG.begin(), rMETAG.end());
+    std::sort(rSASG.begin(),  rSASG.end());
+    std::sort(rNP.begin(),    rNP.end());
+
+    // Seed. With --params11: that tuple, so the search can be started at a known-good
+    // geometry and its score read directly against the neighbourhood. Without it: whatever a
+    // bare run would use — loadStandardConfig resolves all eleven fields self-consistently,
+    // which the autotune HEURISTIC_DEFAULTS tuple does NOT (np=512 with metaGridDim=256,
+    // polyBlockSize=4 gives np % (metaGridDim*polyBlockSize) != 0). Either way the eleven
+    // seed values are read back from the RESOLVED config, so a partial --params11 (0 =
+    // unset) is seeded at the loader's own derivation for the fields it leaves out.
+    if (seed) {
+        loadPartialCustomConfigDynamic(*seed);
+    } else {
+        loadStandardConfig();
+        // loadStandardConfig pins the narrow SCATTER grid to a literal 64 ("keeps the exact
+        // prior value") so bare runs stay byte-identical to the validated records. That is below
+        // the SM count on every card with more than 64 SMs, where the grid prune then rejects
+        // the seed and the search cannot start at all. Raise it for the SEED only.
+        //
+        // Both grids and polyBlockSize move together: metaGridDim * polyBlockSize must divide
+        // num_polysPerSieveCall EXACTLY, and loadStandardConfig grew polyBlockSize against the
+        // old grid of 64. Raising the grid alone therefore breaks the partition (128 * 32 =
+        // 4096 > np = 2048 leaves num_polyBlocksPerThreadBlock = 0). Adjust all of them and
+        // re-load through loadPartialCustomConfig, so every derived quantity -- npbptb,
+        // activeBuckets, both sharedMemReq -- follows from one consistent tuple instead of
+        // being patched field by field.
+        const uint32_t mpq  = pow2geqU32((uint32_t)g_info.multiProcessorCount);
+        const uint32_t np   = gs_conf.num_polysPerSieveCall;
+        const uint32_t metaGrid = std::min(std::max(gms_conf.num_threadBlocks, mpq), np);
+        const uint32_t sasGrid  = std::min(std::max(ss_conf.num_threadBlocks,  mpq), np);
+        const uint32_t pbs  = std::max(1u, std::min(gms_conf.polyBlockSize, np / metaGrid));
+        loadPartialCustomConfig(np,
+                                gs_conf.num_sievingBlocksPerSieveCall,
+                                pbs,
+                                gms_conf.num_activeBlocksPerCycle,
+                                metaGrid, gms_conf.num_threadsPerBlock,
+                                sasGrid,  ss_conf.num_threadsPerBlock);
+    }
+    LOG(LOG_INFO) << "Param test: seed from "
+                  << (seed ? "--params11" : "loadStandardConfig()");
+    const uint32_t seedVal[] = {
+        gs_conf.sievingBlockSize, gs_conf.num_polysPerSieveCall,
+        ss_conf.num_threadBlocks, gms_conf.polyBlockSize,
+        gs_conf.bigPrimeStartIndex, gms_conf.num_threadBlocks,
+        gms_conf.num_threadsPerBlock, ss_conf.num_threadsPerBlock,
+        gs_conf.midPrimeStartIndex
+    };
+    // Make the seed exactly representable, then freeze the ladders (the axis table below
+    // holds pointers into them).
+    {
+        std::vector<uint32_t>* lad[] = {&rSB,&rNP,&rSASG,&rPBS,
+                                        &rBPSI,&rMETAG,&rMETAB,&rSASB,&rMIDPS};
+        for (size_t i = 0; i < 9; ++i) { addRung(*lad[i], seedVal[i]); std::sort(lad[i]->begin(), lad[i]->end()); }
+    }
+
+    struct Axis { SieveParam id; const char* name; const std::vector<uint32_t>* vals; };
+    const std::vector<Axis> axis = {
+        // numIntervals and blocksPerCycle are absent BY DESIGN: both are functions of
+        // sievingBlockSize (coverage == 2M, one meta-sieve cycle), derived in the loader. As
+        // free axes they made every SB move cost three simultaneous changes, which no bounded
+        // neighbourhood could afford -- so SB, the axis with the largest effect, never moved.
+        {P_SIEVING_BLOCK_SIZE,      "SB",        &rSB   },   // reload-forcing
+        {P_SUB_CUBE_SIZE,           "np",        &rNP   },
+        {P_SAS_GRID_DIM,            "sasGrid",   &rSASG },
+        {P_POLY_BLOCK_SIZE,         "pbs",       &rPBS  },
+        {P_BIG_PRIME_START,         "bPSI",      &rBPSI },
+        {P_META_GRID_DIM,           "metaGrid",  &rMETAG},
+        {P_META_BLOCK_DIM,          "metaBlock", &rMETAB},
+        {P_SAS_BLOCK_DIM,           "sasBlock",  &rSASB },
+        {P_MID_PRIME_START,         "midPS",     &rMIDPS}
+    };
+    const size_t n = axis.size();
+
+    std::vector<size_t> best(n);
+    for (size_t i = 0; i < n; ++i)
+        best[i] = (size_t)(std::find(axis[i].vals->begin(), axis[i].vals->end(), seedVal[i])
+                           - axis[i].vals->begin());
+
+    // ---- probe: work-normalised, so configurations sweeping different amounts of the
+    //      cube stay comparable. Lower is better. Negative = rejected/unmeasurable.
+    //      A candidate is no longer rejected for its bucket FILL: loadPartialCustomConfigDynamic
+    //      sizes globalBucketSize to the predicted peak occupancy, so a large bPSI simply buys a
+    //      bigger bucket. The only bucket-related rejection left is the VRAM budget, enforced
+    //      (like every other admissibility rule) by validateConfigsSilent().
+    double last_probe_us = 0.0;   // absolute time of the most recent probe (for logging)
+    auto toParamSet = [&](const std::vector<size_t>& p) {
+        ParamSet ps;
+        for (size_t i = 0; i < n; ++i) ps[axis[i].id] = (*axis[i].vals)[p[i]];
+        return ps;
+    };
+    // Heuristic prunes. These reject configs that are ADMISSIBLE but structurally wasteful,
+    // before any launch, so the ball spends its probes on candidates that could plausibly win.
+    // Kept here rather than in validateConfigs: they are judgements about what is sensible,
+    // not statements about what is correct.
+    // Counted, not logged: at a compressed radius the ball holds thousands of candidates and a
+    // line per rejection buries the round. The per-round tally says the same thing in one line.
+    uint64_t pruned_grid = 0, pruned_cycles = 0, pruned_subcubes = 0, pruned_smem = 0;
+    auto heuristicallyHopeless = [&]() -> bool {
+        // (1) A grid below the SM count leaves whole SMs idle for the kernel's entire
+        //     duration -- no occupancy, cache or latency effect can pay that back.
+        if (gms_conf.num_threadBlocks < mp || ss_conf.num_threadBlocks < mp) {
+            ++pruned_grid; return true;
+        }
+        // (2) num_metaSieveCycles > 1 re-traverses the entire factor base above
+        //     bigPrimeStartIndex once per cycle, paying rootsFromPolyId and the modular setup
+        //     again while the useful hit work per cycle merely halves.
+        if (gms_conf.num_metaSieveCycles > 1) { ++pruned_cycles; return true; }
+        // (3) num_subCubes = min(32768, 2^(shc_dim-1))/np is the number of sieve CALLS one
+        //     hypercube costs, and each call carries a fixed pipeline tax the probe cannot see:
+        //     its own processAndCommit, counter resets and stream sync, amortised over np
+        //     polynomials. Small np multiplies that tax without changing the relation set --
+        //     a cost that is real in production and invisible to a kernel-only timing probe,
+        //     so it is pruned rather than measured.
+        if (gs_conf.num_subCubes > kMaxSubCubes) { ++pruned_subcubes; return true; }
+        // (4) The search PROBES through the legacy kernel, which reads B_values from global
+        //     memory, but its OUTPUT is a tuple for a production BATCH run, where the GATHER
+        //     kernel stages shc_dim uint512 B_values in shared memory on top of
+        //     ss_conf.sharedMemReq. validateConfigs gates that term on batch_size > 0 -- which
+        //     is correct for whichever kernel is about to run, and therefore zero here. Check
+        //     the batch footprint explicitly so the search cannot recommend a geometry that
+        //     passes every probe and then fails to launch in production.
+        if (ss_conf.sharedMemReq + (size_t)fs_params.shc_dim * sizeof(mpqs::uint512)
+                > g_info.maxSharedMemPerBlock) { ++pruned_smem; return true; }
+        return false;
+    };
+
+    auto evaluate = [&](const std::vector<size_t>& p) -> double {
+        loadPartialCustomConfigDynamic(toParamSet(p));
+        if (!validateConfigsSilent()) return -1.0;
+        if (heuristicallyHopeless()) return -1.0;
+        loadSievingDataParamTest(f_data.factorBase, f_data.rootN, f_data.a_factors,
+                                 fs_params.shc_dim, gs_conf, ss_conf, dev_pointers);
+        // Never probe past the cube: num_subCubes is cap/np, so it is 1 at the largest np.
+        const uint32_t sub = std::min(kProbeSubCubes, gs_conf.num_subCubes);
+        if (sub == 0) return -1.0;
+        cudaGetLastError();                      // clear anything sticky from the last candidate
+        const float t_us = sieveMini(sub);
+        // sieveMini only times; it never checks. A config that passes validateConfigs but fails
+        // AT LAUNCH (smem over the opt-in limit, bad grid) returns a near-zero time and would
+        // otherwise win the round. Reject it, and clear the error so the next probe starts clean.
+        const cudaError_t perr = cudaGetLastError();
+        if (perr != cudaSuccess) {
+            LOG(LOG_DEBUG_1) << "      probe failed: " << cudaGetErrorString(perr);
+            return -1.0;
+        }
+        if (t_us <= 0.0f) return -1.0;
+        last_probe_us = t_us;
+        const double work = (double)sub * gs_conf.num_polysPerSieveCall
+                          * gs_conf.num_sievingBlockBatches
+                          * gs_conf.num_sievingBlocksPerSieveCall
+                          * gs_conf.sievingBlockSize;
+        return work > 0.0 ? (double)t_us / work : -1.0;
+    };
+
+    auto axisOf = [&](SieveParam id) -> size_t {
+        for (size_t i = 0; i < n; ++i) if (axis[i].id == id) return i;
+        return n;
+    };
+    auto describe = [&](const std::vector<size_t>& p) {
+        std::string s;
+        for (size_t i = 0; i < n; ++i)
+            s += (i ? " " : "") + std::string(axis[i].name) + "=" +
+                 std::to_string((*axis[i].vals)[p[i]]);
+        return s;
+    };
+
+    // Same tuple in --params11 order (SieveParam), ready to paste onto a command line.
+    // numIntervals and blocksPerCycle are no longer axes but they ARE still fields, so they are
+    // filled with the values the loader derives -- otherwise the line would come back 9 values
+    // long and --params11, which wants all 11, would reject it.
+    auto describeDynamic = [&](const std::vector<size_t>& p) {
+        const size_t sbAxis = axisOf(P_SIEVING_BLOCK_SIZE);
+        const uint32_t sb   = (sbAxis < n) ? (*axis[sbAxis].vals)[p[sbAxis]] : 0u;
+        const uint32_t nI   = sb ? (uint32_t)((2ull * fs_params.M) / sb) : 0u;
+        std::string s;
+        for (uint32_t k = 0; k < (uint32_t)P_COUNT; ++k) {
+            if (k) s += ",";
+            if (k == (uint32_t)P_NUM_INTERVALS || k == (uint32_t)P_BLOCKS_PER_CYCLE) {
+                s += std::to_string(nI);      // derived: coverage == 2M, one meta-sieve cycle
+                continue;
+            }
+            for (size_t a = 0; a < n; ++a)
+                if ((uint32_t)axis[a].id == k)
+                    s += std::to_string((*axis[a].vals)[p[a]]);
+        }
+        return s;
+    };
+
+    LOG(LOG_INFO) << "Param test: radius " << kRadius
+                  << " (max face dimension)"
+                  << ", <= " << kMaxRounds
+                  << " rounds, jump margin " << (100.0 * kJumpMargin)
+                  << " %, probing seed: " << describe(best);
+    LOG(LOG_INFO) << "  --params11 " << describeDynamic(best);
+    double bestScore = evaluate(best);
+    if (bestScore < 0.0) {
+        LOG(LOG_ERROR_CRITICAL) << "Param test: seed config rejected -- "
+                                << describe(best) << "; validator says:";
+        loadPartialCustomConfigDynamic(toParamSet(best));
+        validateConfigs();          // loud: print which check failed
+        exit(1);                    // do NOT fall back into runParamTestLegacy
+    }
+    LOG(LOG_INFO) << "  seed score " << bestScore << " us/poly-position ("
+                  << last_probe_us << " us absolute), bucket " << gs_conf.globalBucketSize
+                  << " slots for a predicted "
+                  << expectedBucketEntries(gs_conf.sievingBlockSize, gs_conf.bigPrimeStartIndex)
+                  << " mean entries";
+
+    // ---- hill climb, FIRST-IMPROVEMENT. The walk re-centres on the FIRST candidate that
+    //      beats the incumbent by more than kJumpMargin and restarts the neighbourhood from
+    //      there, so a single round can move several axes; the argmin-over-the-whole-ball
+    //      rule it replaces could move the incumbent by at most one L1 ball per round no
+    //      matter how many probes that ball cost. The margin is what keeps a jump from
+    //      chasing probe noise. A ball that completes with no such jump falls back to the
+    //      argmin over that ball (steepest descent), which is also what makes "the incumbent
+    //      is the neighbourhood optimum" a meaningful convergence test.
+    // ---- THE TUNING COMPLEX ---------------------------------------------------------
+    //
+    // Which parameters are worth moving TOGETHER is not a question of distance in ladder space;
+    // it is fixed by the constraints in validateConfigs and by which quantity each parameter
+    // feeds. A uniform L1 ball gets this backwards: it spends most of its probes on pairs that
+    // share no constraint at all (polyBlockSize with bigPrimeStart, say) while being far too
+    // small to reach along the axes that genuinely must travel together.
+    //
+    // So the neighbourhood is a complex of FACES -- small sets of axes with a real coupling --
+    // and each face is swept over the FULL PRODUCT of its ladders with every other axis held at
+    // the incumbent. A face therefore reaches further on each of its axes than a radius-3 ball
+    // does, for a small fraction of the probes: ~1.1k for a whole cycle against ~84k for
+    // radius 3, which still only reaches +-3 rungs.
+    //
+    // Vertices are shared between faces (np sits in two, sasBlock and metaGrid in two each), so
+    // this is a complex rather than a partition. Every axis appears in at least one face.
+    struct Face { const char* name; std::vector<SieveParam> ids; };
+    const std::vector<Face> faces = {
+        // GATHER smem is SB + 3*bPSI*4 and blocks/SM = min(smem limit, threads limit from
+        // sasBlockDim): all three set the same occupancy rung and none of them means anything
+        // alone. This is the face a ball can never assemble.
+        {"occupancy",         {P_SIEVING_BLOCK_SIZE, P_BIG_PRIME_START, P_SAS_BLOCK_DIM}},
+        // metaGridDim * num_polyBlocksPerThreadBlock * polyBlockSize == np, EXACTLY.
+        {"scatter-partition", {P_SUB_CUBE_SIZE, P_META_GRID_DIM, P_POLY_BLOCK_SIZE}},
+        // sasGridDim divides np, np/sasGridDim is a power of two, and polys-per-block decides
+        // how early the maxRelationsPerBlock budget is exhausted.
+        {"gather-partition",  {P_SUB_CUBE_SIZE, P_SAS_GRID_DIM}},
+        {"scatter-waves",     {P_META_GRID_DIM, P_META_BLOCK_DIM}},
+        {"gather-waves",      {P_SAS_GRID_DIM, P_SAS_BLOCK_DIM}},
+        // Shallow gradients that need full-ladder resolution rather than neighbours; midPS is
+        // genuinely independent, constrained only by smallPrimesUsed <= midPS <= bPSI.
+        {"big-prime-split",   {P_BIG_PRIME_START}},
+        {"mid-prime-split",   {P_MID_PRIME_START}},
+    };
+
+    const std::vector<size_t> seedIdx = best;     // kept for the final head-to-head
+    const double seedScore = bestScore;
+    std::vector<size_t> cand(n);
+    uint64_t probes = 0;
+
+    // SCORING RULE: RELATIVE, not absolute.
+    //
+    // An absolute record cannot be compared across a long run. Clocks ramp up from idle over the
+    // first seconds and drift down as the part heats -- on a mobile card that is several percent
+    // over a multi-minute search, monotone and correlated with WHEN a probe was taken rather
+    // than with what it measured. A record kept as a min-over-all-draws captures the machine's
+    // single best thermal moment, and every later candidate is then handicapped against it; and
+    // because a face sweep walks its ladders in ascending order, whatever is enumerated first
+    // (small SB, small bPSI) wins on timing alone.
+    //
+    // So every candidate is scored RELATIVE to the incumbent measured near the same moment:
+    //   * during a sweep, the incumbent is re-probed every kRefEvery candidates and the running
+    //     reference is the min of the last kRefWindow such draws (min, because the noise is
+    //     one-sided: interference only ever adds time);
+    //   * a face's winner then faces the incumbent in an ALTERNATING duel, so both see the same
+    //     thermal state, and adoption needs the ratio to clear kJumpMargin.
+    //
+    // INVARIANT: each adopted step is >= kJumpMargin better than the incumbent measured beside
+    // it, so the chain product is a real cumulative improvement rather than a sum of drifts.
+    double refNow = bestScore;                  // incumbent floor, near the current probe
+    std::deque<double> refWindow{bestScore};
+    double chainGain = 1.0;                     // product of the adopted relative improvements
+
+    auto probeReference = [&]() {
+        const double d = evaluate(best);
+        ++probes;
+        if (d <= 0.0) return;
+        refWindow.push_back(d);
+        while (refWindow.size() > (size_t)kRefWindow) refWindow.pop_front();
+        refNow = *std::min_element(refWindow.begin(), refWindow.end());
+    };
+
+    // Alternating paired duel: challenger and incumbent interleaved so any drift over the duel
+    // hits both equally. Returns the ratio (challenger / incumbent); < 1 means faster.
+    auto duel = [&](const std::vector<size_t>& challenger, double& outAbs) -> double {
+        double cMin = -1.0, iMin = -1.0;
+        for (int r = 0; r < kReps; ++r) {
+            const double c = evaluate(challenger); ++probes;
+            const double i = evaluate(best);       ++probes;
+            if (c > 0.0 && (cMin < 0.0 || c < cMin)) cMin = c;
+            if (i > 0.0 && (iMin < 0.0 || i < iMin)) iMin = i;
+        }
+        if (cMin <= 0.0 || iMin <= 0.0) return 1.0;
+        outAbs  = cMin;
+        refNow  = iMin;                       // the duel just measured the incumbent: reuse it
+        refWindow.assign(1, iMin);
+        return cMin / iMin;
+    };
+
+    // A face has no early exit, so its size is exactly the product of its ladders -- known
+    // before the first probe, which makes both the plan and the ETA exact.
+    auto faceSize = [&](const Face& f) {
+        uint64_t sz = 1;
+        for (SieveParam id : f.ids) { const size_t a = axisOf(id); if (a < n) sz *= axis[a].vals->size(); }
+        return sz;
+    };
+    {
+        uint64_t cycleProbes = 0;
+        std::string plan;
+        for (const Face& f : faces) {
+            if ((int)f.ids.size() > kRadius) continue;
+            cycleProbes += faceSize(f);
+            plan += (plan.empty() ? "" : ", ") + std::string(f.name) + "("
+                  + std::to_string(faceSize(f)) + ")";
+        }
+        LOG(LOG_INFO) << "Tuning complex: " << plan;
+        LOG(LOG_INFO) << "  " << cycleProbes << " probes per full cycle";
+    }
+
+    for (int cycle = 0; cycle < kMaxRounds; ++cycle) {
+        bool improved = false;
+        for (const Face& f : faces) {
+            // --param_test_radius now bounds the FACE DIMENSION: 1 = single-axis sweeps only,
+            // 3 = every face below. Faces above the bound are skipped, not truncated.
+            if ((int)f.ids.size() > kRadius) continue;
+
+            std::vector<size_t> fax;
+            for (SieveParam id : f.ids) { const size_t a = axisOf(id); if (a < n) fax.push_back(a); }
+            if (fax.empty()) continue;
+
+            std::vector<size_t> faceBest;
+            double faceScore = -1.0;
+            uint64_t tried = 0, accepted = 0;
+            const uint64_t total = faceSize(f);
+            pruned_grid = pruned_cycles = pruned_subcubes = pruned_smem = 0;
+            const clk::time_point t0 = clk::now();
+            cand = best;
+
+            auto sweep = [&](auto&& self, size_t k) -> void {
+                if (k == fax.size()) {
+                    ++tried;
+                    if (tried % kRefEvery == 0) probeReference();   // track the machine, not the clock
+                    const double sc = evaluate(cand);
+                    if (sc > 0.0) {
+                        ++accepted;
+                        const double rel = sc / refNow;             // 1.0 == the incumbent, here, now
+                        if (cand != best && (faceScore < 0.0 || rel < faceScore)) {
+                            faceScore = rel;
+                            faceBest  = cand;
+                        }
+                    }
+                    if (tried % kProgressProbes == 0) {
+                        const double el = secs(clk::now() - t0);
+                        LOG(LOG_INFO) << "    " << f.name << ": " << tried << "/" << total
+                                      << " (" << (100 * tried / total) << " %), " << accepted
+                                      << " valid, best x" << faceScore << " (ref "
+                                      << refNow << "), " << el << " s elapsed, ~"
+                                      << (el * (double)(total - tried) / (double)tried)
+                                      << " s left";
+                    }
+                    return;
+                }
+                const size_t a = fax[k];
+                for (size_t v = 0; v < axis[a].vals->size(); ++v) {
+                    cand[a] = v;
+                    self(self, k + 1);
+                }
+                cand[a] = best[a];
+            };
+            sweep(sweep, 0);
+            probes += tried;
+
+            const double el = secs(clk::now() - t0);
+            if (faceScore < 0.0) {
+                LOG(LOG_INFO) << "  cycle " << cycle << " face " << f.name << ": no valid "
+                              << "alternative (" << tried << " probes, " << el << " s)";
+                continue;
+            }
+            double challengerAbs = 0.0;
+            const double rel = duel(faceBest, challengerAbs);      // paired, same thermal state
+            if (rel >= 1.0 - kJumpMargin) {
+                LOG(LOG_INFO) << "  cycle " << cycle << " face " << f.name << ": unchanged ("
+                              << accepted << "/" << tried << " valid, " << el
+                              << " s); best alternative x" << rel << " in the duel (sweep said x"
+                              << faceScore << "), needs x" << (1.0 - kJumpMargin) << "; pruned "
+                              << (pruned_grid + pruned_cycles + pruned_subcubes + pruned_smem) << " (grid "
+                              << pruned_grid << ", cycles " << pruned_cycles << ", subcubes "
+                              << pruned_subcubes << ")";
+                continue;
+            }
+            LOG(LOG_INFO) << "  cycle " << cycle << " face " << f.name << ": x" << rel
+                          << " (" << (100.0 * (1.0 - rel)) << " % better than the incumbent "
+                          << "measured beside it), " << accepted << "/" << tried << " valid, "
+                          << el << " s";
+            best       = faceBest;
+            bestScore  = challengerAbs;
+            chainGain *= rel;
+            improved   = true;
+            LOG(LOG_INFO) << "    " << describe(best);
+            LOG(LOG_INFO) << "    --params11 " << describeDynamic(best);
+        }
+        if (!improved) {
+            LOG(LOG_INFO) << "  converged (no face improves on the record)";
+            break;
+        }
+    }
+
+    // ---- Single-variable descent: one full pass, sweeping each axis over its ENTIRE ladder
+    //      (not radius-limited), so a long shallow axis can cross to its far end in one move.
+    //      Adoption obeys the same record rule as the rounds above: the axis argmin is re-drawn
+    //      and must beat the record by kJumpMargin, so the chain invariant survives this phase.
+    LOG(LOG_INFO) << "Single-variable descent over " << n << " axes";
+    for (size_t i = 0; i < n; ++i) {
+        const size_t before = best[i];
+        std::vector<size_t> axBest;
+        double axScore = -1.0;
+        for (size_t v = 0; v < axis[i].vals->size(); ++v) {
+            if (v == before) continue;                 // the incumbent holds the record already
+            cand = best;
+            cand[i] = v;
+            const double sc = evaluate(cand);
+            ++probes;
+            const double rel = sc / refNow;
+            if (sc > 0.0 && (axScore < 0.0 || rel < axScore)) { axScore = rel; axBest = cand; }
+        }
+        if (axScore < 0.0) {
+            LOG(LOG_WARNING) << "  " << axis[i].name << ": no valid value; left at "
+                             << (*axis[i].vals)[before];
+            continue;
+        }
+        double challengerAbs = 0.0;
+        const double rel = duel(axBest, challengerAbs);
+        if (rel >= 1.0 - kJumpMargin) {
+            LOG(LOG_INFO) << "  " << axis[i].name << ": " << (*axis[i].vals)[before]
+                          << " (unchanged); best alternative x" << rel << " in the duel";
+            continue;
+        }
+        LOG(LOG_INFO) << "  " << axis[i].name << ": " << (*axis[i].vals)[before] << " -> "
+                      << (*axis[i].vals)[axBest[i]] << ", x" << rel << " ("
+                      << (100.0 * (1.0 - rel)) << " % better)";
+        best       = axBest;
+        bestScore  = challengerAbs;
+        chainGain *= rel;
+    }
+
+    // The chain endpoints. Every link was >= kJumpMargin, all measured under the same record
+    // rule, so this total is a statement about the geometry rather than about the probe spread.
+    // The chain is the product of paired improvements -- the only total that survives a drifting
+    // machine. The seed is ALSO re-probed here: comparing that fresh draw against the one taken
+    // before the search measures how far the machine itself moved, which is the quantity that
+    // makes an absolute before/after comparison meaningless.
+    {
+        const double seedNow = evaluate(seedIdx);
+        ++probes;
+        LOG(LOG_INFO) << "Chain: " << (100.0 * (1.0 / chainGain - 1.0))
+                      << " % faster than the seed (product of paired steps)";
+        if (seedScore > 0.0 && seedNow > 0.0) {
+            LOG(LOG_INFO) << "  machine drift: seed measured " << seedScore << " before the "
+                          << "search, " << seedNow << " now => "
+                          << (100.0 * (seedNow - seedScore) / seedScore)
+                          << " % (clock ramp and thermals, NOT geometry)";
+        }
+        LOG(LOG_INFO) << "  seed   --params11 " << describeDynamic(seedIdx);
+    }
+    LOG(LOG_INFO) << "Param test complete: " << probes << " probes, OVERALL BEST "
+                  << bestScore << " us/poly-position";
+    LOG(LOG_INFO) << "  " << describe(best);
+    LOG(LOG_INFO) << "  --params11 " << describeDynamic(best);
+    exit(0);
+}
+
 DeviceSievingController::ParamTestResult
-DeviceSievingController::runParamTest(factoringData& f_data){
+DeviceSievingController::runParamTestLegacy(factoringData& f_data){
     LOG_SET_SUBMODULE("PARAM_TEST");
     int32_t hyperCubeSize = 1 << (f_data.a_factors.size() - 1);
     int32_t M = f_data.M;
@@ -1481,7 +2110,9 @@ void DeviceSievingController::loadStandardConfig()
     ss_conf.num_threadsPerBlock = 256;
     ss_conf.num_threadBlocks = std::min(256u, gs_conf.num_polysPerSieveCall);
     // Width-aware: the wide (uint16) accumulator path sizes blockEntries at sizeof(uint16_t).
-    ss_conf.sharedMemReq = gs_conf.sievingBlockSize * accumElemBytes() + 3 * gs_conf.bigPrimeStartIndex * sizeof(int);
+    ss_conf.offsetsInGlobal = (offsets_in_global_ && !use_wide_accumulator_) ? 1u : 0u;
+    ss_conf.sharedMemReq = gs_conf.sievingBlockSize * accumElemBytes()
+                         + (ss_conf.offsetsInGlobal ? 0u : 3 * gs_conf.bigPrimeStartIndex * sizeof(int));
     applyGatherBlockDimOverride();  // A/B knob: override ss_conf.num_threadsPerBlock (no-op when 0)
 
     /* processRelationsConfig */
@@ -1607,7 +2238,7 @@ void DeviceSievingController::loadPartialCustomConfig(uint32_t totalPolys, uint3
     // downstream (LEQ_CHECK on ss_conf.sharedMemReq + the narrow-batch occupancy preflight).
     if (!use_wide_accumulator_ && bpsi_override_ != 0)
         gs_conf.bigPrimeStartIndex = bpsi_override_;
-    gs_conf.midPrimeStartIndex = 32;
+    gs_conf.midPrimeStartIndex = 96;
     gs_conf.maxRelationsPerBlock = 64;
 
     /* globalMetaSieveConfig */
@@ -1668,10 +2299,11 @@ void DeviceSievingController::loadPartialCustomConfig(uint32_t totalPolys, uint3
             // FRACTION of 2M when an --autotune geometry picks intervals*SB < 2M (giving
             // num_sievingBlockBatches >= 2, e.g. Turing intervals=8/SB=32768 at M=262144 -> 2
             // batches). A single launch may also OVER-cover (sievingBlockSize == M =>
-            // intervals*SB > 2M, with the num_sievingBlockBatches 0->1 clamp above). The real
-            // invariant is that the batches TOGETHER cover [-M,M); assert on the TOTAL coverage,
-            // not the per-launch coverage, so valid multi-batch configs do not false-trip this
-            // critical guard while a genuine coverage shortfall is still caught.
+            // intervals*SB > 2M, with the num_sievingBlockBatches 0->1 clamp above); [C1] still
+            // only asserts the TOTAL here, so valid multi-batch configs do not false-trip this
+            // critical guard while a genuine coverage shortfall is still caught. Over-coverage
+            // is rejected one level up, by the two-sided coverage invariant in validateConfigs()
+            // — it sieves past [-M,M), which is cheap per position and barren in relations.
             const uint64_t total_coverage =
                 (uint64_t)gs_conf.num_sievingBlockBatches * coverage;
             if (total_coverage < two_M) {
@@ -1731,13 +2363,174 @@ void DeviceSievingController::loadPartialCustomConfig(uint32_t totalPolys, uint3
     ss_conf.num_threadsPerBlock = sasT;
     ss_conf.num_threadBlocks = sasB;
     // Width-aware: the wide (uint16) accumulator path sizes blockEntries at sizeof(uint16_t).
-    ss_conf.sharedMemReq = gs_conf.sievingBlockSize * accumElemBytes() + 3 * gs_conf.bigPrimeStartIndex * sizeof(int);
+    ss_conf.offsetsInGlobal = (offsets_in_global_ && !use_wide_accumulator_) ? 1u : 0u;
+    ss_conf.sharedMemReq = gs_conf.sievingBlockSize * accumElemBytes()
+                         + (ss_conf.offsetsInGlobal ? 0u : 3 * gs_conf.bigPrimeStartIndex * sizeof(int));
     applyGatherBlockDimOverride();  // A/B knob: override ss_conf.num_threadsPerBlock (no-op when 0)
 
     /* processRelationsConfig */
     pr_conf.num_threadsPerBlock = 512;
     pr_conf.num_threadBlocks = pow2geq(g_info.multiProcessorCount);
 }
+
+void DeviceSievingController::ensureTailInvP() const
+{
+    const size_t n = f_data.factorBase.size();
+    if (tail_inv_p_.size() == n + 1) return;
+    tail_inv_p_.assign(n + 1, 0.0);
+    for (size_t i = n; i-- > 0; )
+        tail_inv_p_[i] = tail_inv_p_[i + 1]
+                       + (f_data.factorBase[i] ? 1.0 / (double)f_data.factorBase[i] : 0.0);
+}
+
+double DeviceSievingController::expectedBucketEntries(uint32_t sievingBlockSize,
+                                                      uint32_t bigPrimeStartIndex) const
+{
+    ensureTailInvP();
+    if (bigPrimeStartIndex >= tail_inv_p_.size()) return 0.0;
+    return 2.0 * (double)sievingBlockSize * tail_inv_p_[bigPrimeStartIndex];
+}
+
+uint32_t DeviceSievingController::autoGlobalBucketSize(uint32_t sievingBlockSize,
+                                                       uint32_t bigPrimeStartIndex,
+                                                       uint32_t numPolys,
+                                                       uint32_t numIntervals) const
+{
+    const double mu = expectedBucketEntries(sievingBlockSize, bigPrimeStartIndex);
+    if (mu <= 0.0) return 32u;                      // nothing is bucketed at this bPSI
+    const double N = (double)std::max(1u, numPolys) * (double)std::max(1u, numIntervals);
+    const double z = std::sqrt(2.0 * std::log(std::max(N, 2.0)));
+    const double peak = mu + z * std::sqrt(mu);
+    const uint64_t slots = (uint64_t)std::ceil(peak);
+    const uint64_t rounded = ((slots + 31u) / 32u) * 32u;   // keep the stride 32-aligned
+    return (uint32_t)std::min<uint64_t>(rounded, 0xFFFFFFFFull);
+}
+
+void DeviceSievingController::loadPartialCustomConfigDynamic(const ParamSet& p)
+{
+    custom_config_invalid_ = false;
+    auto pow2leq = [](uint32_t x) -> uint32_t {
+        if (x < 1) return 0;
+        return 1 << (31 - std::countl_zero(x));
+    };
+    auto pow2geq = [pow2leq](uint32_t x) -> uint32_t {
+        uint32_t pow2 = pow2leq(x);
+        return (pow2 == x) ? pow2 : pow2 << 1;
+    };
+    auto log2 = [](uint32_t x) -> uint32_t {
+        if (x <= 0) return 0;
+        return 31 - std::countl_zero(x);
+    };
+    // A parameter present in `p` is hard-set; an absent one keeps the derivation above it.
+    auto set = [&p](SieveParam k, uint32_t& dst) { if (p[k]) dst = *p[k]; };
+
+    /* initConfig */
+    init_conf.num_threadsPerBlock = 512;
+    init_conf.num_threadBlocks = 2*pow2geq(g_info.multiProcessorCount);
+    init_conf.batch_size = 0;
+    gs_conf.batch_size   = 0;
+    gms_conf.batch_size  = 0;
+    ss_conf.batch_size   = 0;
+
+    /* generalSievingConfig */
+    if (use_wide_accumulator_) {
+        const uint32_t wide_sb_den = (uint32_t)(32u * accumElemBytes() + 12u);
+        gs_conf.sievingBlockSize = std::min(fs_params.M,
+            pow2leq((3u * g_info.maxSharedMemPerBlock * 32u) / (4u * wide_sb_den)));
+    } else {
+        gs_conf.sievingBlockSize = std::min(fs_params.M, pow2leq((3*g_info.maxSharedMemPerBlock)/4));
+    }
+    set(P_SIEVING_BLOCK_SIZE, gs_conf.sievingBlockSize);
+    gs_conf.log2_sievingBlockSize = log2(gs_conf.sievingBlockSize);
+
+    gs_conf.num_polysPerSieveCall =
+        clampWideNumPolys(gs_conf.num_polysPerSieveCall, use_wide_accumulator_);
+    set(P_SUB_CUBE_SIZE, gs_conf.num_polysPerSieveCall);
+
+    gs_conf.bigPrimeStartIndex = gs_conf.sievingBlockSize/32;
+    set(P_BIG_PRIME_START, gs_conf.bigPrimeStartIndex);
+    gs_conf.midPrimeStartIndex = 96;
+    set(P_MID_PRIME_START, gs_conf.midPrimeStartIndex);
+    gs_conf.maxRelationsPerBlock = 64;
+
+    /* globalMetaSieveConfig */
+    set(P_META_BLOCK_DIM, gms_conf.num_threadsPerBlock);
+    set(P_META_GRID_DIM,  gms_conf.num_threadBlocks);
+    gms_conf.maxActiveBucketsTotal = 2 << 15;
+
+    if (use_wide_accumulator_) {
+        gs_conf.num_sievingBlocksPerSieveCall = (2u * fs_params.M) / gs_conf.sievingBlockSize;
+    }
+    // numIntervals is pinned by the coverage invariant (numIntervals * SB == 2M), and
+    // blocksPerCycle by the one-cycle rule (num_metaSieveCycles = numIntervals/blocksPerCycle;
+    // anything above 1 re-walks the whole factor base above bigPrimeStart). Both are therefore
+    // FUNCTIONS of sievingBlockSize, derived here unless explicitly pinned, so that moving SB
+    // costs one degree of freedom rather than three.
+    if (!use_wide_accumulator_ && gs_conf.sievingBlockSize)
+        gs_conf.num_sievingBlocksPerSieveCall =
+            (uint32_t)((2ull * fs_params.M) / gs_conf.sievingBlockSize);
+    set(P_NUM_INTERVALS, gs_conf.num_sievingBlocksPerSieveCall);
+    gms_conf.num_activeBlocksPerCycle = gs_conf.num_sievingBlocksPerSieveCall;
+
+    // Bucket sizing, once SB / bPSI / np / numIntervals are all resolved. An explicit
+    // --bucket_size_factor is operator intent and wins; otherwise the bucket is sized to the
+    // PREDICTED PEAK occupancy, so it is neither so small that large-prime hits are silently
+    // discarded nor so large that VRAM is spent on unreachable headroom. Whether it fits is
+    // decided by the VRAM budget check in validateConfigs(), not here.
+    gs_conf.globalBucketSize = (bucket_size_factor_override_ > 0.0)
+        ? computeGlobalBucketSize(gs_conf.sievingBlockSize)
+        : autoGlobalBucketSize(gs_conf.sievingBlockSize, gs_conf.bigPrimeStartIndex,
+                               gs_conf.num_polysPerSieveCall,
+                               gs_conf.num_sievingBlocksPerSieveCall);
+
+    gs_conf.num_subCubes = gs_conf.num_polysPerSieveCall
+        ? std::min(32768u,(1u << fs_params.shc_dim)/2)/gs_conf.num_polysPerSieveCall : 0;
+
+    set(P_BLOCKS_PER_CYCLE, gms_conf.num_activeBlocksPerCycle);
+
+    {
+        const uint64_t cover = (uint64_t)gs_conf.sievingBlockSize
+                             * gs_conf.num_sievingBlocksPerSieveCall;
+        gs_conf.num_sievingBlockBatches = cover ? (uint32_t)((2ull*fs_params.M)/cover) : 1;
+        if (gs_conf.num_sievingBlockBatches == 0) gs_conf.num_sievingBlockBatches = 1;
+    }
+
+    set(P_POLY_BLOCK_SIZE, gms_conf.polyBlockSize);
+    gms_conf.log2_polyBlockSize = log2(gms_conf.polyBlockSize);
+
+    // EXACTNESS-CHECKED num_polyBlocksPerThreadBlock, as in loadPartialCustomConfig: the
+    // SCATTER kernel partitions the polynomials with a fixed trip count and no bound guard,
+    // so metaGridDim * num_polyBlocksPerThreadBlock * polyBlockSize == num_polysPerSieveCall
+    // must hold exactly. Reject here, naming the divisibility, rather than leave a floored
+    // value to surface downstream as a puzzling EQUAL_CHECK failure.
+    const uint32_t meta_divisor = gms_conf.num_threadBlocks * gms_conf.polyBlockSize;
+    if (meta_divisor == 0 || (gs_conf.num_polysPerSieveCall % meta_divisor) != 0) {
+        custom_config_invalid_ = true;
+        gms_conf.num_polyBlocksPerThreadBlock = 0;   // NON0_CHECK also fires
+    } else {
+        gms_conf.num_polyBlocksPerThreadBlock = gs_conf.num_polysPerSieveCall / meta_divisor;
+    }
+    gms_conf.log2_num_polyBlocksPerThreadBlock = log2(gms_conf.num_polyBlocksPerThreadBlock);
+
+    applyMetaCycleCap();
+    gms_conf.num_metaSieveCycles = gms_conf.num_activeBlocksPerCycle
+        ? gs_conf.num_sievingBlocksPerSieveCall/gms_conf.num_activeBlocksPerCycle : 0;
+    gms_conf.num_activeBucketsPerThreadBlock = gms_conf.num_activeBlocksPerCycle*gms_conf.polyBlockSize;
+    gms_conf.sharedMemReq = gms_conf.num_activeBucketsPerThreadBlock * sizeof(int);
+
+    /* sieveAndScanConfig */
+    set(P_SAS_BLOCK_DIM, ss_conf.num_threadsPerBlock);
+    set(P_SAS_GRID_DIM,  ss_conf.num_threadBlocks);
+    ss_conf.offsetsInGlobal = (offsets_in_global_ && !use_wide_accumulator_) ? 1u : 0u;
+    ss_conf.sharedMemReq = gs_conf.sievingBlockSize * accumElemBytes()
+                         + (ss_conf.offsetsInGlobal ? 0u : 3 * gs_conf.bigPrimeStartIndex * sizeof(int));
+    applyGatherBlockDimOverride();
+
+    /* processRelationsConfig */
+    pr_conf.num_threadsPerBlock = 512;
+    pr_conf.num_threadBlocks = pow2geq(g_info.multiProcessorCount);
+}
+
 
 /*
  * A2 meta-sieve SCATTER cycle cap (--sieve_meta_cycle_cap, default 0 = OFF).
@@ -1878,6 +2671,8 @@ void DeviceSievingController::printCustomConfigs(){
 }
 
 bool DeviceSievingController::validateConfigs() {
+    // Silent mode (validateConfigsSilent): verdict unchanged, diagnostics suppressed.
+    #define VLOG(lvl) if (validate_quiet_) {} else LOG(lvl)
     auto isPowerOfTwo = [](uint32_t n) {
         return n > 0 && (n & (n - 1)) == 0;
     };
@@ -1890,7 +2685,7 @@ bool DeviceSievingController::validateConfigs() {
     // and cleared: both loaders reset it, so this only guards the config just loaded.
     if (custom_config_invalid_) {
         validFlag = false;
-        LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: the pinned kernel geometry was rejected by "
+        VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: the pinned kernel geometry was rejected by "
                                    "the config loader (see the [Sieve] Invalid pinned geometry "
                                    "message above).";
         custom_config_invalid_ = false;
@@ -1900,7 +2695,7 @@ bool DeviceSievingController::validateConfigs() {
     do { \
         if (!isPowerOfTwo(var)) { \
             validFlag = false; \
-            LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #var << " must be a power of 2. " << "Current value: " << (var) << std::endl; \
+            VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #var << " must be a power of 2. " << "Current value: " << (var) << std::endl; \
         } \
     } while (0)
 
@@ -1908,7 +2703,7 @@ bool DeviceSievingController::validateConfigs() {
     do { \
         if ( (var1) != (var2) ) { \
             validFlag = false; \
-            LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #var1 << " must be equal to " << #var2 << ". Current values: " << (var1) << ", " << (var2) << std::endl; \
+            VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #var1 << " must be equal to " << #var2 << ". Current values: " << (var1) << ", " << (var2) << std::endl; \
         } \
     } while (0)
 
@@ -1916,7 +2711,7 @@ bool DeviceSievingController::validateConfigs() {
     do { \
         if (!( (var1) <= (var2) )) { \
             validFlag = false; \
-            LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #var1 << " must be less than or equal to " << #var2 << ". Current values: " << (var1) << ", " << (var2) << std::endl; \
+            VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #var1 << " must be less than or equal to " << #var2 << ". Current values: " << (var1) << ", " << (var2) << std::endl; \
         } \
     } while (0)
 
@@ -1924,7 +2719,7 @@ bool DeviceSievingController::validateConfigs() {
     do { \
     if ((var) == 0) { \
         validFlag = false; \
-        LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #var << " must be > 0." << std::endl; \
+        VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #var << " must be > 0." << std::endl; \
     } \
     } while (0)
 
@@ -1978,7 +2773,7 @@ bool DeviceSievingController::validateConfigs() {
     if (sb_override_ != 0 || bpsi_override_ != 0) {
         if (use_wide_accumulator_) {
             validFlag = false;
-            LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: --sieve_block_size / "
+            VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: --sieve_block_size / "
                 "--sieve_big_prime_start are NARROW-BATCH ONLY and were rejected on the WIDE "
                 "(uint16/u8sat) accumulator path. Requested sieve_block_size="
                 << sb_override_ << ", sieve_big_prime_start=" << bpsi_override_
@@ -1986,7 +2781,7 @@ bool DeviceSievingController::validateConfigs() {
                 << std::endl;
         } else if (!(init_conf.batch_size > 0 && gs_conf.batch_size > 0)) {
             validFlag = false;
-            LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: --sieve_block_size / "
+            VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: --sieve_block_size / "
                 "--sieve_big_prime_start are NARROW-BATCH ONLY and were rejected in LEGACY mode "
                 "(--sieve_batch_size 0). Requested sieve_block_size=" << sb_override_
                 << ", sieve_big_prime_start=" << bpsi_override_
@@ -1994,33 +2789,47 @@ bool DeviceSievingController::validateConfigs() {
         }
     }
 
-    // COVERAGE INVARIANT (narrow batch): num_sievingBlocksPerSieveCall * sievingBlockSize
-    // >= 2M. See narrowBatchCoverageOk() in sieve_memory_model.h for the full derivation of why
-    // the loader's existing [C1] guard — which multiplies by the fictitious
-    // num_sievingBlockBatches — PASSES a batch config that sieves only [-M, 0). This block is
-    // the real invariant; the [C1] block is left textually unchanged.
+    // BAND-ORDERING INVARIANT. The GATHER kernel sizes its shared offsets1/offsets2/primes
+    // arrays at bigPrimeStartIndex entries each, and walks [smallPrimesUsed, midPrimeStart)
+    // then [midPrimeStart, bigPrimeStart). midPrimeStart ABOVE bigPrimeStart makes the first
+    // loop index past the end of its array into the next one — garbage log values, silently.
+    // Below smallPrimesUsed it double-counts the primes the mask already applied.
+    LEQ_CHECK(gs_conf.midPrimeStartIndex, gs_conf.bigPrimeStartIndex, validFlag);
+    LEQ_CHECK(fs_params.smallPrimesUsed, gs_conf.midPrimeStartIndex, validFlag);
+
+    // COVERAGE INVARIANT (narrow, BOTH paths): numIntervals * sievingBlockSize == 2M, exactly.
+    // Per sieve call the kernel sweeps coverage = numIntervals * sievingBlockSize positions from
+    // ds_params.startIndex, and [-M,M) is 2M wide. Both deviations are defects:
     //
-    // NOT gated on the overrides: this is a pre-existing latent defect (every binary
-    // up to v1.0.5), reachable on any device whose smem budget yields SB < 2M/numIntervals. It is
-    // a no-op for every loadStandardConfig geometry and every shipped --params tuple.
-    if (init_conf.batch_size > 0 && gs_conf.batch_size > 0 && !use_wide_accumulator_) {
-        if (!narrowBatchCoverageOk(gs_conf.num_sievingBlocksPerSieveCall,
-                                   gs_conf.sievingBlockSize, fs_params.M)) {
+    //   coverage > 2M — num_sievingBlockBatches floors to 0 and is clamped to 1, so the call
+    //     runs off the end of [-M,M) into positions where Q is far above the threshold: cheap
+    //     per position in kernel time, nearly barren in relations. Nothing re-normalises for
+    //     that, so the config looks fast to any timing probe while yielding almost nothing —
+    //     which is exactly how a parameter search gets walked into it.
+    //
+    //   coverage < 2M — on the BATCH path runSievingBatch never advances ds_params.startIndex
+    //     (the per-batch re-offsetting that sieveFullCubeSnapshot / sieveFullCube /
+    //     benchmarkSievingConfig each perform is absent there), so num_sievingBlockBatches is
+    //     fictitious and the sieve silently covers only part of [-M,M). The LEGACY loops do
+    //     advance it and would cover 2M across several launches, but then the per-call work is
+    //     a config-dependent fraction of the interval, which is not a quantity a probe can
+    //     compare across candidates — so equality is required there too.
+    if (!use_wide_accumulator_) {
+        const uint64_t coverage = (uint64_t)gs_conf.num_sievingBlocksPerSieveCall
+                                * (uint64_t)gs_conf.sievingBlockSize;
+        const uint64_t two_M    = 2ull * (uint64_t)fs_params.M;
+        if (coverage != two_M) {
             validFlag = false;
-            const uint64_t coverage = (uint64_t)gs_conf.num_sievingBlocksPerSieveCall
-                                    * (uint64_t)gs_conf.sievingBlockSize;
-            const uint64_t two_M = 2ull * (uint64_t)fs_params.M;
-            // Ceiling division: the smallest numIntervals that restores full coverage.
             const uint64_t required = gs_conf.sievingBlockSize == 0 ? 0
-                : (two_M + gs_conf.sievingBlockSize - 1) / gs_conf.sievingBlockSize;
-            LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: NARROW BATCH interval coverage "
-                "below 2M — this config would SILENTLY sieve only part of [-M,M). numIntervals("
-                << gs_conf.num_sievingBlocksPerSieveCall << ") * sievingBlockSize("
-                << gs_conf.sievingBlockSize << ") = " << coverage << " < 2M(" << two_M
-                << "). runSievingBatch() never advances ds_params.startIndex, so "
-                   "num_sievingBlockBatches(" << gs_conf.num_sievingBlockBatches
-                << ") does NOT multiply this coverage. Required: numIntervals >= " << required
-                << " (--params field 2)." << std::endl;
+                : two_M / gs_conf.sievingBlockSize;
+            VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: NARROW interval coverage must equal 2M. "
+                "numIntervals(" << gs_conf.num_sievingBlocksPerSieveCall << ") * sievingBlockSize("
+                << gs_conf.sievingBlockSize << ") = " << coverage
+                << (coverage > two_M ? " > 2M(" : " < 2M(") << two_M << "). "
+                << (coverage > two_M
+                        ? "Sieving past [-M,M) is fast per position and barren in relations. "
+                        : "Part of [-M,M) would go unsieved. ")
+                << "Required: numIntervals = " << required << " (--params field 2)." << std::endl;
         }
     }
 
@@ -2036,7 +2845,7 @@ bool DeviceSievingController::validateConfigs() {
     do { \
         if ((divisor) == 0 || ((dividend) % (divisor)) != 0) { \
             validFlag = false; \
-            LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #divisor << " must divide " << #dividend \
+            VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << #divisor << " must divide " << #dividend \
                                     << " exactly. Current values: " << (divisor) << ", " << (dividend) << std::endl; \
         } \
     } while (0)
@@ -2045,7 +2854,7 @@ bool DeviceSievingController::validateConfigs() {
     do { \
         if (!isPowerOfTwo(expr)) { \
             validFlag = false; \
-            LOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << label << " must be a power of 2. " \
+            VLOG(LOG_ERROR_CRITICAL) << "VALIDATION ERROR: " << label << " must be a power of 2. " \
                                     << "Current value: " << (expr) << std::endl; \
         } \
     } while (0)
@@ -2095,7 +2904,7 @@ bool DeviceSievingController::validateConfigs() {
     // saturating-uint8 wide path. The narrow path RHS is byte-identical to before.
     const size_t expected_ss_sharedMemReq =
         gs_conf.sievingBlockSize * accumElemBytes()
-        + 3 * gs_conf.bigPrimeStartIndex * sizeof(int);
+        + (ss_conf.offsetsInGlobal ? 0u : 3 * gs_conf.bigPrimeStartIndex * sizeof(int));
     EQUAL_CHECK(ss_conf.sharedMemReq, expected_ss_sharedMemReq, validFlag);
     EQUAL_CHECK(gms_conf.num_activeBucketsPerThreadBlock, gms_conf.num_activeBlocksPerCycle * gms_conf.polyBlockSize,validFlag);
     EQUAL_CHECK(gms_conf.num_metaSieveCycles*gms_conf.num_activeBlocksPerCycle, gs_conf.num_sievingBlocksPerSieveCall, validFlag);
@@ -2115,9 +2924,44 @@ bool DeviceSievingController::validateConfigs() {
     // sieveBucketBudget(totalGlobalMem,0,4,5) == (4*totalGlobalMem)/5 == 0.80*VRAM (was
     // 3/4). The 64-bit LHS corrects the wrap (now rejects the over-budget config); the
     // 0.80 RHS matches loadStandardConfig and the autotune OOM guard.
-    LEQ_CHECK(bucketEntriesBytes(gs_conf.num_polysPerSieveCall, gs_conf.num_sievingBlocksPerSieveCall, gs_conf.globalBucketSize), sieveBucketBudget(g_info.totalGlobalMem, 0, kSieveBudgetNum, kSieveBudgetDen), validFlag);//keep a buffer
+    // BUCKET SIZING. The hard constraint is VRAM (below): a bucket that does not fit is
+    // rejected. Being too SMALL is not rejected here -- it is a yield defect, not an
+    // inadmissible geometry -- but it is silent in the kernel (overflow drops large-prime
+    // hits with no error and no counter), so it is called out loudly. loadPartialCustomConfigDynamic
+    // sizes the bucket at the predicted peak automatically unless --bucket_size_factor pins it.
+    {
+        const double mu = expectedBucketEntries(gs_conf.sievingBlockSize,
+                                                gs_conf.bigPrimeStartIndex);
+        const uint32_t want = autoGlobalBucketSize(gs_conf.sievingBlockSize,
+                                                   gs_conf.bigPrimeStartIndex,
+                                                   gs_conf.num_polysPerSieveCall,
+                                                   gs_conf.num_sievingBlocksPerSieveCall);
+        if (mu > 0.0 && gs_conf.globalBucketSize < want) {
+            VLOG(LOG_WARNING) << "Bucket UNDERSIZED: globalBucketSize=" << gs_conf.globalBucketSize
+                << " slots vs a predicted peak of " << want << " (mean " << mu
+                << " entries at bigPrimeStart=" << gs_conf.bigPrimeStartIndex << ", SB="
+                << gs_conf.sievingBlockSize << "). Overflow DISCARDS large-prime hits silently. "
+                   "Raise --bucket_size_factor, or raise bigPrimeStart so fewer primes are bucketed.";
+        }
+    }
+    // offsetsInGlobal moves the GATHER offsets/primes arrays into VRAM: charge them against the
+    // same budget the bucket is measured against, so the two cannot overcommit together.
+    const uint64_t gatherOffsetsBytes = ss_conf.offsetsInGlobal
+        ? (uint64_t)ss_conf.num_threadBlocks
+          * gatherOffsetsStride(gs_conf.bigPrimeStartIndex) * sizeof(int)
+        : 0ull;
+    LEQ_CHECK(bucketEntriesBytes(gs_conf.num_polysPerSieveCall, gs_conf.num_sievingBlocksPerSieveCall, gs_conf.globalBucketSize), sieveBucketBudget(g_info.totalGlobalMem, gatherOffsetsBytes, kSieveBudgetNum, kSieveBudgetDen), validFlag);//keep a buffer
     LEQ_CHECK(gms_conf.sharedMemReq, g_info.maxSharedMemPerBlock, validFlag);
-    LEQ_CHECK(ss_conf.sharedMemReq, g_info.maxSharedMemPerBlock, validFlag);
+    // GATHER shared memory must be checked against what is actually LAUNCHED. The batch path
+    // adds shc_dim uint512 B_values on top of ss_conf.sharedMemReq (kernel.cu, "Add space for
+    // B_values"), and that term was missing here: a config could pass validation and then fail
+    // at launch with cudaErrorInvalidValue. Nothing checks the launch error outside
+    // SIEVING_DEBUG_FLAG, so the run proceeded, every batch yielded 0 candidates, and it looked
+    // like a healthy sieve producing nothing. The non-pow2 preflight below computes the right
+    // figure but is gated on non-power-of-two geometry, so pow2 tuples were unguarded entirely.
+    const size_t gatherLaunchSmem = ss_conf.sharedMemReq
+        + ((gs_conf.batch_size > 0) ? (size_t)fs_params.shc_dim * sizeof(mpqs::uint512) : 0u);
+    LEQ_CHECK(gatherLaunchSmem, g_info.maxSharedMemPerBlock, validFlag);
 
     // RSA-155 dual-path: wide-launch feasibility + occupancy (GRACEFUL, not a hard abort).
     // The realized batch-sieve launch shared memory is ss_conf.sharedMemReq PLUS the per-block
@@ -2132,7 +2976,7 @@ bool DeviceSievingController::validateConfigs() {
             ss_conf.sharedMemReq + (size_t)fs_params.shc_dim * sizeof(mpqs::uint512);
         if (wideSieveSmem > g_info.maxSharedMemPerBlock) {
             validFlag = false;
-            LOG(LOG_WARNING) << "Wide (uint16) sieve launch infeasible: smem " << wideSieveSmem
+            VLOG(LOG_WARNING) << "Wide (uint16) sieve launch infeasible: smem " << wideSieveSmem
                              << " B > maxSharedMemPerBlock " << g_info.maxSharedMemPerBlock
                              << " B. Reduce M so the wide sieving block fits shared memory.";
         } else {
@@ -2146,12 +2990,12 @@ bool DeviceSievingController::validateConfigs() {
                 (int)ss_conf.num_threadsPerBlock, wideSieveSmem);
             if (occ_err != cudaSuccess || wide_blocks_per_sm < 1) {
                 validFlag = false;
-                LOG(LOG_WARNING) << "Wide (uint16) sieve launch infeasible: occupancy "
+                VLOG(LOG_WARNING) << "Wide (uint16) sieve launch infeasible: occupancy "
                                  << wide_blocks_per_sm << " block/SM (cuda: "
                                  << cudaGetErrorString(occ_err)
                                  << "). Reduce M so the wide launch config is schedulable.";
             } else {
-                LOG(LOG_DEBUG_1) << "Wide (uint16) sieve launch feasible: smem " << wideSieveSmem
+                VLOG(LOG_DEBUG_1) << "Wide (uint16) sieve launch feasible: smem " << wideSieveSmem
                                  << " B, occupancy " << wide_blocks_per_sm << " block/SM.";
             }
         }
@@ -2184,12 +3028,12 @@ bool DeviceSievingController::validateConfigs() {
         };
         if (narrowSieveSmem > g_info.maxSharedMemPerBlock) {
             validFlag = false;
-            LOG(LOG_WARNING) << "SM-aligned narrow sieve launch infeasible: GATHER smem "
+            VLOG(LOG_WARNING) << "SM-aligned narrow sieve launch infeasible: GATHER smem "
                              << narrowSieveSmem << " B > maxSharedMemPerBlock "
                              << g_info.maxSharedMemPerBlock << " B.";
         } else if (grid_over_limit()) {
             validFlag = false;
-            LOG(LOG_WARNING) << "SM-aligned narrow sieve launch infeasible: grid ("
+            VLOG(LOG_WARNING) << "SM-aligned narrow sieve launch infeasible: grid ("
                              << gms_conf.num_threadBlocks << " SCATTER / "
                              << ss_conf.num_threadBlocks << " GATHER) exceeds maxGridSize[0].";
         } else {
@@ -2202,14 +3046,14 @@ bool DeviceSievingController::validateConfigs() {
                 (int)ss_conf.num_threadsPerBlock, narrowSieveSmem);
             if (occ_meta != cudaSuccess || meta_blocks_per_sm < 1) {
                 validFlag = false;
-                LOG(LOG_WARNING) << "SM-aligned SCATTER launch infeasible: occupancy "
+                VLOG(LOG_WARNING) << "SM-aligned SCATTER launch infeasible: occupancy "
                                  << meta_blocks_per_sm << " block/SM (cuda: "
                                  << cudaGetErrorString(occ_meta) << ") at blockDim "
                                  << gms_conf.num_threadsPerBlock << ", smem "
                                  << gms_conf.sharedMemReq << " B.";
             } else if (occ_sas != cudaSuccess || sas_blocks_per_sm < 1) {
                 validFlag = false;
-                LOG(LOG_WARNING) << "SM-aligned GATHER launch infeasible: occupancy "
+                VLOG(LOG_WARNING) << "SM-aligned GATHER launch infeasible: occupancy "
                                  << sas_blocks_per_sm << " block/SM (cuda: "
                                  << cudaGetErrorString(occ_sas) << ") at blockDim "
                                  << ss_conf.num_threadsPerBlock << ", smem "
@@ -2217,7 +3061,7 @@ bool DeviceSievingController::validateConfigs() {
             } else {
                 const uint32_t sms = (g_info.multiProcessorCount > 0)
                                    ? (uint32_t)g_info.multiProcessorCount : 1u;
-                LOG(LOG_INFO) << "[SM-aligned geometry] np=" << gs_conf.num_polysPerSieveCall
+                VLOG(LOG_INFO) << "[SM-aligned geometry] np=" << gs_conf.num_polysPerSieveCall
                               << " SCATTER grid=" << gms_conf.num_threadBlocks
                               << " (occ " << meta_blocks_per_sm << " blk/SM => "
                               << ((double)gms_conf.num_threadBlocks
@@ -2248,34 +3092,42 @@ bool DeviceSievingController::validateConfigs() {
     #undef POW2_VALUE_CHECK
 
     if(!validFlag){
-        LOG(LOG_ERROR_CRITICAL) << "============================================================";
-        LOG(LOG_ERROR_CRITICAL) << "initConfig:";
-        LOG(LOG_ERROR_CRITICAL) << "threads: " << init_conf.num_threadsPerBlock;
-        LOG(LOG_ERROR_CRITICAL) << "blocks: " << init_conf.num_threadBlocks;
-        LOG(LOG_ERROR_CRITICAL) << "batch size: " << init_conf.batch_size;
-        LOG(LOG_ERROR_CRITICAL) << "============================================================";
-        LOG(LOG_ERROR_CRITICAL) << "generalSievingConfig:";
-        LOG(LOG_ERROR_CRITICAL) << "sievingBlockSize: " << gs_conf.sievingBlockSize;
-        LOG(LOG_ERROR_CRITICAL) << "globalBucketSize: " << gs_conf.globalBucketSize;
-        LOG(LOG_ERROR_CRITICAL) << "polys sieved per call: " << gs_conf.num_polysPerSieveCall;
-        LOG(LOG_ERROR_CRITICAL) << "sievingBlocks sieved per call: " << gs_conf.num_sievingBlocksPerSieveCall;
-        LOG(LOG_ERROR_CRITICAL) << "bigPrimeStart: " << gs_conf.bigPrimeStartIndex;
-        LOG(LOG_ERROR_CRITICAL) << "midPrimeStart: " << gs_conf.midPrimeStartIndex;
-        LOG(LOG_ERROR_CRITICAL) << "maxRelationsPerBlock: " << gs_conf.maxRelationsPerBlock;
-        LOG(LOG_ERROR_CRITICAL) << "============================================================";
-        LOG(LOG_ERROR_CRITICAL) << "globalMetaSieveConfig:";
-        LOG(LOG_ERROR_CRITICAL) << "threads: " << gms_conf.num_threadsPerBlock;
-        LOG(LOG_ERROR_CRITICAL) << "blocks: " << gms_conf.num_threadBlocks;
-        LOG(LOG_ERROR_CRITICAL) << "num activeblocks: " << gms_conf.num_activeBlocksPerCycle;
-        LOG(LOG_ERROR_CRITICAL) << "shared memory required: " << gms_conf.sharedMemReq << " bytes";
-        LOG(LOG_ERROR_CRITICAL) << "============================================================";
-        LOG(LOG_ERROR_CRITICAL) << "sieveAndScanConfig:";
-        LOG(LOG_ERROR_CRITICAL) << "threads: " << ss_conf.num_threadsPerBlock;
-        LOG(LOG_ERROR_CRITICAL) << "blocks: " << ss_conf.num_threadBlocks;
-        LOG(LOG_ERROR_CRITICAL) << "shared memory required: " << ss_conf.sharedMemReq << " bytes";
-        LOG(LOG_ERROR_CRITICAL) << "============================================================";
+        VLOG(LOG_ERROR_CRITICAL) << "============================================================";
+        VLOG(LOG_ERROR_CRITICAL) << "initConfig:";
+        VLOG(LOG_ERROR_CRITICAL) << "threads: " << init_conf.num_threadsPerBlock;
+        VLOG(LOG_ERROR_CRITICAL) << "blocks: " << init_conf.num_threadBlocks;
+        VLOG(LOG_ERROR_CRITICAL) << "batch size: " << init_conf.batch_size;
+        VLOG(LOG_ERROR_CRITICAL) << "============================================================";
+        VLOG(LOG_ERROR_CRITICAL) << "generalSievingConfig:";
+        VLOG(LOG_ERROR_CRITICAL) << "sievingBlockSize: " << gs_conf.sievingBlockSize;
+        VLOG(LOG_ERROR_CRITICAL) << "globalBucketSize: " << gs_conf.globalBucketSize;
+        VLOG(LOG_ERROR_CRITICAL) << "polys sieved per call: " << gs_conf.num_polysPerSieveCall;
+        VLOG(LOG_ERROR_CRITICAL) << "sievingBlocks sieved per call: " << gs_conf.num_sievingBlocksPerSieveCall;
+        VLOG(LOG_ERROR_CRITICAL) << "bigPrimeStart: " << gs_conf.bigPrimeStartIndex;
+        VLOG(LOG_ERROR_CRITICAL) << "midPrimeStart: " << gs_conf.midPrimeStartIndex;
+        VLOG(LOG_ERROR_CRITICAL) << "maxRelationsPerBlock: " << gs_conf.maxRelationsPerBlock;
+        VLOG(LOG_ERROR_CRITICAL) << "============================================================";
+        VLOG(LOG_ERROR_CRITICAL) << "globalMetaSieveConfig:";
+        VLOG(LOG_ERROR_CRITICAL) << "threads: " << gms_conf.num_threadsPerBlock;
+        VLOG(LOG_ERROR_CRITICAL) << "blocks: " << gms_conf.num_threadBlocks;
+        VLOG(LOG_ERROR_CRITICAL) << "num activeblocks: " << gms_conf.num_activeBlocksPerCycle;
+        VLOG(LOG_ERROR_CRITICAL) << "shared memory required: " << gms_conf.sharedMemReq << " bytes";
+        VLOG(LOG_ERROR_CRITICAL) << "============================================================";
+        VLOG(LOG_ERROR_CRITICAL) << "sieveAndScanConfig:";
+        VLOG(LOG_ERROR_CRITICAL) << "threads: " << ss_conf.num_threadsPerBlock;
+        VLOG(LOG_ERROR_CRITICAL) << "blocks: " << ss_conf.num_threadBlocks;
+        VLOG(LOG_ERROR_CRITICAL) << "shared memory required: " << ss_conf.sharedMemReq << " bytes";
+        VLOG(LOG_ERROR_CRITICAL) << "============================================================";
     }
+    #undef VLOG
     return validFlag;
+}
+
+bool DeviceSievingController::validateConfigsSilent() {
+    validate_quiet_ = true;
+    const bool ok = validateConfigs();
+    validate_quiet_ = false;
+    return ok;
 }
 
 } // namespace sieve

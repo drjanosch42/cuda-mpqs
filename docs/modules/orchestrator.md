@@ -72,6 +72,10 @@ All three are ADDITIVE: when false, the standard path is byte-for-byte unchanged
 | `sieve_truncate_continue` | `bool` | false | If true, continue the pipeline after a truncated sieve |
 | `useParams` | `bool` | false | Use custom sieve parameter tuple |
 | `params[8]` | `uint32_t[8]` | all 0 | Custom sieve parameters (passed to `loadPartialCustomConfig`) |
+| `useParams11` / `params11[11]` | `bool` / `uint32_t[11]` | false / all 0 | **v1.0.7**, CLI `--params11`. `SieveParam` order: the eight `params` fields, then `sievingBlockSize`, `bigPrimeStartIndex`, `midPrimeStartIndex`. Converted by `makeDynamicParamSet()` (`orchestrator.cpp:134`; a 0 entry = unset) and loaded by `loadPartialCustomConfigDynamic()` in `SieveStage()` and `TruncatedSieveRun()`, taking precedence over `params` (and so over an autotune or history tuple). ⚠ The preflight, the LP `sasGridDim` floor and the legacy `sasBlockDim` cap below are keyed on `useParams` only and do not see `params11`; the small-N adaptive branch runs ahead of it |
+| `param_test` | `bool` | false | **v1.0.7**, CLI `--param_test`. Runs the tuning-complex search at the start of `SieveStage()` and exits the process. A flag, not an `ExecutionMode` — `mode` stays `FULL_PIPELINE` |
+| `param_test_radius` | `uint32_t` | 3 | **v1.0.7**, CLI `--param_test_radius` (≥ 1). Maximum face dimension of the tuning complex |
+| `sieve_offsets_global` | `bool` | false | **v1.0.7**, CLI `--sieve_offsets_global`. Pushed via `setOffsetsInGlobal()` in both setter blocks; narrow only |
 | `pinned_params` | `map<string,bool>` | empty | Records which config fields were explicitly set via CLI. `isPinned(name)` is checked by auto-apply, autotune, and the Jetson/small-N default blocks before overriding any user-provided value |
 
 **Scope enforcement for the v1.0.6 geometry overrides — nothing is ever silently floored, clamped or downgraded.**
@@ -93,7 +97,7 @@ All three are ADDITIVE: when false, the standard path is byte-for-byte unchanged
    wide run cannot reach an overridden field at all; the `validateConfigs` check is what makes the
    attempt *audible* rather than quietly inert.
 
-**Narrow-batch interval-coverage invariant (v1.0.6, `narrowBatchCoverageOk`, `device_sieving_controller.cpp:2007-2026`).**
+**Narrow-batch interval-coverage invariant (v1.0.6, `narrowBatchCoverageOk`; ⚠ superseded in v1.0.7 — see the note at the end of this paragraph).**
 Independent of the overrides and **not** gated on them: on the narrow batch path
 `num_sievingBlocksPerSieveCall × sievingBlockSize ≥ 2M` is now checked in `validateConfigs()` and aborts
 pre-sieve with `LOG_ERROR_CRITICAL`, naming the required `numIntervals`. `runSievingBatch()` never
@@ -103,6 +107,7 @@ guard multiplies into its coverage test — does not multiply this coverage; a c
 over-coverage is legitimate (the autotune M-sweep produces it). Latent in every binary v1.0.5 and earlier; a
 deliberate, recorded behaviour change for smaller-shared-memory devices that are half-sieving today.
 Uses `uint64` arithmetic (the product overflows `uint32` at `M ≥ 2^31`).
+**v1.0.7:** `validateConfigs()` (`device_sieving_controller.cpp:2800`) replaces this with an **equality** `numIntervals × SB == 2M` on **every narrow run, batch and legacy** — over-coverage is now rejected as well (it is fast per position and nearly barren, which a timing probe would reward), so the autotune M-sweep's over-covering probes no longer pass. `narrowBatchCoverageOk()` is no longer called in production.
 
 ### Buffer Sizing Overrides
 
@@ -238,17 +243,17 @@ Three private helpers are shared by `SieveStage()` and `TruncatedSieveRun()` to 
 - **`initLargePrimes()`** — Configures `LargePrimeConfig` (witness capacity, hash bits, combined output, sort mode) from `config_`, constructs `largeprime_`, and calls `initiate()`. No-op if `lp1_bound == 0`.
 - **`logBufferWarnings()`** — Emits fire-once near-full warnings (accum ≥ 90%, partial ≥ 80%, persistent ≥ 95%, witness ≥ 85%) and per-delta LP overflow warnings (slab, witness, output). Called from both batch and legacy sieve loops.
 
-**Siever-side overrides must be pushed before `initiate()`.** Both `SieveStage()` (`orchestrator.cpp:4142-4151`) and `TruncatedSieveRun()` (`orchestrator.cpp:6427-6434`) call the same setter block on the freshly constructed `DeviceSievingController` — `setAccumulatorMode`, `setWideAccumMode`, `setMetaCycleCap`, `setGatherBlockDim`, `setBucketSizeFactor`, and (v1.0.6) `setSievingBlockSizeOverride` / `setBigPrimeStartOverride` / `setNarrowOverflowStats` — because every one of them is consumed by the config loader, which runs after `initiate()`.
+**Siever-side overrides must be pushed before `initiate()`.** Both `SieveStage()` (`orchestrator.cpp:4142-4151`) and `TruncatedSieveRun()` (`orchestrator.cpp:6427-6434`) call the same setter block on the freshly constructed `DeviceSievingController` — `setAccumulatorMode`, `setWideAccumMode`, `setMetaCycleCap`, `setGatherBlockDim`, `setBucketSizeFactor`, (v1.0.6) `setSievingBlockSizeOverride` / `setBigPrimeStartOverride` / `setNarrowOverflowStats`, and (v1.0.7) `setOffsetsInGlobal` — because every one of them is consumed by the config loader, which runs after `initiate()`.
 
 ### Stage 2: SieveStage (three dispatch paths)
 
 **Initialization (shared):**
 1. `DeviceSievingController::initiate(f_data_)`. If `lp1_bound > 0`, calls `setThresholdOverride(lp1_bound)`.
 2. If `sieve_batch_size > 0`, calls `setSievingBatchSize` and `allocateBatchBuffers`.
-3. `PARAM_TEST` short-circuit: calls `siever_->runParamTest(f_data_)` then exits.
+3. **v1.0.7 `param_test` short-circuit** (`orchestrator.cpp:4173`): loads the seed (`loadPartialCustomConfigDynamic(params11)` if `useParams11`, else `loadStandardConfig()`), `loadData()`, `updateState()`, then `runParamTest(f_data_, seed, param_test_radius)`, which ends the process with `exit(0)` (or `exit(1)` on a rejected seed); on the wide path it logs and returns, and `SieveStage()` returns with no relations. Then the **`PARAM_TEST_LEGACY` short-circuit** (≤ v1.0.6 `PARAM_TEST`): `loadStandardConfig()` + `runParamTestLegacy(f_data_)`, logs the best timing and returns.
 4. **sasGridDim auto-correction** (belt-and-suspenders): when LP is active with custom params, computes `min_sas = ceil(subCubeSize × numIntervals / 64)`, rounds up to next power-of-2, and raises `params[6]` if below minimum.
 5. **sasBlockDim cap**: in legacy mode (`sieve_batch_size == 0`), caps `params[7]` to 1024 to match `__launch_bounds__(1024)` on sieveAndScanKernel.
-6. Config loading: `loadPartialCustomConfig(params...)` if `useParams`, else `loadStandardConfig`. Validates and calls `loadData`.
+6. Config loading: small-N adaptive config if `!useParams && max_polys < 64`; else `loadPartialCustomConfigDynamic(params11)` if `useParams11`, else `loadPartialCustomConfig(params...)` if `useParams`; else `loadStandardConfig`. Validates and calls `loadData` (which, since v1.0.7, also builds the small-prime mask).
 7. **Preflight kernel launch check** (`preflightKernelLaunch`, `orchestrator.cpp:4320-4331`): when `useParams`, rejects infeasible kernel launch configurations before entering the sieve loop. Throws `std::runtime_error` on failure.
    **v1.0.6:** `SieveStage()` first computes `relaxed_geometry = (config_.sieve_batch_size > 0) && !siever_->isWideAccumulator()` — exactly `validateConfigs()`' own predicate, read from the siever whose wide/narrow decision was made in `initiate()` — and passes it as `preflightKernelLaunch`'s `allow_nonpow2_geometry` argument, so a pinned **SM-aligned (non-power-of-two)** `{np, metaGridDim, sasGridDim}` tuple passes preflight on the narrow batch path. Legacy and wide runs pass `false` = the mandatory-pow2 rule set.
    **Probe paths keep the mandatory-pow2 rule set, and that is self-consistent — not a gap.**
@@ -439,10 +444,12 @@ BW checkpoints: `{work_dir}/bw*`.
 | `LINALG_ONLY` | Tuning + Matrix + LinAlg + Sqrt | Load required (reads `relations.soa`, v1) |
 | `MATRIX_ONLY` | Load v2 relations [+ `matrix_lp1_bound` L-filter + subsampling] → Matrix → BW → Sqrt | Load required (reads `relations.v2`), no sieve |
 | `SQRT_ONLY` | *(not implemented)* | Logs `LOG_ERROR_CRITICAL` and returns immediately — no disk loader for kernel solutions or factor base |
-| `PARAM_TEST` | Tuning + Sieve init (calls `runParamTest`, then returns) | None |
+| `PARAM_TEST_LEGACY` | Tuning + Sieve init (calls `runParamTestLegacy`, then returns). CLI `--param_test_legacy`; this was `PARAM_TEST` / `--param_test` up to v1.0.6 | None |
 | `AUTOTUNE_ONLY` | Tuning + Autotune | None (prints results, returns) |
 
 Note: `LINALG_ONLY` always runs `TuningStage` to reconstruct the factor base needed for matrix column indexing.
+
+**v1.0.7 `--param_test` is not a mode.** It sets `MPQSConfig::param_test`; the run is a `FULL_PIPELINE` run (Tuning [+ Autotune], history auto-apply eligible) that ends inside `SieveStage()` when the search calls `exit(0)`. The superseded grid search is the mode `PARAM_TEST_LEGACY`, which is also what `shouldAutoApply()` and the `TuningStage` gate now name.
 
 ## Sieve Checkpointing
 

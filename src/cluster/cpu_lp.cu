@@ -65,7 +65,10 @@ bool CPULargePrimeTable::combinePartials(
     // produces a perfect square (X ≡ Y) and a trivial sqrt. Skip without
     // combining. sqrt_Q is the cheapest discriminator and is sufficient — two
     // distinct relations sharing an LP have different (a,b) hence different
-    // sqrt_Q. See logs/preproc_exp/dup_diag/.
+    // sqrt_Q, so equality of sqrt_Q identifies exactly the duplicate-partial
+    // case. Confirmed by duplicate-diagnosis runs over captured cluster
+    // relation sets: every sqrt_Q collision found there was a re-delivery of
+    // the same partial, never two genuinely distinct relations.
     if (stored.sqrt_Q == batch.sqrt_Q[idx]) {
         total_dup_dropped_++;
         return false;

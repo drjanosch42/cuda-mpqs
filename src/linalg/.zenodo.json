@@ -1,0 +1,26 @@
+{
+  "title": "A GPU-resident Block Wiedemann GF(2) linear-algebra implementation - v1.0.1",
+  "version": "1.0.1",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "lgpl-3.0-only",
+  "language": "eng",
+  "creators": [
+    {
+      "name": "Januszewski, Fabian",
+      "affiliation": "Paderborn University",
+      "orcid": "0000-0002-3184-237X"
+    }
+  ],
+  "description": "A GPU-resident implementation of the Block Wiedemann algorithm for solving large sparse linear systems over GF(2). All three stages run on the GPU: Krylov sequence generation, Berlekamp-Massey (lingen), and solution reconstruction. The solver is built on a CUDA sparse matrix-matrix multiplication (SpMM) layer over GF(2) providing several kernel implementations with automatic tuning and format selection. It is used as the linear-algebra stage of the CUDA-MPQS quadratic sieve, and is also usable as a standalone library.",
+  "keywords": [
+    "Block Wiedemann",
+    "linear algebra",
+    "GF(2)",
+    "sparse matrix",
+    "SpMM",
+    "GPU",
+    "CUDA",
+    "computational number theory"
+  ]
+}

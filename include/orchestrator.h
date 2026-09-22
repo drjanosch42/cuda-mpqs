@@ -62,7 +62,7 @@ enum class ExecutionMode {
     SIEVE_ONLY,         ///< Sieve -> Write Relations to Disk -> Exit
     LINALG_ONLY,        ///< Load Matrix (not impl) -> Solve -> Exit
     SQRT_ONLY,          ///< Load Kernel Vectors -> Find Factors
-    PARAM_TEST,         ///< Run parameter test/exploration -> Exit
+    PARAM_TEST_LEGACY,  ///< Legacy exhaustive grid search over Params8 -> Exit
     AUTOTUNE_ONLY,      ///< Tuning -> Autotune -> Print results -> Exit
     MATRIX_ONLY         ///< Load v2 relations -> Matrix -> BW -> Sqrt
 };
@@ -303,6 +303,26 @@ struct MPQSConfig {
     // Param test/selection (from batch branch)
     uint32_t params[8] = {};
     bool useParams = false;
+
+    /// CLI: --params11. Eleven values in SieveParam order:
+    /// {subCubeSize, numIntervals, polyBlockSize, blocksPerCycle, metaGridDim, metaBlockDim,
+    ///  sasGridDim, sasBlockDim, sievingBlockSize, bigPrimeStart, midPrimeStart}.
+    /// The first eight match --params exactly. Consumed via loadPartialCustomConfigDynamic().
+    uint32_t params11[11] = {};
+    bool useParams11 = false;
+
+    /// CLI: --param_test. Runs the tuning-complex parameter search, then exits.
+    /// (The superseded exhaustive grid search is ExecutionMode::PARAM_TEST_LEGACY.)
+    bool param_test = false;
+
+    /// CLI: --sieve_offsets_global. Keeps the GATHER offsets/primes arrays in global memory
+    /// instead of shared, freeing 3*bigPrimeStart*4 bytes of shared memory per block.
+    bool sieve_offsets_global = false;
+
+    /// CLI: --param_test_radius. Maximum FACE DIMENSION of the tuning complex: 1 sweeps each
+    /// axis alone, 3 includes the three-axis faces (occupancy, scatter-partition). Each face is
+    /// swept over the full product of its ladders, so this is not a distance bound.
+    uint32_t param_test_radius = 3;
 
     // Autotune
     bool autotune_enabled = false;

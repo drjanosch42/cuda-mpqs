@@ -104,7 +104,7 @@ The pipeline supports seven execution modes. Only one can be active at a time; t
 | `--linalg_only` | `LINALG_ONLY` | Tuning, Matrix, LinAlg, Sqrt | Load previously saved relations from `<work_dir>/relations.soa`, construct matrix, solve, and extract factors. Requires a prior `--sieve_only` run. |
 | `--matrix_only` | `MATRIX_ONLY` | Load v2 relations → Matrix → BW → Sqrt | Load v2-format relations and run matrix preprocessing, Block Wiedemann, and square root without sieving. Useful for replaying stored relation sets through different matrix configurations. Always uses the CPU matrix backend. |
 | `--sqrt_only` | `SQRT_ONLY` | Sqrt | **BROKEN — use `--linalg_only` instead.** There is no on-disk kernel-vector loader, so this mode cannot reconstruct the linear-algebra state it needs. |
-| `--param_test` | `PARAM_TEST` | Tuning, Sieve (grid search) | Run an exhaustive parameter grid search over sieve kernel configurations. Reports the best timing found. Does not produce factorizations. |
+| `--param_test_legacy` | `PARAM_TEST_LEGACY` | Tuning, Sieve (grid search) | Run the superseded exhaustive parameter grid search over sieve kernel configurations. Reports the best timing found. Does not produce factorizations. The current search is `--param_test`, which is a flag inside the full pipeline rather than a mode — see [Parameter Search](#parameter-search---param_test). |
 | `--autotune_only` | `AUTOTUNE_ONLY` | Tuning, Autotune | Run parameter optimization only, print results, and exit. Writes optimized parameters to the autotune history file but does not proceed to sieving. |
 | `--estimate_only` | (special) | Truncated sieve probe | Run a short sieve probe to estimate total runtime, then exit. Prints projected sieve, matrix, linear algebra, and total times. In solo mode, handled before orchestrator creation. In cluster mode, runs the full cluster sieve with a time limit (`--probe_timeout`) and prints a cluster-aware estimate. |
 
@@ -127,6 +127,7 @@ These parameters control the core SIQS algorithm. When set to 0 (the default), t
 | `--dedup_safety_factor <F>` | double | `1.05` (auto `1.35` for <80d) | Dedup oversample margin: the sieve collects `target * factor` relations to absorb duplicate loss. Values outside `[1.0, 2.0]` trigger a warning but are still applied. | Yes |
 | `--lp_interval <N>` | uint32 | `1` (every batch) | LP processing frequency. `N > 0` forces LP processing every N sieve batches; the default `1` processes every batch. `0` selects adaptive scheduling (LP runs when the partial buffer has filled sufficiently). Useful for tuning the trade-off between LP matching latency and overhead. When the LP pipeline is captured into a CUDA graph, in-graph cadence is set by `--cuda_graph_lp_stride` instead and this flag governs only the non-graph tail. | Yes |
 | `--params <p1,...,p8>` | 8x uint32 | Auto | Manually specify the 8-parameter sieve kernel configuration tuple. Parentheses around the list are optional and stripped. See [Parameter Tuple Format](#parameter-tuple-format) below. | Yes |
+| `--params11 <p1,...,p11>` | 11x uint32 | Auto | Manually specify the extended 11-field sieve kernel configuration tuple. The first eight fields are exactly `--params`; the three additional ones pin the sieving block size and the two factor-base band boundaries. A field given as `0` is left to the loader's own derivation. Takes precedence over `--params`, over autotune and over an auto-applied history. Parentheses are optional and stripped. See [Eleven-Field Tuple](#eleven-field-tuple---params11) below. | Yes |
 
 `--fb_bound`, `--lp1_bound`, `--target_rels`, `--sieve_bound`, `--sieve_max_relations`,
 `--matrix_lp1_bound` and `--matrix_max_rows` accept an optional `K`/`M`/`B`/`T` suffix,
@@ -185,15 +186,112 @@ must divide `subCubeSize` with a power-of-two quotient, and `subCubeSize` must n
 exceed `2^(hypercube dimension - 1)`. A violating tuple aborts before sieving, naming
 the clause it failed — nothing is silently floored to make it fit.
 
-**Interval coverage.** `numIntervals` (index 1) and the sieving block size must satisfy
-`numIntervals x sieveBlockSize >= 2M`. Every shipped tuple satisfies it exactly; it
-matters when overriding the block size (see *Narrow-Batch Geometry Overrides*).
+**Interval coverage.** On the narrow accumulator path — batch *and* legacy —
+`numIntervals` (index 1) and the sieving block size must satisfy
+
+```
+numIntervals x sieveBlockSize == 2M
+```
+
+**exactly.** Under-coverage leaves part of `[-M, M)` unsieved; over-coverage runs past
+the interval into positions where Q is far too large to be smooth, which is cheap per
+position and nearly barren in relations — so an over-covering tuple looks *fast* to a
+timing probe while yielding almost nothing. Both are rejected before sieving, naming the
+`numIntervals` the geometry requires. Every shipped tuple satisfies the equality; it
+matters when overriding the sieving block size (see *Eleven-Field Tuple* and
+*Narrow-Batch Geometry Overrides*). ⚠ 1.0.6 enforced only `>= 2M`, so a tuple accepted
+there can be rejected here; the fix is always the `numIntervals` named in the message.
 
 **Safety adjustments:** When LP is active (`--lp1_bound > 0`) and custom params are set, `sasGridDim` (index 6) is automatically raised to a minimum floor derived from `subCubeSize * numIntervals / 64`, rounded up to the smallest admissible grid (on a power-of-two `subCubeSize` that is the next power of two, as before), to prevent candidate buffer overflow. The legacy kernel `sasBlockDim` (index 7) is capped at 1024 to match `__launch_bounds__`.
 
 **Rollback note.** An `autotune_history.json` written by 1.0.6 or later can hold a
 non-power-of-two tuple that an older binary rejects — loudly, not silently. When
 downgrading, delete the history file or run with `--autotune_no_history`.
+
+#### Eleven-Field Tuple (`--params11`)
+
+`--params11` extends the eight-field tuple with the three geometry fields that are
+otherwise derived from the device's shared-memory budget and from `SB`:
+
+| Index | Name | Description |
+|-------|------|-------------|
+| 0-7 | *as `--params`* | `subCubeSize`, `numIntervals`, `polyBlockSize`, `blocksPerCycle`, `metaGridDim`, `metaBlockDim`, `sasGridDim`, `sasBlockDim` — identical meaning and identical order |
+| 8 | `sievingBlockSize` | Sieving block size `SB`. Derived from the shared-memory budget when left at 0. |
+| 9 | `bigPrimeStart` | Factor-base index at which the bucketed (meta-sieve / gather) large-prime band begins. Derived as `SB / 32` when left at 0. |
+| 10 | `midPrimeStart` | Factor-base index at which the mid-prime band begins. Derived as `96` when left at 0. |
+
+Example: `--params11 2048,8,8,8,256,1024,1024,1024,65536,2820,96`
+
+**All eleven values must be given**; a shorter list is rejected by name. A field set to
+`0` is *derived*, not set to zero, so a tuple can pin some fields and leave the rest to
+the loader. Three of them are functions of `sievingBlockSize` and are the usual ones to
+leave at 0: `numIntervals` (`2M / SB`, the interval-coverage equality above),
+`blocksPerCycle` (equal to `numIntervals`, i.e. one meta-sieve cycle) and
+`bigPrimeStart` (`SB / 32`). The six grid and partition fields have no such derivation
+and are normally given explicitly.
+
+**Band ordering.** The two band boundaries must satisfy
+`smallPrimesUsed <= midPrimeStart <= bigPrimeStart`. A `midPrimeStart` above
+`bigPrimeStart` would make the gather kernel read past the end of its shared arrays, so
+the combination aborts before sieving rather than producing silently wrong logarithms.
+
+**Precedence.** `--params11` wins over `--params`, over autotune and over an
+auto-applied history: whatever else is on the command line, the eleven-field tuple is
+what the sieve loads. It also replaces `--sieve_block_size` / `--sieve_big_prime_start`
+— `sievingBlockSize` and `bigPrimeStart` are the same two quantities — and those two
+flags still require a pinned `--params`, so they cannot be combined with `--params11`
+alone.
+
+**Bucket sizing.** With `--params11` and no `--bucket_size_factor`, the meta-sieve
+bucket is auto-sized to the predicted peak occupancy of the resulting geometry rather
+than to the legacy `SB / 2`. The prediction is made for a single sieve call, so a long
+run can approach the capacity it was given; pass `--bucket_size_factor` explicitly for
+production runs, and `--sieve_bucket_overflow_stats` to watch the actual fill.
+
+⚠ **Three `--params`-only safety nets do not apply.** The launch preflight, the
+automatic `sasGridDim` floor raised when large primes are active, and the legacy
+`sasBlockDim <= 1024` cap all rewrite the eight-field tuple and therefore only run under
+`--params`. The full admissibility check before sieving is unaffected and still rejects
+an infeasible tuple loudly — but an eleven-field tuple is not silently corrected for
+you. ⚠ At very small inputs (hypercube dimension below 7) the small-N adaptive
+configuration path takes over and the tuple is not used.
+
+#### Parameter Search (`--param_test`)
+
+`--param_test` searches the sieve kernel geometry, prints the best tuple it found, and
+exits without factoring. It is a flag inside the normal invocation, not an execution
+mode, so it is combined with the usual `--fb_bound` / `--sieve_bound` / `--lp1_bound`
+settings — the search is only meaningful at the operating point it will be used at.
+
+| Flag | Type | Default | Description | Pinned |
+|------|------|---------|-------------|--------|
+| `--param_test` | boolean | `false` | Run the parameter search (tuning complex) at the configured operating point, print the winning tuple, and exit. | Yes |
+| `--param_test_radius <N>` | uint32 | `3` | Maximum **face dimension** of the search: `1` sweeps each axis on its own, `3` also sweeps the two- and three-axis faces. Must be >= 1. Each face is swept over the full product of its rungs, so this bounds dimension, not distance — raising it enlarges the search sharply. | Yes |
+| `--param_test_legacy` | mode | — | The superseded exhaustive grid search (see [Execution Modes](#execution-modes)). | — |
+
+- **Nine axes.** `sievingBlockSize`, `subCubeSize`, `sasGridDim`, `polyBlockSize`,
+  `bigPrimeStart`, `metaGridDim`, `metaBlockDim`, `sasBlockDim` and `midPrimeStart` —
+  that is, the eleven fields minus `numIntervals` and `blocksPerCycle`, which are
+  functions of `sievingBlockSize` and are derived rather than searched. Grid and block
+  dimensions move on a power-of-two ladder plus multiprocessor-count rungs; the two band
+  boundaries move on the arithmetic lattice the factor-base bands are walked in.
+- **Seed.** `--params11` when given, otherwise the standard configuration. Starting
+  from a known-good tuple lets its score be read directly against its neighbourhood. A
+  seed the validator rejects aborts the run and names the check it failed. ⚠ Candidates
+  are timed through the legacy probe kernel, where the power-of-two rules apply in full,
+  so `subCubeSize`, `metaGridDim` and `sasGridDim` must be powers of two in the seed and
+  the search cannot reach the SM-aligned (non-power-of-two) family. Compare such a pin
+  against a search winner with a full run, never by seeding the search with it.
+- **Adoption rule.** The best candidate of a face then meets the incumbent in an
+  alternating paired duel and is adopted only if it wins by at least 0.5 %. Interleaving
+  the two draws keeps clock ramp and thermal drift out of the comparison.
+- **Output.** A ready-to-paste `--params11` line for the winner and for the seed, the
+  chain gain over the seed as a product of paired improvements, and a measured
+  machine-drift figure so an absolute before/after reading is not mistaken for geometry.
+- **Narrow (uint8) accumulator path only.** On the wide path it logs a critical error
+  and performs no search.
+- Candidates are timed with a short sieve probe, not a full run. Confirm a winner with a
+  complete factorization before adopting it as a pinned tuple.
 
 ### Buffer Sizing
 
@@ -237,6 +335,7 @@ All buffer size flags accept an optional `K` or `M` suffix for base-1024 scaling
 | `--bucket_size_factor <F>` | double | `0` (legacy SB/2) | Meta-sieve bucket capacity as a multiple of the sieving block size (`globalBucketSize = F × SB`). `1.0` un-clamps the default bucket; on the wide path at large `M` this is what eliminates bucket overflow. The knob is width-agnostic — it is live on the narrow path too, where at production geometry it is free (no measured wall or relation-count effect) but becomes **a correctness requirement** on any configuration that lowers `--sieve_big_prime_start`, and on devices whose default bucket already runs near full. Charged against the VRAM budget before allocation — an over-large factor degrades poly count or is rejected, never an OOM. Pair with `--sieve_bucket_overflow_stats` to see the actual fill. | Yes |
 | `--sieve_gather_block_dim <N>` | uint32 | `0` (off) | Overrides the GATHER kernel block dimension (power of two in `[32,1024]`). Result-invariant occupancy A/B knob. | Yes |
 | `--sieve_meta_cycle_cap <N>` | uint32 | `0` (off) | Caps the meta-sieve (SCATTER) active-blocks-per-cycle to shrink the bucket-write window. A write-locality ablation knob, not a speedup lever (capping multiplies factor-base re-reads). | No |
+| `--sieve_offsets_global` | boolean | `false` (off) | Keeps the gather kernel's per-prime offset and prime arrays in global memory instead of shared, freeing `3 x bigPrimeStart x 4` bytes of shared memory per block so that the large-prime transition index stops competing with the sieving block for the shared-memory budget. Narrow accumulator path only (inert on the wide path). **Experimental** — the trade between the freed shared memory and the added global traffic has not been characterised. | Yes |
 
 #### Narrow-Batch Geometry Overrides (experimental)
 
@@ -244,7 +343,9 @@ Two further flags override derivations that are otherwise fixed by the device's
 shared-memory budget. They exist to trade the gathering kernel's shared-memory
 footprint for multiprocessor co-residency, and they are **experimental**: they are
 default-off, reachable only with a pinned `--params`, rejected in combination with
-any autotune flag, and easy to misconfigure.
+any autotune flag, and easy to misconfigure. They are also the two quantities that
+fields 9 and 10 of [`--params11`](#eleven-field-tuple---params11) carry directly; use
+whichever of the two forms suits the tuple, not both.
 
 | Flag | Type | Default | Description | Pinned |
 |------|------|---------|-------------|--------|
@@ -266,14 +367,16 @@ any autotune flag, and easy to misconfigure.
 launch covers, so `numIntervals` (`--params` field 2) must rise in step to keep
 
 ```
-numIntervals x sieve_block_size >= 2M
+numIntervals x sieve_block_size == 2M
 ```
 
-A configuration that violates this sieves only half the interval. This binary
-aborts loudly and names the interval count it needs; **releases before 1.0.6 accept
-it silently**, lose roughly half the yield, and can even report a *higher* relation
-count while doing so, because a smaller region suffers less per-block relation
-truncation. Never carry such a tuple back to an older binary.
+A configuration that under-covers sieves only part of the interval; one that
+over-covers runs past it into barren positions and merely *looks* fast. This binary
+aborts loudly and names the interval count it needs. **Releases before 1.0.6 accept
+under-coverage silently**, lose roughly half the yield, and can even report a *higher*
+relation count while doing so, because a smaller region suffers less per-block relation
+truncation; **1.0.6 enforces only the lower bound.** Never carry such a tuple back to an
+older binary.
 
 **Second hazard — bucket capacity.** Lowering `--sieve_big_prime_start` raises the
 meta-sieve bucket fill sharply. Pass `--bucket_size_factor 1.0` alongside it;

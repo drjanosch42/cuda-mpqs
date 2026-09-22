@@ -168,6 +168,20 @@ command line (`tests/cuda-mpqs.cpp:738-760` parses the 8-tuple with no power-of-
 `autotune_history.json` entry that recorded one. See
 [SM-Aligned (Non-Power-of-Two) Geometry](#sm-aligned-non-power-of-two-geometry-v106) below.
 
+**v1.0.7 — nothing under `src/autotune/` changed, but three sieve-side changes reach it.**
+(1) Every tuple the autotuner applies, projects or auto-applies goes through
+`loadPartialCustomConfig`, which now sets `midPrimeStartIndex = 96` and runs the small-prime mask,
+so an autotuned run sieves differently from the same tuple on v1.0.6 (a bare run through
+`loadStandardConfig` keeps `midPrimeStartIndex = 32`). (2) `validateConfigs()` now demands
+`numIntervals × SB == 2M` exactly on **every** narrow run, legacy included, so over-covering probes
+(the M-sweep driving `SB = min(M, …) == M` at a fixed interval count) and legacy probes with
+`numIntervals × SB < 2M` — both legal in v1.0.6 — are now rejected; expect more skipped probes on
+small-shared-memory devices. (3) The new `--param_test` search (sieve module,
+`DeviceSievingController::runParamTest`) is **separate from the autotuner**: it searches `SB`,
+`bigPrimeStartIndex` and `midPrimeStartIndex` in addition to the `Params8` axes, prints its winner
+as a `--params11` line, and writes no `autotune_history.json` entry. The autotuner cannot produce or
+record an 11-field tuple; a `--params11` pin takes precedence over any autotune or history tuple.
+
 ### Algorithm
 
 1. **Phase 1 (Seed):** Start from `HEURISTIC_DEFAULTS = {512, 8, 4, 8, 256, 1024, 256, 1024}`. Clamp to feasible region (e.g., `subCubeSize <= 2^(shc_dim-1)`, `blocksPerCycle <= numIntervals`). Validate; if infeasible, fall back to first valid enumerated config.

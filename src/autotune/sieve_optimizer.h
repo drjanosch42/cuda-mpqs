@@ -168,7 +168,7 @@ private:
     std::map<ParamKey, RuntimeEstimate> cache_;
     uint32_t total_probes_ = 0;
 
-    std::chrono::high_resolution_clock::time_point t_wall_start_;
+    std::chrono::steady_clock::time_point t_wall_start_;
     bool timed_out_ = false;
 
     // Phase-level probe counters (populated during optimize())

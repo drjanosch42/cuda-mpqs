@@ -188,8 +188,8 @@ The fix is one line each (`256` → `512` in the second half of the three condit
 **Status: unfixed and untouched.** This is a **submodule** defect and `src/linalg` is out of scope
 for edits under the parent repo's Code Rule 1. Verified identical at both the gitlink recorded by
 the parent at HEAD (`7dab002`) and the currently checked-out submodule working tree (`dc48659`) —
-those two commits differ only under `tools/release/`. Practical impact today is nil: production
-runs symmetric `m = n = 256`.
+those two commits differ only under the submodule's release-tooling directory. Practical impact
+today is nil: production runs symmetric `m = n = 256`.
 
 ### Delta-16 SpMM Autotuner uint32 Overflow Guard
 

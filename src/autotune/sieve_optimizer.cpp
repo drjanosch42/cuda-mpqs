@@ -106,7 +106,7 @@ uint64_t SieveParameterOptimizer::L_min(uint32_t F) {
 bool SieveParameterOptimizer::checkBudget() {
     if (timed_out_) return false;
     if (total_probes_ >= cfg_.max_total_probes) return false;
-    auto now = std::chrono::high_resolution_clock::now();
+    auto now = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(now - t_wall_start_).count();
     if (elapsed >= cfg_.wall_clock_timeout_sec) {
         LOG(LOG_INFO) << "SieveParameterOptimizer: wall-clock budget exhausted ("
@@ -517,7 +517,7 @@ SieveOptimizationResult SieveParameterOptimizer::optimize(
     const SieveSearchBounds& bounds)
 {
     auto [F, M, L] = warm_start;
-    t_wall_start_ = std::chrono::high_resolution_clock::now();
+    t_wall_start_ = std::chrono::steady_clock::now();
     timed_out_ = false;
     total_probes_ = 0;
     cache_.clear();
@@ -684,7 +684,7 @@ SieveOptimizationResult SieveParameterOptimizer::optimize(
     // Build result
     // =====================================================================
 
-    auto now = std::chrono::high_resolution_clock::now();
+    auto now = std::chrono::steady_clock::now();
     double wall_sec = std::chrono::duration<double>(now - t_wall_start_).count();
 
     SieveOptimizationResult result;

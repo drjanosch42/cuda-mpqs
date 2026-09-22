@@ -225,7 +225,8 @@ void print_usage(const char* prog_name) {
               << "  --lp1_combined_buf <SIZE>    LP match output buffer [Default: 32K]\n"
               << "  --lp1_hash_bits <N>          LP hash table directory bits [Default: auto]\n"
               << "\n--- Execution Modes ---\n"
-              << "  --param_test     Run parameter test/exploration\n"
+              << "  --param_test        Run the parameter search (tuning complex), then exit\n"
+              << "  --param_test_legacy Run the superseded exhaustive grid search\n"
               << "  --full           Full Pipeline (Default)\n"
               << "  --sieve_only     Run Sieving only\n"
               << "  --linalg_only    Run Linear Algebra only (requires matrix)\n"
@@ -442,8 +443,8 @@ ParsedArgs parse_args(int argc, char** argv) {
         else if (arg == "--sqrt_legacy") args.config.sqrt_legacy = true;
         else if (arg == "--sqrt_diagnostic") args.config.sqrt_diagnostic = true;
         else if (arg == "--estimate_only") args.estimate_only = true;
-        else if (arg == "--param_test") {
-            args.config.mode = ExecutionMode::PARAM_TEST;
+        else if (arg == "--param_test_legacy") {
+            args.config.mode = ExecutionMode::PARAM_TEST_LEGACY;
         }
 
         // --- Cluster mode ---
@@ -734,6 +735,47 @@ ParsedArgs parse_args(int argc, char** argv) {
         else if (arg == "--sieve_hc_dim" && i+1 < argc) {
             if (!parse_uint32(argv[++i], args.config.sieve_hcube_dimension)) exit(1);
             args.mark("sieve_hcube_dimension");
+        }
+        else if (arg == "--param_test_radius" && i+1 < argc) {
+            if (!parse_uint32(argv[++i], args.config.param_test_radius)) exit(1);
+            if (args.config.param_test_radius == 0) {
+                std::cerr << "Error: --param_test_radius must be >= 1.\n";
+                exit(1);
+            }
+            args.mark("param_test_radius");
+        }
+        else if (arg == "--sieve_offsets_global") {
+            args.config.sieve_offsets_global = true;
+            args.mark("sieve_offsets_global");
+        }
+        else if (arg == "--param_test") {
+            args.config.param_test = true;
+            args.mark("param_test");
+        }
+        else if (arg == "--params11" && i+1 < argc) {
+            std::string input = argv[++i];
+            input.erase(std::remove(input.begin(), input.end(), '('), input.end());
+            input.erase(std::remove(input.begin(), input.end(), ')'), input.end());
+            std::stringstream ss(input);
+            std::string segment;
+            int found = 0;
+            while (std::getline(ss, segment, ',')) {
+                if (segment.empty()) {
+                    std::cerr << "Error: empty value in --params11 list.\n";
+                    exit(1);
+                }
+                if (found < 11) {
+                    if (!parse_uint32(segment.data(), args.config.params11[found])) exit(1);
+                }
+                found++;
+            }
+            if (found < 11) {
+                std::cerr << "Error: --params11 requires 11 comma-separated values, got "
+                          << found << ".\n";
+                exit(1);
+            }
+            args.config.useParams11 = true;
+            args.mark("params11");
         }
         else if (arg == "--params" && i+1 < argc) {
             std::string input = argv[++i];

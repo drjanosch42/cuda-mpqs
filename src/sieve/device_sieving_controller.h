@@ -11,9 +11,31 @@
 #include "json_helper.h"
 #include <array>
 #include <atomic>
+#include <optional>
+#include <deque>
 
 namespace mpqs {
 namespace sieve {
+
+/// Parameter identity for loadPartialCustomConfigDynamic. The first eight entries keep the
+/// Params8 / loadPartialCustomConfig order.
+enum SieveParam : uint32_t {
+    P_SUB_CUBE_SIZE = 0,
+    P_NUM_INTERVALS,
+    P_POLY_BLOCK_SIZE,
+    P_BLOCKS_PER_CYCLE,
+    P_META_GRID_DIM,
+    P_META_BLOCK_DIM,
+    P_SAS_GRID_DIM,
+    P_SAS_BLOCK_DIM,
+    P_SIEVING_BLOCK_SIZE,
+    P_BIG_PRIME_START,
+    P_MID_PRIME_START,
+    P_COUNT
+};
+
+/// Sparse parameter list: a set entry overrides, an unset one keeps the loader's derivation.
+using ParamSet = std::array<std::optional<uint32_t>, P_COUNT>;
 
 class DeviceSievingController {
 
@@ -156,7 +178,14 @@ public:
     // Configuration
     void loadStandardConfig();
     void loadPartialCustomConfig(uint32_t totalPolys, uint32_t totalIntervals, uint32_t polyBlockSize, uint32_t blocksPerCycle, uint32_t metaB, uint32_t metaT, uint32_t sasB, uint32_t sasT);
-    ParamTestResult runParamTest(factoringData& f_data);
+    void loadPartialCustomConfigDynamic(const ParamSet& p);
+    /// Neighbourhood parameter search. `seed` (from --params11) pins the starting
+    /// tuple; nullptr seeds from loadStandardConfig(), i.e. from what a bare run would use.
+    /// `radius` bounds the FACE DIMENSION of the tuning complex (see runParamTest):
+    /// 1 = single-axis sweeps, 3 = the full complex. Faces are always swept exhaustively.
+    void runParamTest(factoringData& f_data, const ParamSet* seed = nullptr,
+                      uint32_t radius = 3);
+    ParamTestResult runParamTestLegacy(factoringData& f_data);
     void setConfig(const initConfig& c) { init_conf = c; }
     void setConfig(const generalSievingConfig& c) { gs_conf = c; }
     void setConfig(const globalMetaSieveConfig& c) { gms_conf = c; }
@@ -297,6 +326,14 @@ public:
     /// Consumed only at config-load time; call before either loader.
     void setBucketSizeFactor(double f) { bucket_size_factor_override_ = f; }
 
+    /// --sieve_offsets_global. Moves the GATHER offsets1/offsets2/primes arrays out of shared
+    /// memory into devicePointers::dev_sieveOffsets, one slice per thread block. Shared memory
+    /// per GATHER block then drops from SB + 3*bigPrimeStartIndex*4 to SB alone, which both
+    /// decouples bigPrimeStartIndex from the shared budget entirely and can buy a second
+    /// resident block per SM. NARROW ONLY -- silently inert on the wide path, whose kernels
+    /// keep the shared layout. Consumed at config-load time; call before either loader.
+    void setOffsetsInGlobal(bool on) { offsets_in_global_ = on; }
+
     /// v1.0.6: override gs_conf.sievingBlockSize on the NARROW BATCH --params path.
     /// n == 0 (default) = OFF: the loader keeps SB = min(M, pow2leq(3/4 * maxSharedMemPerBlock)),
     /// byte-identical to v1.0.5 on every path. n > 0 replaces that derivation inside
@@ -366,6 +403,7 @@ public:
     void printCustomConfigs();
     void printConfigsDEBUG();
     bool validateConfigs();
+    bool validateConfigsSilent();
 
     // Public getter for non-batch processing postprocessor handshake
     cudaStream_t getCudaStream() const { return stream; }
@@ -489,6 +527,9 @@ private:
     /// validateConfigs would otherwise only report the resulting EQUAL_CHECK mismatch.
     bool custom_config_invalid_ = false;
 
+    /// Set by validateConfigsSilent(): suppresses validateConfigs' diagnostics only.
+    bool validate_quiet_ = false;
+
     bool use_wide_accumulator_ = false;
 
     // Wide saturating-uint8 accumulator: width dispatch inside the wide
@@ -526,6 +567,11 @@ private:
     /// both config loaders where globalBucketSize is assigned.
     double bucket_size_factor_override_ = 0.0;
 
+    /// See setOffsetsInGlobal(). Resolved into sieveAndScanConfig::offsetsInGlobal by the
+    /// loaders (and forced off on the wide path), which is the single value the kernels,
+    /// the allocators and validateConfigs all read.
+    bool offsets_in_global_ = false;
+
     /// v1.0.6 --sieve_block_size / --sieve_big_prime_start overrides. 0 = OFF (the loader's own
     /// derivation runs, byte-identical to v1.0.5). Consumed ONLY inside loadPartialCustomConfig,
     /// at the derivation site of each field, so every quantity derived from them
@@ -545,6 +591,26 @@ private:
     /// override > 0 returns round(override*SB), floored at 1 slot. globalBucketSize need not
     /// be a power of two (it is a plain per-bucket stride in the entry index math); the legacy
     /// SB/2 and the common factor=1.0 doubling both stay powers of two anyway.
+    /// Suffix sums of 1/p over the factor base, built once and reused: tail_inv_p_[i] =
+    /// sum_{j >= i} 1/p_j. Rebuilt if the factor base changes size.
+    mutable std::vector<double> tail_inv_p_;
+    void ensureTailInvP() const;
+
+    /// Expected entries in ONE (poly, sievingBlock) bucket: every prime at or above
+    /// bigPrimeStartIndex has 2 roots, each landing ~SB/p times in a window of SB positions.
+    /// Note this is SB-proportional and independent of np/numIntervals.
+    double expectedBucketEntries(uint32_t sievingBlockSize, uint32_t bigPrimeStartIndex) const;
+
+    /// Bucket size that fits the PEAK bucket, not the mean. Occupancy is a sum of many
+    /// near-independent Bernoulli hits, so it concentrates: sigma = sqrt(mu), and the maximum
+    /// over the N = np*numIntervals buckets sits about z = sqrt(2 ln N) sigmas above the mean.
+    /// Sizing at mu + z*sqrt(mu) (rounded up to a multiple of 32) therefore wastes no VRAM on
+    /// headroom that cannot be used, while leaving overflow -- which SILENTLY discards
+    /// large-prime hits -- statistically out of reach. Whether the result FITS is a separate
+    /// question, answered by the VRAM budget check in validateConfigs().
+    uint32_t autoGlobalBucketSize(uint32_t sievingBlockSize, uint32_t bigPrimeStartIndex,
+                                  uint32_t numPolys, uint32_t numIntervals) const;
+
     uint32_t computeGlobalBucketSize(uint32_t sievingBlockSize) const {
         if (bucket_size_factor_override_ <= 0.0)
             return sievingBlockSize / 2;

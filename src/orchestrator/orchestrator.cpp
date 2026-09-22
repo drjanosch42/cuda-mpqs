@@ -130,6 +130,14 @@ static bool mpqsDebugShouldDropChunkAssign(uint8_t worker_id, uint64_t occurrenc
 
 namespace mpqs {
 
+// --params11 -> ParamSet, in SieveParam order (first eight identical to --params).
+static mpqs::sieve::ParamSet makeDynamicParamSet(const uint32_t (&v)[11]) {
+    mpqs::sieve::ParamSet ps;
+    for (uint32_t k = 0; k < mpqs::sieve::P_COUNT; ++k)
+        if (v[k]) ps[k] = v[k];
+    return ps;
+}
+
 // -----------------------------------------------------------------------------
 // Constructor & Destructor
 // -----------------------------------------------------------------------------
@@ -245,7 +253,7 @@ void MPQSOrchestrator::Run() {
     LOG(LOG_INFO) << "RUNNING IN DEBUG MODE";
 #endif
 
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
     auto t_start = clock::now();
 
     // Per-stage timing (seconds)
@@ -258,7 +266,7 @@ void MPQSOrchestrator::Run() {
         if (config_.mode == ExecutionMode::FULL_PIPELINE ||
             config_.mode == ExecutionMode::SIEVE_ONLY ||
             config_.mode == ExecutionMode::LINALG_ONLY ||
-            config_.mode == ExecutionMode::PARAM_TEST ||
+            config_.mode == ExecutionMode::PARAM_TEST_LEGACY ||
             config_.mode == ExecutionMode::AUTOTUNE_ONLY)
         {
             auto t_tuning = clock::now();
@@ -2064,7 +2072,7 @@ void MPQSOrchestrator::Run() {
             // ============================================================
             LOG(LOG_INFO) << "M9f: Building sqrt batch from " << kernel_solutions_.size()
                           << " kernel vectors (packed pipeline, no merge tree)...";
-            using clock_kv = std::chrono::high_resolution_clock;
+            using clock_kv = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
             auto t_expand = clock_kv::now();
 
             const auto& v2 = *preproc_v2_result_;
@@ -2202,7 +2210,7 @@ void MPQSOrchestrator::Run() {
             // ============================================================
             LOG(LOG_INFO) << "Expanding " << kernel_solutions_.size()
                           << " kernel vectors via merge tree...";
-            using clock_kv = std::chrono::high_resolution_clock;
+            using clock_kv = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
             auto t_expand = clock_kv::now();
 
             const size_t ns = raw_smooths_soa_.num_relations;
@@ -4077,7 +4085,7 @@ void MPQSOrchestrator::SieveStage() {
     LOG_SET_MODULE("Sieve");
     LOG_SET_STAGE(LOG_STAGE_SIEVE, "Sieve");
     LOG(LOG_INFO) << "Sieve";
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
     auto t_sieve_start = clock::now();
 
     // --- Cluster mode setup ---
@@ -4144,6 +4152,7 @@ void MPQSOrchestrator::SieveStage() {
     siever_->setMetaCycleCap(config_.sieve_meta_cycle_cap);  // A2: SCATTER meta-cycle cap (0 = off)
     siever_->setGatherBlockDim(config_.sieve_gather_block_dim);  // GATHER blockDim A/B knob (0 = off)
     siever_->setBucketSizeFactor(config_.sieve_bucket_size_factor);  // bucket-overflow ablation knob (0 = legacy SB/2)
+    siever_->setOffsetsInGlobal(config_.sieve_offsets_global);       // GATHER offsets/primes out of shared memory
     // v1.0.6: narrow-batch --params-only geometry overrides (0 = off => byte-identical).
     // Must run BEFORE initiate(), like every other loader-consumed override above.
     siever_->setSievingBlockSizeOverride(config_.sieve_block_size);   // sievingBlockSize override (0 = off)
@@ -4160,13 +4169,29 @@ void MPQSOrchestrator::SieveStage() {
     // NOTE: setSievingBatchSize must be called AFTER loadStandardConfig/loadPartialCustomConfig
     // because those functions reset init_conf.batch_size = 0. Moved below config loading.
 
-    // PARAM_TEST: exhaustive grid search, then return to Run()
-    if(config_.mode == ExecutionMode::PARAM_TEST) {
+    // Tuning-complex parameter search, then exit.
+    if (config_.param_test) {
+        LOG(LOG_INFO) << "Parameter search (tuning complex)...";
+        // --params11, when given, pins the seed AND the geometry loadData() sizes for.
+        const bool seeded = config_.useParams11;
+        const mpqs::sieve::ParamSet seed =
+            seeded ? makeDynamicParamSet(config_.params11) : mpqs::sieve::ParamSet{};
+        if (seeded) siever_->loadPartialCustomConfigDynamic(seed);
+        else        siever_->loadStandardConfig();
+        siever_->loadData();
+        siever_->updateState();
+        siever_->runParamTest(f_data_, seeded ? &seed : nullptr,
+                                         config_.param_test_radius);
+        return;
+    }
+
+    // PARAM_TEST_LEGACY: exhaustive grid search, then return to Run()
+    if(config_.mode == ExecutionMode::PARAM_TEST_LEGACY) {
         LOG(LOG_INFO) << "Testing parameter combinations...";
         siever_->loadStandardConfig();
         siever_->loadData();
         siever_->updateState();
-        auto result = siever_->runParamTest(f_data_);
+        auto result = siever_->runParamTestLegacy(f_data_);
         LOG(LOG_INFO) << "Param test complete. Best timing: "
                       << result.best_timing_us << " us ("
                       << result.configs_tested << " configs tested)";
@@ -4255,7 +4280,7 @@ void MPQSOrchestrator::SieveStage() {
         siever_->loadPartialCustomConfig(
             totalPolys, totalIntervals, polyBlockSize, blocksPerCycle,
             metaB, 256, sasB, 256);
-    } else if (config_.useParams) {
+    } else if (config_.useParams || config_.useParams11) {
         LOG(LOG_DEBUG_2) << "Loading Custom Config";
 
         // Post-autotune safety clamp: metaB (params[4]) and sasB (params[6])
@@ -4284,7 +4309,10 @@ void MPQSOrchestrator::SieveStage() {
             }
         }
 
-        siever_->loadPartialCustomConfig(config_.params[0],
+        if (config_.useParams11) {
+            siever_->loadPartialCustomConfigDynamic(makeDynamicParamSet(config_.params11));
+        } else {
+            siever_->loadPartialCustomConfig(config_.params[0],
                                          config_.params[1],
                                          config_.params[2],
                                          config_.params[3],
@@ -4292,6 +4320,7 @@ void MPQSOrchestrator::SieveStage() {
                                          config_.params[5],
                                          config_.params[6],
                                          config_.params[7]);
+        }
     } else {
         LOG(LOG_DEBUG_2) << "Loading Standard Config";
         siever_->loadStandardConfig();
@@ -6411,7 +6440,7 @@ MPQSOrchestrator::TruncatedSieveResult MPQSOrchestrator::TruncatedSieveRun(
         }
     }
 
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
 
     // =========================================================================
     // 1. Initialize Siever (replicate SieveStage init)
@@ -6427,6 +6456,7 @@ MPQSOrchestrator::TruncatedSieveResult MPQSOrchestrator::TruncatedSieveRun(
     siever_->setMetaCycleCap(config_.sieve_meta_cycle_cap);  // A2: SCATTER meta-cycle cap (0 = off)
     siever_->setGatherBlockDim(config_.sieve_gather_block_dim);  // GATHER blockDim A/B knob (0 = off)
     siever_->setBucketSizeFactor(config_.sieve_bucket_size_factor);  // bucket-overflow ablation knob (0 = legacy SB/2)
+    siever_->setOffsetsInGlobal(config_.sieve_offsets_global);       // GATHER offsets/primes out of shared memory
     // v1.0.6: narrow-batch --params-only geometry overrides (0 = off => byte-identical).
     // Must run BEFORE initiate(), like every other loader-consumed override above.
     siever_->setSievingBlockSizeOverride(config_.sieve_block_size);   // sievingBlockSize override (0 = off)
@@ -6438,8 +6468,11 @@ MPQSOrchestrator::TruncatedSieveResult MPQSOrchestrator::TruncatedSieveRun(
 
     // Force legacy loop — no batch mode for probes
 
-    if (config_.useParams) {
-        siever_->loadPartialCustomConfig(config_.params[0],
+    if (config_.useParams || config_.useParams11) {
+        if (config_.useParams11) {
+            siever_->loadPartialCustomConfigDynamic(makeDynamicParamSet(config_.params11));
+        } else {
+            siever_->loadPartialCustomConfig(config_.params[0],
                                          config_.params[1],
                                          config_.params[2],
                                          config_.params[3],
@@ -6447,6 +6480,7 @@ MPQSOrchestrator::TruncatedSieveResult MPQSOrchestrator::TruncatedSieveRun(
                                          config_.params[5],
                                          config_.params[6],
                                          config_.params[7]);
+        }
     } else {
         // Mirror SieveStage small-N adaptive config: loadStandardConfig() sets
         // metaB from SM count which exceeds max_polys for small N, producing
@@ -6721,7 +6755,7 @@ void MPQSOrchestrator::MatrixStage() {
     LOG_SET_MODULE("Orchestrator");
     LOG_SET_STAGE(LOG_STAGE_MATRIX_PREPROCESSING, "Matrix");
     LOG(LOG_INFO) << "Matrix Construction";
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
     auto t_start = clock::now();
 
     // 1. Validation: ensure relations are available
@@ -6878,7 +6912,7 @@ void MPQSOrchestrator::LinearAlgebraStage() {
     LOG_SET_MODULE("Orchestrator");
     LOG_SET_STAGE(LOG_STAGE_BW_INITIALIZATION, "LinAlg");
     LOG(LOG_INFO) << "Linear Algebra (Block Wiedemann)";
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
     auto t_start = clock::now();
 
     lingen::BWSolverConfig& bw_conf = config_.bw_config;
@@ -6979,7 +7013,7 @@ void MPQSOrchestrator::SquareRootStage() {
     LOG_SET_MODULE("Orchestrator");
     LOG_SET_STAGE(LOG_STAGE_SQRT, "Sqrt");
     LOG(LOG_INFO) << "Square Root";
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;  // monotonic: wall clock is stepped by NTP / WSL2 host sync
     auto t_start = clock::now();
 
     if (kernel_solutions_.empty()) {
@@ -7272,7 +7306,7 @@ bool MPQSOrchestrator::shouldAutoApply() const {
     // Only for modes that do sieving (or autotune-only, for warm start)
     return config_.mode == ExecutionMode::FULL_PIPELINE
         || config_.mode == ExecutionMode::SIEVE_ONLY
-        || config_.mode == ExecutionMode::PARAM_TEST
+        || config_.mode == ExecutionMode::PARAM_TEST_LEGACY
         || config_.mode == ExecutionMode::AUTOTUNE_ONLY;
 }
 

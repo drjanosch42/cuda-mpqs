@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
     
     cudaStream_t stream = 0; // Default stream
 
-    auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_start = std::chrono::steady_clock::now();
 
     size_t current_a_factors_size = siever->getFactoringData().a_factors.size();
 
@@ -282,7 +282,7 @@ int main(int argc, char** argv) {
     post_proc->flush();
     post_proc->retrieveRelations(relations);
 
-    auto t_end = std::chrono::high_resolution_clock::now();
+    auto t_end = std::chrono::steady_clock::now();
     double duration = std::chrono::duration<double>(t_end - t_start).count();
 
     LOG(LOG_INFO) << "[SieveBench] Sieving Loop finished after " << steps << " steps in " << duration << " seconds.";

@@ -4,11 +4,22 @@ In-tree flattened folder (demoted from a former Git submodule in Stage A — onl
 
 Large prime (LP) support is orthogonal to pipeline selection — both legacy and batch modes support LP when the orchestrator sets a threshold override via `setThresholdOverride()`.
 
-The batch sieve-and-scan kernel additionally exists in three **accumulator widths** (legacy uint8, wide uint16, wide saturating-uint8) — the RSA-155 dual-path fork; see *Dual-Path Sieve Accumulator* below. The legacy uint8 kernels are byte-for-byte untouched by the fork (enforced by a source byte-identity check in the development tree).
+The batch sieve-and-scan kernel additionally exists in three **accumulator widths** (legacy uint8, wide uint16, wide saturating-uint8) — the RSA-155 dual-path fork; see *Dual-Path Sieve Accumulator* below. The legacy uint8 kernels were byte-for-byte untouched by the fork (enforced by a source byte-identity check in the development tree). ⚠ **v1.0.7 deliberately modifies the two narrow GATHER kernels** (small-prime mask, backward-sieve restructure), so that byte-identity check fails against any pre-v1.0.7 baseline by design and must be re-anchored at v1.0.7; the wide kernels remain untouched.
 
 Namespaces: `mpqs::sieve` (all sieving structures and kernels), `mpqs::postprocessing` (DoubleBuffer).
 
-**Current as of v1.0.6 (2026-08-25).** Across the whole of v1.0.6 `src/sieve/kernel.cu` has an
+**Current as of v1.0.7 (2026-09-18).** Unlike v1.0.6, v1.0.7 **does change `kernel.cu`** — but
+only the two **narrow** GATHER kernels, `sieveAndScanKernel` (legacy) and `sieveAndScanBatchKernel`
+(batch); the SCATTER kernels and both wide kernels (`...Wide`, `...WideU8Sat`) are untouched, so the
+RSA-150/155 production path (wide/u8sat) is unaffected by construction. v1.0.7 adds, **always on**
+for both narrow GATHER kernels, the small-prime log mask and a restructured backward sieve; and, as
+**opt-in** features, the 11-field `--params11` pin, the tuning-complex parameter search
+(`--param_test`, the old grid search renamed `--param_test_legacy`) and `--sieve_offsets_global`. It
+also tightens `validateConfigs()` (band ordering, exact coverage, launch-true GATHER shared memory).
+See *v1.0.7 — Small-Prime Mask, Backward Sieve, `--params11` and the Parameter Search* below; the
+v1.0.6 paragraph that follows is kept as the record of that release.
+
+**v1.0.6 (2026-08-25).** Across the whole of v1.0.6 `src/sieve/kernel.cu` has an
 **empty diff** — every change landed in `device_sieving_controller.{h,cpp}`, `sieve_memory_model.h`
 and one `kernel.cuh` declaration. The extension of CUDA-graph capture to post-processing and solo LP
 touched **no file in this module at all**; the graph is assembled by the orchestrator out of the
@@ -25,7 +36,8 @@ change observed relation counts — see the notes below before scoring an A/B.
 
 | File | Purpose |
 |------|---------|
-| `kernel.cu` / `kernel.cuh` | All CUDA kernels (legacy + batch variants + the wide/u8sat accumulator forks), device math helpers, polynomial/root helpers, host launch wrappers. **`kernel.cu` has an EMPTY diff across the whole of v1.0.6**; the only v1.0.6 change here is a `kernel.cuh` *declaration* of `globalMetaSieveBatchKernel` (`kernel.cuh:24-33`) so the host controller can pass its address to `cudaOccupancyMaxActiveBlocksPerMultiprocessor` for the v1.0.6 narrow-batch occupancy preflight — the definition is untouched |
+| `kernel.cu` / `kernel.cuh` | All CUDA kernels (legacy + batch variants + the wide/u8sat accumulator forks), device math helpers, polynomial/root helpers, host launch wrappers. v1.0.6 left `kernel.cu` untouched (its only change was a `kernel.cuh` *declaration* of `globalMetaSieveBatchKernel` for the occupancy preflight). **v1.0.7 changes the two narrow GATHER kernels only** — mask initialisation, the restructured backward sieve, the `recordBackwardFactor()` helper (`kernel.cu:133`) and the optional global-memory offsets slice — plus `loadSievingData` / `loadSievingDataParamTest` (allocate `dev_sieveOffsets`) and a host-side GATHER launch-error check in `runSievingBatch` (`kernel.cu:2879`) |
+| `dynamicMask.cuh` | **v1.0.7.** Small-prime log mask: `generateMask()` (host; builds the periodic mask and the CRT basis, uploads both) and `findMaskOffsets()` (device; the per-sieving-block phase of the mask for each of the two root classes). See the v1.0.7 section |
 | `sieving_data_structs.h` | All data structures: primes, candidates, contexts, configs, `gpuInfo`, `DoubleBuffer`; `MAX_SHC_DIM` |
 | `sieve_memory_model.h` | Single source-of-truth device-memory model: `sieveBucketBudget()` (`kSieveBudgetNum/Den` = 4/5 = 0.80·VRAM), `estimateSieveFootprint()`, `reduceNumPolysToBudget()`, `clampWideNumPolys()`/`kWideNumPolysCap` = 512 — mirrors the ten `cudaMalloc` calls in `kernel.cu` (loadSievingData), computed in 64-bit (fixes the 32-bit product wrap that OOMed M=262K/RSA-140). **v1.0.6** also puts the header-only narrow-batch geometry predicates here — `narrowBatchCoverageOk()`, `admissibleSieveBlockSize()`, `admissibleBigPrimeStart()` — so the CLI, `validateConfigs()` and the `sieve_geometry_overrides` unit test share exactly one statement of each rule |
 | `device_sieving_controller.h` / `.cpp` | Main API class: initialization, execution, batch orchestration, config loaders, accumulator-width dispatch, autotune probe harness, state management, snapshot / cluster hooks |
@@ -197,7 +209,7 @@ The root helpers take the decoupled B-value array explicitly (post struct-bloat 
 | `modAdd(a, b, m)` | (a + b) mod m, safe for a,b < m |
 | `modSub(a, b, m)` | (a − b) mod m, safe for unsigned a,b < m |
 | `modSub_shifted(a, b, m)` | Returns result in [1, m] for computing positive sieve offsets |
-| `modSum(a, b, m)` | (a + b) mod m where b is signed (|b| < m) — used for Gray code root updates |
+| `modSum(a, b, m)` | (a + b) mod m where b is signed (\|b\| < m) — used for Gray code root updates |
 | `log2(a)` | Floor log₂ via `clz32` |
 | `align_up_to_hit(x, bound, p)` | Smallest y ≥ bound with y ≡ x (mod p) |
 | `atomicByteAdd(array, idx, x)` | Byte-granularity atomic add via 32-bit word atomics (also as `ATOMIC_BYTE_ADD` / `ATOMIC_BYTE_ADD_RETURN` macros, `kernel.cu:42-46`) |
@@ -221,9 +233,9 @@ Additionally, **`markInactivePrimesKernel`** sets `primeDataSIQS.inactive = 1` f
 
 The kernel operates in two phases per sieve block:
 
-**Forward sieve phase:**
-- Initializes a shared-memory byte array (`blockEntries`) to zero.
-- Small primes (index < `midPrimeStartIndex`): cooperative sieve via direct shared-memory adds, one prime at a time with full-block synchronization.
+**Forward sieve phase** (v1.0.7 layout; identical in the batch kernel):
+- **Mask primes** (index < `smallPrimesUsed`): the shared byte array (`blockEntries`) is no longer zeroed — it is initialised, one 32-bit word per thread iteration, from the precomputed periodic small-prime log mask (sum of the two root-class phases returned by `findMaskOffsets()`), after which these primes' offsets are advanced past the block end. See the v1.0.7 section.
+- Small primes (`smallPrimesUsed` ≤ index < `midPrimeStartIndex`): walked in **32-lane groups** — lane `threadIdx.x % 32` strides a prime's progression by `32·p`, and the block works on `blockDim/32` primes at once — accumulating with `ATOMIC_BYTE_ADD` and **no per-prime barriers** (≤ v1.0.6: one prime at a time across the whole block, plain adds, a `__syncthreads()` per prime).
 - Mid-range primes (`midPrimeStartIndex` ≤ index < `bigPrimeStartIndex`): each thread handles its own prime via `ATOMIC_BYTE_ADD` (no inter-thread sync needed — disjoint access).
 - Large primes (index ≥ `bigPrimeStartIndex`): applied from pre-computed global buckets filled by `globalMetaSieveKernel`.
 
@@ -235,8 +247,10 @@ This kernel family is referred to as the **GATHER** kernel in tuning reports (it
 - Writes `candidateRelation` records (b, poly_id, sieve_offset, num_factors=0) for qualifying positions.
 - **Overflow-safe clamping**: a candidate whose reserved slot `>= maxPerBlock` is dropped and its `blockEntries[index]` is reset to 0, preventing the backward scan from reading uninitialized `indexToCandidate`. The returned count is clamped so `candidatesFound` never grows past the per-block buffer limit `maxPerBlock`.
 
-**Backward trial division phase:**
-- For each active prime, walks backward through the sieve offsets. At positions flagged as candidates, records the prime's factor base index into `candidateRelation.factors[]` using `ATOMIC_BYTE_ADD_RETURN` for index allocation.
+**Backward trial division phase** (v1.0.7 restructure; recording is `recordBackwardFactor()`, which uses `ATOMIC_BYTE_ADD_RETURN` on `blockEntries` as the per-candidate slot allocator):
+- Mask primes (index < `smallPrimesUsed`): **candidate-driven** — the block strides over `newCandidates × smallPrimesUsed` (candidate, prime) pairs and records `p` iff `(offset_{1,2}[i] − x) mod p == 0`. Walking these primes' residue classes costs `2·SB/p` probes to service a handful of candidates; the direct test costs `2·nCandidates`.
+- `smallPrimesUsed` ≤ index < `midPrimeStartIndex`: walked backward in the same 32-lane groups as the forward pass, **without** the two per-prime barriers ≤ v1.0.6 carried (the pass only reads offsets/primes and slot allocation is atomic).
+- `midPrimeStartIndex` ≤ index < `bigPrimeStartIndex`: unchanged (one prime per thread).
 - Large-prime bucket entries are similarly scanned for factor extraction (prime index stored in upper 32 bits of the 64-bit bucket entry).
 
 ### globalMetaSieveKernel Nested-Loop Control Flow
@@ -261,15 +275,15 @@ Per-block shared-memory budget is taken from `prop.sharedMemPerBlockOptin - 1024
 
 ## Dual-Path Sieve Accumulator (uint8 / uint16 / saturating-uint8)
 
-At RSA-150/155 scale a full smooth accumulates `log₂|Q/a| − δ ≈ 258–274` in the forward-sieve accumulator; the legacy `uint8` `blockEntries` caps at 255 and **wraps**, silently rejecting ~98–99.5 % of full smooths (RSA-140's ~250 stays under the cap — unaffected). The fix is a dual-path fork; **the legacy kernels are byte-for-byte untouched** (enforced by a source byte-identity check in the development tree).
+At RSA-150/155 scale a full smooth accumulates `log₂|Q/a| − δ ≈ 258–274` in the forward-sieve accumulator; the legacy `uint8` `blockEntries` caps at 255 and **wraps**, silently rejecting ~98–99.5 % of full smooths (RSA-140's ~250 stays under the cap — unaffected). The fix is a dual-path fork; **the fork left the legacy kernels byte-for-byte untouched** (enforced by a source byte-identity check in the development tree; v1.0.7 later changed the narrow GATHER kernels on purpose — see the v1.0.7 section).
 
 **Kernels** (all batch-mode; there is no non-batch wide kernel):
 
 | Kernel | Accumulator | Notes |
 |--------|-------------|-------|
-| `sieveAndScanBatchKernel` (`kernel.cu:1129`) | `uint8`, wrapping | Legacy narrow path; carries all validated ≤RSA-140 records |
-| `sieveAndScanBatchKernelWide` (`kernel.cu:1440`) | `uint16` via `ATOMIC_HALF_ADD*` | Near-verbatim width-only fork (+ `excludeNonRelationsWide`); doubles the `blockEntries` shared-memory footprint, halving SB |
-| `sieveAndScanBatchKernelWideU8Sat` (`kernel.cu:1754`) | `uint8`, **saturating** at 255 | Copy of the narrow kernel whose five forward-accumulation sites saturate (via `atomicByteAddSat` on contended paths, clamped store on the single-owner mid-prime path); restores SB to narrow's full width |
+| `sieveAndScanBatchKernel` (`kernel.cu:1224`) | `uint8`, wrapping | Legacy narrow path; carries all validated ≤RSA-140 records. v1.0.7: small-prime mask + restructured backward sieve |
+| `sieveAndScanBatchKernelWide` (`kernel.cu:1584`) | `uint16` via `ATOMIC_HALF_ADD*` | Near-verbatim width-only fork (+ `excludeNonRelationsWide`); doubles the `blockEntries` shared-memory footprint, halving SB |
+| `sieveAndScanBatchKernelWideU8Sat` (`kernel.cu:1898`) | `uint8`, **saturating** at 255 | Copy of the narrow kernel whose five forward-accumulation sites saturate (via `atomicByteAddSat` on contended paths, clamped store on the single-owner mid-prime path); restores SB to narrow's full width |
 
 **Host dispatch** (`DeviceSievingController::initiate()`):
 - `use_wide_accumulator_` — computed from an exact 3-point evaluation of `approxPolyVal` at x ∈ {−M, 0, M−1} (mirroring the device arithmetic): `use_wide = (APV_max + WIDE_MARGIN) >= 256` with `WIDE_MARGIN = 4` (`device_sieving_controller.cpp:119-132`). Auto: uint16-family for RSA-150/155, uint8 for ≤RSA-140. CLI override `--sieve_accumulator {auto|u8|u16}` (`setAccumulatorMode`).
@@ -279,15 +293,15 @@ At RSA-150/155 scale a full smooth accumulates `log₂|Q/a| − δ ≈ 258–274
 
 ## Standard Config Geometry (`loadStandardConfig`)
 
-`loadStandardConfig()` (`device_sieving_controller.cpp:1245`) derives the no-autotune/no-history geometry. Narrow-path values are byte-for-byte the historical ones; every wide deviation is gated on `use_wide_accumulator_`:
+`loadStandardConfig()` (`device_sieving_controller.cpp:1873`) derives the no-autotune/no-history geometry. Narrow-path values are byte-for-byte the historical ones; every wide deviation is gated on `use_wide_accumulator_`:
 
 - **`sievingBlockSize` (SB):** narrow `pow2leq(3/4·maxShared)`; wide `pow2leq((3/4·maxShared − 3·1024·4)/accumElemBytes())` — the uint16 accumulator budget quarters SB vs narrow (2 bytes/entry + the reserved bigPrime floor), a structural throughput cost the autotune cannot touch; u8sat restores the 1-byte width.
 - **`globalBucketSize` = SB/2** (legacy exact) unless the ablation knob `--bucket_size_factor <F>` is set, in which case `computeGlobalBucketSize()` returns `round(F·SB)` in both config loaders (F=0.5 reproduces legacy; F=1.0 doubles the bucket). The resized bucket is charged against the VRAM budget before allocation, so an over-large factor degrades `num_polysPerSieveCall` or is validator-rejected — never an OOM.
-- **`bigPrimeStartIndex`:** wide `SB/32` (mirrors the tuned custom-path split); narrow keeps exactly 1024. `midPrimeStartIndex` = 32. (The `bigPrimeStart=SB/32` + `num_polys≤512` pair is the wide-path default-geometry fix that recovered 18× on H100.)
+- **`bigPrimeStartIndex`:** wide `SB/32` (mirrors the tuned custom-path split); narrow keeps exactly 1024. `midPrimeStartIndex` = 32 (`:1940`) — ⚠ **still 32 in v1.0.7**, whereas `loadPartialCustomConfig` (the `--params` / autotune / history path, `:2241`) and `loadPartialCustomConfigDynamic` (`--params11`, `:2452`) use 96, so a bare or `loadStandardConfig`-seeded run gets the mask with a narrower small-prime walk band than a pinned run. (The `bigPrimeStart=SB/32` + `num_polys≤512` pair is the wide-path default-geometry fix that recovered 18× on H100.)
 - **`num_polysPerSieveCall`:** seed `min(32768, 2^(shc_dim−1))`, wide-clamped to ≤ 512, then reduced by `reduceNumPolysToBudget()` until the bucket buffer (`num_polys · num_sievingBlocks · globalBucketSize · 8` B, computed in 64-bit — see `sieve_memory_model.h`) fits `0.80·totalGlobalMem`; `num_subCubes` absorbs the change so total polys sieved is unaffected. An optional autotune OOM-guard knob (`setMaxTotalSieveBytes`, default off) further halves the seed until the *entire* footprint (`estimateSieveFootprint().total()`) fits.
 - **Meta-sieve (SCATTER) grid:** wide `2·pow2geq(multiProcessorCount)` (SM-aware — the hardcoded 64-block grid left an A100 at 12.5 % occupancy, 1.4–1.9× SCATTER win); narrow keeps exactly 64.
 - **Wide-path `num_polys ≥ num_threadBlocks` validation floor — CLAMPED (shipped, `c1e49ac`, not an OOM).** The meta-sieve SCATTER grid `num_threadBlocks = 2·pow2geq(SMs)` is **512 on H100 (132 SMs), 256 on A100 (108 SMs)** and is fixed independent of `M`. Historically the config validator (`device_sieving_controller.cpp`, the `LEQ_CHECK`/`EQUAL_CHECK` block now at `:2105-2107`) required `num_polysPerSieveCall ≥ num_threadBlocks` (and `num_polyBlocksPerThreadBlock = num_polys/num_threadBlocks` to be a nonzero power of two), so when a large `M` drove `reduceNumPolysToBudget()` to degrade `num_polys` **below** that grid width the pipeline **aborted with a config-validation error before any sieve memory was allocated** — it was *not* an OOM and *not* a VRAM ceiling (VRAM could be almost entirely free at the abort). This is exactly why the H100 M-ladder's M=8M/bf2.0 leg (job 1986430) aborted: np degraded 512→256 < the H100 grid's 512. **The floor is now clamped away** (`device_sieving_controller.cpp:1461`, wide-gated on `use_wide_accumulator_`): `if (use_wide_accumulator_) gms_conf.num_threadBlocks = std::min(gms_conf.num_threadBlocks, gs_conf.num_polysPerSieveCall);`, applied after the two np-budget reductions and before the `polyBlockSize` loop — every SM-derived block that still owns a poly is kept and the pow2/product/LEQ checks pass (the min of two powers of two is a power of two). The narrow (uint8, ≤RSA-140) path keeps its exact grid (64), byte-for-byte unchanged. **np-retention closed form** (still the relevant sizing guide — a degraded np now means fewer active SCATTER blocks and thus a *slower* run rather than an abort): with `bucket_bytes = 16·num_polys·bf·M` (SB cancels), `num_polys=512` is retained iff `16·512·bf·M ≤ 0.8·VRAM_total`, i.e. **`bf·M ≤ 9.76×10⁶` on H100** and **`bf·M ≤ 4.14×10⁶` on A100**. **Outcome since the clamp shipped:** M=16M (H100, np=256) was measured against M=8M (np=512) at F=300M and F=400M and lost on both rungs (−13.3%/−2.6% fulls/s respectively) — the np-halving penalty outweighs the M-doubling gain; the M-axis is closed at M=8M on H100 (2026-07-12 RSA-155 H100 M=16M analysis). Do not pursue M=32M.
-- **GATHER launch:** `ss_conf.num_threadsPerBlock = 256`, `num_threadBlocks = min(256, num_polysPerSieveCall)`, `sharedMemReq = SB·accumElemBytes() + 3·bigPrimeStartIndex·4`.
+- **GATHER launch:** `ss_conf.num_threadsPerBlock = 256`, `num_threadBlocks = min(256, num_polysPerSieveCall)`, `sharedMemReq = SB·accumElemBytes() + 3·bigPrimeStartIndex·4` (v1.0.7: the second term is dropped under `--sieve_offsets_global`, narrow only).
 - **Ablation knobs** (both loaders, all default-off/byte-identical): `--sieve_meta_cycle_cap <N>` caps `num_activeBlocksPerCycle` at `min(pow2_floor(N), derived)` and raises `num_metaSieveCycles` correspondingly (SCATTER write-locality experiment; net-negative as a speedup — see loop-nesting note above); `--sieve_gather_block_dim <N>` overrides the GATHER blockDim (result-invariant: the shared accumulator is sized per sieving-block, not per-thread, and every work loop strides by `blockDim.x`).
 
 ## SM-Aligned Launch Geometry (v1.0.6 — narrow BATCH only, `--params`-gated)
@@ -430,7 +444,7 @@ loudly at the CLI (`tests/cuda-mpqs.cpp`, the "cross-flag guards" block) and sco
 | Flag | Config field | Default | Admissible | Effect |
 |------|--------------|---------|------------|--------|
 | `--sieve_block_size <N>` | `sieve_block_size` (u32) | `0` = off | `0`, or a **power of two ≥ 256**; additionally `≤ M` and within the shared-memory sum (both enforced downstream) | Replaces the `gs_conf.sievingBlockSize` derivation `min(M, pow2leq(¾·maxSharedMemPerBlock))` **inside `loadPartialCustomConfig` only** (`:1560-1561`). Applied at the derivation site, so `log2_sievingBlockSize`, `computeGlobalBucketSize(SB)` and `ss_conf.sharedMemReq` all follow automatically |
-| `--sieve_big_prime_start <N>` | `sieve_big_prime_start` (u32) | `0` = off | `0`, or **strictly > 32** (= `midPrimeStartIndex`); **power of two NOT required**; additionally `≤ fb_size` | Replaces `gs_conf.bigPrimeStartIndex = sievingBlockSize/32` (`:1609-1610`). Cancels the unconditional SB↔bPSI coupling, so an SB override does not *also* silently migrate ~1024 factor-base primes from GATHER's in-block path onto SCATTER's bucketed path |
+| `--sieve_big_prime_start <N>` | `sieve_big_prime_start` (u32) | `0` = off | `0`, or **strictly > 32** at the CLI; ⚠ **since v1.0.7 effectively `≥ midPrimeStartIndex` = 96** on this (`loadPartialCustomConfig`) path — `validateConfigs()` now rejects `midPrimeStartIndex > bigPrimeStartIndex` loudly, so 33…95 parse and then abort pre-sieve; **power of two NOT required**; additionally `≤ fb_size` | Replaces `gs_conf.bigPrimeStartIndex = sievingBlockSize/32` (`:1609-1610`). Cancels the unconditional SB↔bPSI coupling, so an SB override does not *also* silently migrate ~1024 factor-base primes from GATHER's in-block path onto SCATTER's bucketed path |
 | `--sieve_bucket_overflow_stats` | `sieve_bucket_overflow_stats` (bool) | `false` = off | boolean, no argument | Diagnostic only. Relaxes the previously wide-only host reader `getBucketOverflowStats()` so the **narrow** path also emits `[BucketOverflow]` |
 
 **Admissible-set rationale** (`sieve_memory_model.h`, shared with the unit test):
@@ -444,6 +458,13 @@ arithmetic. The bounds that depend on run-time quantities unknown at parse time 
 `N ≤ fb_size`, and the sum `SB·accumElemBytes + 3·bPSI·4 + shc_dim·64 ≤ maxSharedMemPerBlock`) are
 deliberately **not** checked at the CLI; they are enforced by `validateConfigs`' `LEQ_CHECK` on
 `ss_conf.sharedMemReq` and by the narrow-batch occupancy preflight.
+
+⚠ **v1.0.7: the "> 32" rationale above is stale.** `loadPartialCustomConfig` now sets
+`midPrimeStartIndex = 96`, and the CLI predicate `admissibleBigPrimeStart()` (`sieve_memory_model.h`)
+and the loader comment still say "> 32". The *silent* inversion is nevertheless closed: v1.0.7's
+band-ordering invariant in `validateConfigs()` (`:2792`) rejects `midPrimeStartIndex >
+bigPrimeStartIndex` (and `smallPrimesUsed > midPrimeStartIndex`) with `LOG_ERROR_CRITICAL`, so an
+out-of-band value fails loudly before sieving — just later than at parse time.
 
 ### Coverage invariant — a silent half-sieve that was latent in every binary up to and including v1.0.5
 
@@ -487,7 +508,21 @@ off by default), so this remains a source-and-arithmetic finding, not a live rep
 complementary half was confirmed live, in that the documented `rec` tuple lands exactly on `2M` on
 3/3 reps.
 
-⚠ **Deliberate behaviour change.** Configurations on smaller-shared-memory devices (Turing-class,
+⚠ **v1.0.7 tightens this to EQUALITY on both narrow paths.** `validateConfigs()` (`:2800`) now
+requires `numIntervals × SB == 2M` exactly, in uint64, whenever the path is narrow — **batch and
+legacy alike** (the batch-only gate is gone), and names the required `numIntervals = 2M/SB`.
+Over-coverage is now rejected too: it sieves past `[−M, M)`, which is cheap per position and nearly
+barren, so a timing probe (the parameter search in particular) would otherwise be walked into it.
+Under-coverage on the *legacy* path (which does advance `startIndex` and would cover `2M` over
+several launches) is rejected because the per-call work would be a config-dependent fraction of the
+interval. ⚠ Consequences: (a) the "`≥`, not `==`" paragraph above describes v1.0.6 only; (b) the
+autotune M-sweep's over-covering probes and legacy-path probes with `intervals × SB < 2M` — both
+legal in v1.0.6 — are now rejected (they surface as failed/skipped probes, not as errors); (c)
+`narrowBatchCoverageOk()` (`sieve_memory_model.h`, `≥`) no longer governs production — it survives
+only in the `sieve_geometry_overrides` unit test and in comments. The wide path is unaffected (it
+derives `numIntervals = 2M/SB` itself).
+
+⚠ **Deliberate behaviour change (v1.0.6).** Configurations on smaller-shared-memory devices (Turing-class,
 Jetson) that are half-sieving *today, silently* now fail **loudly**. The escape is `numIntervals` =
 `--params` field 2. **Whenever `SB` changes, `numIntervals` must change with it so that
 `numIntervals × SB ≥ 2M`.**
@@ -667,6 +702,140 @@ itself is unexplained. The **legacy** path is not a bit-identity arm at all — 
 a batch boundary; its real evidence is source byte-identity, checked directly against the
 previous release's `kernel.cu`.
 
+## v1.0.7 — Small-Prime Mask, Backward Sieve, `--params11` and the Parameter Search
+
+Scope: the two **narrow** GATHER kernels and host configuration. The wide kernels, the SCATTER
+kernels and the whole RSA-150/155 production path (wide/u8sat) are untouched.
+
+### Small-prime log mask (always on, narrow GATHER, legacy and batch)
+
+The smallest factor-base primes cost the most in the forward sieve (`SB/p` hits each) yet their
+contribution to every sieving block is periodic. v1.0.7 precomputes it once
+(`src/sieve/dynamicMask.cuh`, called from `loadData()`):
+
+- **`generateMask()`** (host) takes the longest factor-base prefix `p_0 … p_{k−1}` with
+  `4·∏p_i < 65,536`; `period P = ∏p_i` and `smallPrimesUsed = k`. It builds a `4P`-byte mask (one
+  period viewed as `P` 32-bit words) holding `⌊log₂ p⌋` at every multiple of each `p_i` — the
+  kernel's own log values, so relation sets are unchanged — and the CRT basis
+  `e_i = (P/p_i)·((P/p_i)⁻¹ mod p_i) mod P`. Both go to **global** memory
+  (`dev_smallPrimeMask`, `dev_CRT_baseElements`); no shared memory is used. At RSA-100 / F = 5.5M
+  the mask primes are {3, 5, 13, 19}, `P = 3,705`, 14,820 B.
+- **`findMaskOffsets()`** (device, once per sieving block) computes, for each root class,
+  `shift = Σ e_i·(root_i mod p_i) mod P` — the unique residue mod `P` that is ≡ `root_i` mod every
+  `p_i` — and the word offset of `sieveBlockStart − shift` (adjusted by whole periods to a multiple
+  of 4; `P` is odd, so at most three additions).
+- **Initialisation.** `blockEntries` is filled word-wise with
+  `mask[(o₁+i) mod P] + mask[(o₂+i) mod P]` instead of being zeroed (per byte at most
+  `2·Σ⌊log₂ p_i⌋`, far below 255, so the word add never carries between bytes). The mask primes'
+  offsets are then advanced past the block end, and the forward walk starts at `smallPrimesUsed`.
+- **Backward sieve.** Mask primes are recovered by testing the candidates directly (see
+  *sieveAndScanKernel Detail*); the rest of the small band is walked in 32-lane groups without
+  per-prime barriers.
+- **Band ordering.** `smallPrimesUsed ≤ midPrimeStartIndex ≤ bigPrimeStartIndex` is now a
+  `validateConfigs()` invariant (`:2792`); either inversion aborts loudly. `midPrimeStartIndex` is
+  96 in both custom loaders but still 32 in `loadStandardConfig`.
+
+**Measured (first version of the mask, `cf2264b`, all `cgu 0`, pinned `--params`, product-verified):**
+RTX 5070 Ti RSA-100 at the `rec` tuple −7.76 % sieve / −6.02 % Total; H100 at the pin −14.1 % sieve,
+board energy −6.79 %; A100 at the pin (coverage-exact `M = 262,144`) −21.3 % sieve, board energy
+−11.23 %. ⚠ These predate the backward-sieve restructure and the application of the mask to the
+legacy kernel (`10e7e1d`, `4624166`); the released kernel has not been re-measured on the cluster
+GPUs. On H100 the halved `s3h` geometry reverses sign under the mask (+4.13 % wall); do not pursue it.
+
+### `--params11` and `loadPartialCustomConfigDynamic()`
+
+`--params11 <np,numIntervals,polyBlockSize,blocksPerCycle,metaGridDim,metaBlockDim,sasGridDim,sasBlockDim,SB,bPSI,midPS>`
+— the first eight fields are exactly `--params`, the last three are `sievingBlockSize`,
+`bigPrimeStartIndex` and `midPrimeStartIndex` (`enum SieveParam`, `device_sieving_controller.h`).
+All 11 values must be given; a **0 means "unset"** and keeps the loader's derivation:
+
+| Field | Derivation when 0 |
+|---|---|
+| `SB` | narrow `min(M, pow2leq(¾·maxSharedMemPerBlock))`; wide as in `loadPartialCustomConfig` |
+| `numIntervals` | `2M / SB` (the coverage invariant) |
+| `blocksPerCycle` | `= numIntervals` (one meta-sieve cycle) |
+| `bPSI` | `SB / 32` |
+| `midPS` | 96 |
+| `np`, `pbs`, `metaGridDim`, `metaBlockDim`, `sasGridDim`, `sasBlockDim` | ⚠ **no derivation** — the loader keeps whatever the config structs already hold; pass these explicitly |
+
+`globalBucketSize` is sized to the **predicted peak** bucket occupancy unless
+`--bucket_size_factor` pins it: `μ = 2·SB·Σ_{i ≥ bPSI} 1/p_i` (`expectedBucketEntries()`), peak
+`μ + z·√μ` with `z = √(2 ln(np·numIntervals))`, rounded up to a multiple of 32
+(`autoGlobalBucketSize()`, `:2394`). The bucket therefore grows with a lower `bPSI` and shrinks with
+a higher one; whether it fits is decided by the VRAM check in `validateConfigs()`. That check also
+**warns** (`Bucket UNDERSIZED`, every loader) when `globalBucketSize` is below the predicted peak.
+
+`--params11` is consumed by `SieveStage()` and `TruncatedSieveRun()` in the same `else if` as
+`--params` and wins when both are set. ⚠ It does **not** get the `--params`-only safeguards: the
+`preflightKernelLaunch()` check, the LP `sasGridDim` floor and the legacy `sasBlockDim ≤ 1024` cap are
+all keyed on `useParams`; and the small-N adaptive branch (`max_polys < 64`) runs ahead of it. The
+v1.0.6 `--sieve_block_size` / `--sieve_big_prime_start` overrides are not consumed by this loader
+(and the CLI rejects them without `--params`); use fields 9–10 instead.
+
+⚠ **`--params11` is NOT narrow-gated, and on wide it is an UNGUARDED second door.** No `useParams11`
+site tests `use_wide_accumulator_` (`orchestrator.cpp:4283`/`:4312`, `:6471`), and this loader's wide
+branches (`:2436`, `:2447`, `:2461`, `:2524`) resolve a usable wide configuration — so a wide tuple is
+neither rejected nor ignored. But `set(P_SIEVING_BLOCK_SIZE, …)` (`:2444`) and `set(P_BIG_PRIME_START, …)`
+(`:2450`) are **ungated**, so fields 9–10 reach `SB`/`bPSI` on the wide path, bypassing the
+`validateConfigs:2774-2782` scope rejection that `--sieve_block_size` / `--sieve_big_prime_start` are
+given there — a rejection whose stated reason is that wide's `SB` comes from a different budget solve
+and its bucket VRAM rides the RSA-150/155 retention boundary. The `== 2M` coverage check is likewise
+`!use_wide_accumulator_`-gated, so a wide tuple pinning `numIntervals` (field 2, `set()` at `:2472`)
+inconsistently with `SB` is checked by **nothing**. **No wide `--params11` run exists on record** —
+treat it as unvalidated and do not use it at RSA-150/155 until it is guarded or measured.
+
+### `--sieve_offsets_global` (default off, narrow only)
+
+Moves the GATHER `offsets1/offsets2/primes` arrays (`3·bPSI·4` B) from shared memory into a
+per-block slice of `dev_sieveOffsets` (stride `gatherOffsetsStride(bPSI)`, 128-B aligned).
+GATHER shared memory drops to `SB` (+ the batch `B_values`), which decouples `bPSI` from the shared
+budget and can buy a second resident block. The slice is charged against the 0.80·VRAM budget.
+Forced off on the wide path. **Unmeasured as a production setting.**
+
+### `--param_test` — the tuning-complex parameter search (narrow only)
+
+`runParamTest()` (`device_sieving_controller.cpp:864`) replaces the grid search (kept as
+`--param_test_legacy` → `runParamTestLegacy()`). It is seeded from `--params11` if given, otherwise
+from `loadStandardConfig()` with the SCATTER/GATHER grids raised to at least `pow2geq(SMs)`. Nine
+axes are searched — `SB, np, sasGrid, pbs, bPSI, metaGrid, metaBlock, sasBlock, midPS`;
+`numIntervals` and `blocksPerCycle` are not axes (derived from `SB` as above). Ladders: powers of two
+plus SM-derived rungs for the grids and `np` (read from the device, never hardcoded); `bPSI` and
+`midPS` on the lattice `smallPrimesUsed + 32k`, `bPSI` bounded by the shared-memory budget (or by
+`fb_size/2` under `--sieve_offsets_global`).
+
+- **Faces.** Axes that share a constraint are swept together over the full product of their
+  ladders: `occupancy` {SB, bPSI, sasBlock}, `scatter-partition` {np, metaGrid, pbs},
+  `gather-partition` {np, sasGrid}, `scatter-waves` {metaGrid, metaBlock}, `gather-waves`
+  {sasGrid, sasBlock}, `big-prime-split` {bPSI}, `mid-prime-split` {midPS}.
+  `--param_test_radius R` (default 3, must be ≥ 1) is the **maximum face dimension** swept, not a
+  distance.
+- **Scoring.** Each probe is `sieveMini()` over ≤ 2 subcubes through the **legacy** kernel (a
+  deliberate design decision: the legacy kernel is cheap to probe and has so far proven representative
+  of the batch kernels' optimal launch parameters, which the production run then uses), after one
+  untimed warm-up step, normalised to µs per poly-position. Candidates are scored relative to the
+  incumbent re-probed every 25 candidates; a face winner must beat the incumbent by ≥ 0.5 % in an
+  alternating two-rep duel to be adopted. Cycles repeat (≤ 64) until no face improves, then one
+  single-axis descent over full ladders runs; the log ends with the chain gain, the machine drift
+  (seed re-probed) and the winner as a `--params11` line.
+- **Pruned before launch:** grids below the SM count, more than one meta-sieve cycle, more than 2
+  sieve calls per hypercube, and tuples whose **batch** GATHER footprint (with `B_values`) would not
+  fit shared memory. Inadmissible tuples are rejected by `validateConfigsSilent()`; a tuple that
+  fails at launch is rejected via `cudaGetLastError()`.
+- **Output and exit.** The winner is printed, not applied: the process ends with `exit(0)` inside the
+  sieve stage (an unusable seed ends with `exit(1)` after a loud `validateConfigs()`). On the wide
+  path it logs an error and returns. Because the probe runs the legacy kernel while the output is
+  meant for a batch run, the recommended tuple should be confirmed with a timed batch run.
+
+### Validation changes (all paths unless noted)
+
+- **Coverage** is an equality `numIntervals × SB == 2M` on both narrow paths (see the coverage
+  section above).
+- **GATHER shared memory** is checked as launched: `sharedMemReq + shc_dim·64 B` on the batch path
+  (the `B_values` term was missing, so a pow2 tuple could pass validation and then fail to launch).
+- **Launch failures are visible:** `runSievingBatch` checks `cudaGetLastError()` after the GATHER
+  launch and logs `[Sieve] GATHER launch FAILED` at `LOG_ERROR_CRITICAL` (host-side, no sync). It
+  does not abort.
+
 ## Batch Sieving (GPU-Only Mode)
 
 Selected when `sieve_batch_size > 0`. Eliminates CPU-GPU synchronization in the inner loop by pre-uploading K polynomial configurations and running all steps on-device:
@@ -693,7 +862,7 @@ One block per batch step (64 threads). Computes a = ∏ p_k via a **variable-dep
 
 Annotated with **`__launch_bounds__(1024)`** (same as the legacy variant) to cap register allocation and ensure reliable launches at high thread counts. Structurally identical to `sieveAndScanKernel` with two key differences:
 
-- **B_values in shared memory**: loads the current step's B-components from the pre-uploaded `batch_B_flat` array into shared memory (`s_B_values`) for fast Gray code b-construction. The shared memory layout is: `[s_B_values | offsets1 | offsets2 | primes | blockEntries]`.
+- **B_values in shared memory**: loads the current step's B-components from the pre-uploaded `batch_B_flat` array into shared memory (`s_B_values`) for fast Gray code b-construction. The shared memory layout is: `[s_B_values | offsets1 | offsets2 | primes | blockEntries]` (v1.0.7 under `--sieve_offsets_global`: `[s_B_values | blockEntries]`, the three int arrays living in the block's `dev_sieveOffsets` slice).
 - **Per-block relation counts**: writes `candidatesFound` to `dev_blockRelationCounts[blockIdx.x]` at kernel exit, enabling `compactCandidatesBatchKernel` to skip empty blocks.
 
 ### compactCandidatesBatchKernel Detail
@@ -721,9 +890,10 @@ Overflow guard: if `pos >= max_capacity`, the thread returns without writing.
 | Method | Description |
 |--------|-------------|
 | `initiate(factoringData&)` | Copy factoring parameters, compute `fixedSievingParams`, resolve the accumulator-width dispatch (`use_wide_accumulator_`, `wide_u8sat_selected_`) — requires `f_data.a` finalized (`recalc_a` before `initiate`) |
-| `loadData()` | Upload factor base, roots, and a-factors to GPU |
+| `loadData()` | Upload factor base, roots, and a-factors to GPU; **v1.0.7:** also builds and uploads the small-prime mask (`generateMask()`, `device_sieving_controller.cpp:346`) and sets `fs_params.period` / `smallPrimesUsed` — on every path, including wide, whose kernels do not read it |
 | `loadStandardConfig()` | Derive the default kernel launch configs (see *Standard Config Geometry*) |
-| `loadPartialCustomConfig(totalPolys, totalIntervals, polyBlockSize, blocksPerCycle, metaB, metaT, sasB, sasT)` | Load a tuned 8-parameter (`Params8`) tuple — the autotune / pinned-params / history path |
+| `loadPartialCustomConfig(totalPolys, totalIntervals, polyBlockSize, blocksPerCycle, metaB, metaT, sasB, sasT)` | Load a tuned 8-parameter (`Params8`) tuple — the autotune / pinned-params / history path. v1.0.7: `midPrimeStartIndex = 96` |
+| `loadPartialCustomConfigDynamic(const ParamSet&)` | **v1.0.7**, `--params11` and the parameter search: sparse 11-field loader (`SieveParam` order); a set entry overrides, an unset (0) one keeps the derivation — see the v1.0.7 section |
 | `allocateBatchBuffers()` | Allocate batch job arrays (`dev_job_a_array`, `dev_job_B_flat`, `dev_job_factor_indices`, `dev_blockRelationCounts`) |
 | `updateState()` | Sync `dynamicSievingParams` after an a-coefficient change (call after `loadData()`) |
 | `advance_a(step)` | Advance to the next a coefficient via hypercube walk |
@@ -732,15 +902,17 @@ Overflow guard: if `pos >= max_capacity`, the thread returns without writing.
 
 | Method | Description |
 |--------|-------------|
-| `sieveStep()` | Legacy: run one polynomial through the 3-kernel pipeline |
+| `sieveStep()` | Legacy: run one polynomial through the 3-kernel pipeline. **v1.0.7:** `initPrimeData()` (inverse/B-value derivation, a function of `a` alone) runs only when `ds_params.newCube` is set; `updateState()` now sets `newCube = true` whenever `a` changes, so the derivation is paid once per hypercube instead of once per call |
 | `sieveFullCube()` | Legacy: iterate all Gray code polynomials for the current a |
 | `prepareSievingBatch()` | Batch: advance host state, upload next K polynomial configurations, launch `generatePolynomialsKernel` |
 | `prepareSievingBatchFromStaged(idx, a_out, B_out)` | Graph-capturable prep: launch only `generatePolynomialsKernel` from already-staged device indices (no H2D copy, no host state advance) |
 | `setJobArrays(a, B, factor_idx)` | Redirect the job-array pointers used by `runSievingBatch` to per-batch staged arrays (for CUDA-graph replay) |
 | `runSievingBatch(n, start)` | Batch: execute n polynomial steps on GPU from batch offset `start`. Checks `*external_stop_` (if set) before launching kernels and returns early — host-side only. Passes `use_wide_accumulator_` / `wide_u8sat_selected_` into the kernel dispatch |
-| `runParamTest(factoringData&)` | Exhaustive `Params8` sweep; returns `ParamTestResult {best_params, best_timing_us, configs_tested, json_path}` |
+| `runParamTest(factoringData&, const ParamSet* seed = nullptr, uint32_t radius = 3)` | **v1.0.7**, `--param_test`: tuning-complex parameter search (narrow only), seeded from `--params11` or from `loadStandardConfig()`; logs the winner as a ready-to-paste `--params11` line and **calls `exit(0)`** (seed rejected ⇒ `exit(1)`). See the v1.0.7 section |
+| `runParamTestLegacy(factoringData&)` | `--param_test_legacy` (≤ v1.0.6 `runParamTest`): exhaustive `Params8` sweep; returns `ParamTestResult {best_params, best_timing_us, configs_tested, json_path}` |
 | `evaluateConfig(params, num_subcubes, reload_needed)` | Evaluate one `Params8` tuple (loadPartialCustomConfig + validateConfigs + timed run); −1.0f if infeasible |
 | `validateResults(factoringData&)` | Pull candidates from GPU, validate via CPU trial division |
+| `validateConfigsSilent()` | **v1.0.7**: `validateConfigs()` with every diagnostic suppressed (same verdict) — used per probe by the parameter search |
 
 ### Autotune Probe Harness (wide path)
 
@@ -767,6 +939,7 @@ Overflow guard: if `pos >= max_capacity`, the thread returns without writing.
 | `setBucketSizeFactor(f)` | `--bucket_size_factor`: `globalBucketSize = f·SB` (0.0 = off, legacy SB/2 exactly) |
 | `setSievingBlockSizeOverride(n)` | **v1.0.6**, `--sieve_block_size`: overrides `gs_conf.sievingBlockSize` inside `loadPartialCustomConfig` only. `n = 0` (default) = off, byte-identical on every path; `n > 0` must be a power of two in `[256, M]`. Call before `initiate()`. Ignored on the wide path at the point of use **and** rejected by `validateConfigs()` on wide/legacy |
 | `setBigPrimeStartOverride(n)` | **v1.0.6**, `--sieve_big_prime_start`: overrides `gs_conf.bigPrimeStartIndex` (otherwise `SB/32`) inside `loadPartialCustomConfig` only. `n = 0` (default) = off; `n > 0` must satisfy `32 < n ≤ fb_size`. **Not** required to be a power of two. Call before `initiate()` |
+| `setOffsetsInGlobal(on)` | **v1.0.7**, `--sieve_offsets_global`: moves the GATHER `offsets1/offsets2/primes` arrays from shared memory into a per-block slice of `dev_sieveOffsets` (global). `false` (default) = shared layout. Narrow only — forced off on wide. Call before either loader |
 | `setNarrowOverflowStats(on)` | **v1.0.6**, `--sieve_bucket_overflow_stats`: enables `getBucketOverflowStats()` on the narrow path. `false` (default) = off, byte-identical. Wide behaviour unaffected either way |
 | `setMaxTotalSieveBytes(bytes)` | Autotune OOM-guard cap on the total sieve footprint (0 = off, production default); clamp diagnostic via `getLastSeedClamp()` |
 | `isWideAccumulator()` / `isWideU8Sat()` | Resolved accumulator-width dispatch state (both false on the narrow path) |

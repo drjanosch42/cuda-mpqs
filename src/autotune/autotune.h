@@ -84,7 +84,7 @@ private:
     MPQSConfig&     pipeline_config_;
     mpqs::sieve::factoringData& f_data_;
     AutotuneResult  result_;
-    std::chrono::high_resolution_clock::time_point start_time_;
+    std::chrono::steady_clock::time_point start_time_;
 
     // --- N metadata (computed once in constructor) ---
     HistoryStore history_;

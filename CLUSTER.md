@@ -455,6 +455,17 @@ single-GPU linear-algebra stage), producing two 70-digit prime factors
 (product-verified). Large-prime fraction 56.8%, which cleared the 2-cycle sqrt
 cliff at a 63% per-solution nontrivial-GCD rate.
 
+### Multi-node H100 (RSA-150, 496-bit, factored 2026-08-23)
+
+RSA-150 (496-bit) has been factored end-to-end on the same 16-node × 4 H100 = 64-GPU
+cluster. The cluster sieve ran **295.18 GPU-h / 4.61 h wall**, producing 17,269,643
+relations at a 44.90% large-prime fraction; the linear-algebra stage solved a
+16,700,000 × 15,663,546 GF(2) matrix with 690,586,752 nonzeros in **7.68 GPU-h** on a
+single H100. **Total: 302.86 GPU-h / 107.506 kWh**, yielding two 75-digit prime
+factors (product-verified). The sieve ran the same wide-accumulator configuration as
+RSA-155 (`--bucket_size_factor 1.0`) at `--lp1_bound 200000000000000`, and the
+linear algebra used `--matrix_max_rows 16700000` at Block Wiedemann block width 256.
+
 ### Multi-node H100 (RSA-155, 512-bit, factored 2026-07-14)
 
 RSA-155 (512-bit) has been factored end-to-end — the largest input this pipeline
