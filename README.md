@@ -322,11 +322,12 @@ memory bandwidth.
 If you use cuda-mpqs in academic work, please cite it. A
 [`CITATION.cff`](CITATION.cff) file is provided for citation managers.
 
-The archived releases carry the concept DOI
-[10.5281/zenodo.22902652](https://doi.org/10.5281/zenodo.22902652), which always
-resolves to the latest cuda-mpqs release. Cite it unless you need to pin a
-specific version, in which case use that version's own DOI from the Zenodo
-record.
+Releases are archived on Zenodo. This release, v1.0.8, has the version DOI
+[10.5281/zenodo.23137108](https://doi.org/10.5281/zenodo.23137108); cite it to
+pin the exact code you used. The concept DOI
+[10.5281/zenodo.21619468](https://doi.org/10.5281/zenodo.21619468) always
+resolves to the latest cuda-mpqs release; cite it to refer to the software
+independent of version.
 
 BibTeX:
 
@@ -337,7 +338,7 @@ BibTeX:
              Quadratic Sieve},
   year    = {2026},
   version = {1.0.8},
-  doi     = {10.5281/zenodo.22902652},
+  doi     = {10.5281/zenodo.23137108},
   url     = {https://github.com/drjanosch42/cuda-mpqs},
   license = {LGPL-3.0-only}
 }
