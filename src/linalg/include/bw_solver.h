@@ -202,6 +202,11 @@ struct BWSolverConfig {
     /// Used when stage1_save_S_to_disk is true.
     std::string stage1_S_disk_path = "";
 
+    /// @brief Force the Stage 1 host copy of S (debug override).
+    /// By default the host copy is made only when a consumer needs it: S kept off the
+    /// device, S-to-disk, hashing, or Stage 1 checkpoints. Set true to always make it.
+    bool stage1_force_host_S = false;
+
     /// @brief Stage 1 Hashing.
     /// Computes hashes for X, Y, and S.
     bool stage1_compute_hashes = false;
@@ -247,6 +252,20 @@ struct BWSolverConfig {
     /// @brief GPU Hybrid Mode.
     /// If true, uses experimental GPU offloading for the recursive step.
     bool stage2_gpu_mode = false;
+
+    /// @brief Stage 2 initialization basis on the device.
+    /// If true (and stage2_gpu_mode, m <= 512), the initialization basis (t0, pairs),
+    /// F_init and gamma are computed by a dedicated device kernel directly on the
+    /// device-resident S; only a 16-byte result record returns to the host and S is not
+    /// downloaded. Bit-identical to the CPU routine (see src/lingen/stage2/init_basis.h).
+    /// Set false to use the CPU reference routine (requires a host copy of S).
+    bool stage2_init_on_gpu = true;
+
+    /// @brief Stage 2 initialization cross-check.
+    /// Runs both the device and the CPU initialization and compares t0, rank, the pairs
+    /// (in order), the F_init bytes and gamma; throws on any mismatch. Downloads S.
+    /// Implied by stage2_internal_oracle_verification / enable_all_oracle_verification.
+    bool stage2_init_cross_check = false;
 
     /// @brief Load S sequence from disk instead of receiving from Stage 1.
     /// Useful for resuming Stage 2 independently or debugging.
@@ -512,6 +531,12 @@ struct BWStage1Config {
     /// @brief Disk path for S save.
     std::string S_disk_path = "";
 
+    /// @brief Download S to the host during generation.
+    /// Derived in UpdateStage1Config(): true iff !keep_S_on_device, S-to-disk, hashing,
+    /// Stage 1 checkpoints, or BWSolverConfig::stage1_force_host_S. When false, S exists
+    /// only on the device (d_S_sequence_) and no host vector is allocated.
+    bool host_copy_S = true;
+
     /// @brief Random Seed.
     /// Used to initialize the PRNG for creating random blocks X and Y
     /// if they are not loaded from disk.
@@ -631,6 +656,15 @@ struct BWStage2Config {
     /// and basis updates are offloaded to the GPU, while pivot decisions remain on CPU.
     /// If false, uses the reference CPU-only implementation.
     bool gpu_mode = false;
+
+    /// @brief Compute the initialization basis, F_init and gamma on the device.
+    /// Effective iff gpu_mode && init_on_gpu && init_basis_gpu_supported(m, n);
+    /// otherwise the CPU reference routine runs. Outputs are bit-identical.
+    bool init_on_gpu = true;
+
+    /// @brief Cross-check the device initialization against the CPU reference.
+    /// Compares t0, rank, pairs, F_init and gamma; throws on mismatch.
+    bool init_cross_check = false;
 
     /// @brief Load S from disk instead of receiving from Stage 1.
     bool load_S_from_disk = false;

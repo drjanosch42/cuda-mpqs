@@ -280,6 +280,15 @@ void BlockWiedemannSolver::UpdateStage1Config() {
     stage1_cfg_.hash_X = cfg_.stage1_hash_X;
     stage1_cfg_.hash_Y = cfg_.stage1_hash_Y;
     stage1_cfg_.hash_S = cfg_.stage1_hash_S;
+
+    // 6. Host copy of S: only for a consumer (Stage 2 reads d_S_sequence_ directly; the
+    //    post-run legacy oracle copies D2D from it). Source-3 upload needs hS_ exactly
+    //    when S is not kept on the device.
+    stage1_cfg_.host_copy_S = !stage1_cfg_.keep_S_on_device
+                           || (stage1_cfg_.save_S_to_disk && !stage1_cfg_.S_disk_path.empty())
+                           || stage1_cfg_.compute_hashes
+                           || stage1_cfg_.save_checkpoints
+                           || cfg_.stage1_force_host_S;
 }
 
 void BlockWiedemannSolver::UpdateStage2Config() {
@@ -308,6 +317,11 @@ void BlockWiedemannSolver::UpdateStage2Config() {
     
     // Oracle Override
     stage2_cfg_.internal_oracle_verification = cfg_.enable_all_oracle_verification || cfg_.stage2_internal_oracle_verification;
+
+    // Initialization basis: device path by default; cross-check implied by the oracle.
+    stage2_cfg_.init_on_gpu = cfg_.stage2_init_on_gpu;
+    stage2_cfg_.init_cross_check = cfg_.stage2_init_cross_check
+                                || stage2_cfg_.internal_oracle_verification;
 
     // 4. Hashing & Validation (With Global Overrides)
     stage2_cfg_.compute_hashes = cfg_.enable_all_hashing || cfg_.stage2_compute_hashes;
@@ -635,10 +649,21 @@ void BlockWiedemannSolver::RunStage1() {
     // Generate — swap X↔Z if using alternative operator
     // GPU transpose (if active) happens inside the pipeline; no post-processing needed
     // d_S_target (if non-null) receives D2D copies inside the pipeline
+    {
+        std::string reasons;
+        auto add = [&](bool c, const char* r) { if (c) reasons += (reasons.empty() ? "" : ", ") + std::string(r); };
+        add(!stage1_cfg_.keep_S_on_device, "S not kept on device");
+        add(stage1_cfg_.save_S_to_disk && !stage1_cfg_.S_disk_path.empty(), "S to disk");
+        add(stage1_cfg_.compute_hashes, "hashes");
+        add(stage1_cfg_.save_checkpoints, "checkpoint");
+        add(cfg_.stage1_force_host_S, "forced");
+        LOG(LOG_STATS) << "[BWStage 1] S host copy: "
+                       << (stage1_cfg_.host_copy_S ? "ON (" + reasons + ")" : std::string("OFF (no consumer)"));
+    }
     if (use_alt_op) {
-        krylov.generate(stage1_cfg_.seq_len, hY_, hX_, hS_, stream_, d_S_target);
+        krylov.generate(stage1_cfg_.seq_len, hY_, hX_, hS_, stream_, d_S_target, stage1_cfg_.host_copy_S);
     } else {
-        krylov.generate(stage1_cfg_.seq_len, hX_, hY_, hS_, stream_, d_S_target);
+        krylov.generate(stage1_cfg_.seq_len, hX_, hY_, hS_, stream_, d_S_target, stage1_cfg_.host_copy_S);
     }
     CHECK_SOLVER(cudaStreamSynchronize(stream_));
 
@@ -812,6 +837,10 @@ void BlockWiedemannSolver::RunStage2() {
     // Source 3: Fallback — upload from host (current behavior)
     if (!dS) {
         LOG(LOG_STATS) << "[BWStage 2] Uploading S from host memory";
+        if (hS_.empty()) {
+            throw std::runtime_error("[BWStage 2] No S available: not on device, not on host, "
+                                     "not loaded from disk");
+        }
         size_t s_bytes = hS_.size() * sizeof(uint64_t);
         CHECK_SOLVER(cudaMalloc(&dS, s_bytes));
         CHECK_SOLVER(cudaMemcpyAsync(dS, hS_.data(), s_bytes,
@@ -853,10 +882,20 @@ void BlockWiedemannSolver::RunStage2() {
         LOG_INCREMENT_STAGE(100);
         LOG(LOG_STATS) << "[BWSolver] Running Legacy Oracle Check...";
 
+        // Independent copy of S for the oracle: from the host copy if one exists, else
+        // D2D from the (still alive, freed below) device S of Source 1/2.
         uint64_t* dS_oracle;
-        size_t s_bytes_oracle = hS_.size() * sizeof(uint64_t);
-        CHECK_SOLVER(cudaMalloc(&dS_oracle, s_bytes_oracle));
-        CHECK_SOLVER(cudaMemcpyAsync(dS_oracle, hS_.data(), s_bytes_oracle, cudaMemcpyHostToDevice, stream_));
+        if (!hS_.empty()) {
+            size_t s_bytes_oracle = hS_.size() * sizeof(uint64_t);
+            CHECK_SOLVER(cudaMalloc(&dS_oracle, s_bytes_oracle));
+            CHECK_SOLVER(cudaMemcpyAsync(dS_oracle, hS_.data(), s_bytes_oracle, cudaMemcpyHostToDevice, stream_));
+        } else {
+            size_t s_bytes_oracle = d_S_sequence_bytes_;
+            if (dS != d_S_sequence_ || s_bytes_oracle == 0)
+                throw std::runtime_error("[BWSolver] Legacy oracle: no S source");
+            CHECK_SOLVER(cudaMalloc(&dS_oracle, s_bytes_oracle));
+            CHECK_SOLVER(cudaMemcpyAsync(dS_oracle, dS, s_bytes_oracle, cudaMemcpyDeviceToDevice, stream_));
+        }
 
         // Legacy solver still uses raw params for now (reference implementation)
         int delta_oracle = stage2_cfg_.seq_len / 2;

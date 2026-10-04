@@ -104,6 +104,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         src/lingen/stage1/krylov_generator.cu
         src/lingen/stage2/basecase_ops.cu
         src/lingen/stage2/basecase_solver.cu
+        src/lingen/stage2/init_basis.cu
         src/lingen/stage2/basecase_solver_reference.cu
         src/lingen/operations/poly_arith_engine.cu
         src/lingen/stage3/solution_reconstructor.cu
@@ -152,6 +153,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_lingen_bench(bw_lingen_smoke benchmarks/bw_lingen_smoke.cu)
     add_lingen_bench(bw_lingen_bench benchmarks/bw_lingen_benchmark.cu)
     add_lingen_bench(test_s_disk_io tests/test_s_disk_io.cu)
+    add_lingen_bench(test_init_basis_gpu tests/test_init_basis_gpu.cu)
 	  
 else()
     # If not standalone, we only build the library to increase build time
@@ -182,6 +184,7 @@ else()
         src/lingen/stage1/krylov_generator.cu
         src/lingen/stage2/basecase_ops.cu
         src/lingen/stage2/basecase_solver.cu
+        src/lingen/stage2/init_basis.cu
         src/lingen/stage2/basecase_solver_reference.cu
         # src/lingen/operations/poly_arith_engine.cu
         src/lingen/stage3/solution_reconstructor.cu

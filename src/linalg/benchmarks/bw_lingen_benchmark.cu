@@ -105,6 +105,8 @@ void print_usage(const char* prog_name) {
               << "  --s2_sequence_length <N>  Input sequence length to consume.\n"
               << "  --s2_delta <N>         Explicit degree bound delta.\n"
               << "  --s2_cpu_mode          Force CPU-only Basecase (Disable GPU default).\n"
+              << "  --s2_init_cpu          Initialization basis on the CPU (reference path; downloads S).\n"
+              << "  --s2_init_verify       Run device and CPU initialization, abort on mismatch (downloads S).\n"
               << "  --s2_verify_gpu        Enable optimized GPU annihilation check.\n"
               << "  --s2_verify_legacy     Enable slow CPU legacy annihilation check.\n"
               << "  --s2_post_run_legacy   Run full Legacy solver after main run for comparison.\n"
@@ -186,6 +188,8 @@ ParsedArgs parse_args(int argc, char** argv, LogConfig *log_cfg) {
         else if (arg == "--s2_sequence_length" && i+1 < argc) args.solver_cfg.stage2_seq_len = std::atoi(argv[++i]);
         else if (arg == "--s2_delta" && i+1 < argc) args.solver_cfg.stage2_delta = std::atoi(argv[++i]);
         else if (arg == "--s2_cpu_mode") args.solver_cfg.stage2_gpu_mode = false; // Disable default GPU
+        else if (arg == "--s2_init_cpu") args.solver_cfg.stage2_init_on_gpu = false;
+        else if (arg == "--s2_init_verify") args.solver_cfg.stage2_init_cross_check = true;
         else if (arg == "--s2_verify_gpu") args.solver_cfg.stage2_check_annihilation_gpu = true;
         else if (arg == "--s2_verify_legacy") args.solver_cfg.stage2_check_annihilation_legacy = true;
         else if (arg == "--s2_post_run_legacy") args.solver_cfg.stage2_post_run_legacy_check = true;

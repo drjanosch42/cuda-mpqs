@@ -452,6 +452,8 @@ The CPU backend (`--matrix_backend cpu`) uses the V1 pipeline: binary CSR with G
 | `--bw_max_solutions <N>` | int | `-1` (all) | Cap the number of Block Wiedemann solution vectors reconstructed. `-1` reconstructs all. Lowering it can skip a zero-yield reconstruction batch on large inputs. *Experimental.* | No |
 | `--bw_checkpoint_dir <path>` | string | `""` (off) | Directory for Block Wiedemann stage-boundary checkpoints (Krylov sequence, lingen polynomial, final solutions). Enables resume across the long linear-algebra stages. *Experimental — resumes from the last completed stage, not mid-stage.* | No |
 | `--bw_resume` | boolean | `false` | Load completed-stage Block Wiedemann checkpoint artifacts from `--bw_checkpoint_dir` and skip those stages. *Experimental.* | No |
+| `--bw_init_cpu` | boolean | `false` | Compute the Block Wiedemann Stage-2 initialization basis on the CPU reference routine instead of the GPU (downloads the Krylov sequence to the host). Output is bit-identical. | No |
+| `--bw_init_verify` | boolean | `false` | Run both the GPU and the CPU Stage-2 initialization and abort on any mismatch (downloads the Krylov sequence). Diagnostic. | No |
 
 ### Square Root Options
 

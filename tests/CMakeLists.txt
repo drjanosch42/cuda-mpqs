@@ -349,6 +349,18 @@ set_target_properties(test_graph_capture_scope PROPERTIES
 target_link_libraries(test_graph_capture_scope PRIVATE mpqs_common cudampqs_build_flags)
 add_test(NAME graph_capture_scope COMMAND test_graph_capture_scope)
 
+# Block Wiedemann Stage 2 initialization basis: device kernel (k_find_init_basis /
+# k_build_f_init) vs the CPU reference, bit for bit (t0, rank, pairs in order, pivot
+# mask, F_init bytes, gamma) over structured and 300 fuzz cases. Needs a CUDA device.
+add_executable(test_init_basis_gpu
+    ${CMAKE_SOURCE_DIR}/src/linalg/tests/test_init_basis_gpu.cu)
+set_target_properties(test_init_basis_gpu PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(test_init_basis_gpu PRIVATE lingen_ops cudampqs_build_flags)
+add_test(NAME bw_init_basis COMMAND test_init_basis_gpu)
+
 # Optional Sqrt specific benchmark (EXCLUDE_FROM_ALL: uses AoS Relation API, needs M2 update for SoA)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sqrt_benchmark.cpp")
     add_executable(bench_sqrt EXCLUDE_FROM_ALL sqrt_benchmark.cpp

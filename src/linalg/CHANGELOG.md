@@ -9,7 +9,32 @@ project adheres to [Semantic Versioning 2.0.0](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-09-28
+
 ### Added
+- Stage 2 initialization basis on the GPU: a dedicated single-warp kernel
+  (`k_find_init_basis`, `src/lingen/stage2/init_basis.cu`) computes t0 and the
+  m basis pairs directly on the device-resident Krylov sequence S, keeping a
+  fully reduced (Gauss-Jordan) basis in shared memory; a second kernel
+  (`k_build_f_init`) writes the initial generator F and gamma straight into
+  the solver's device buffers. Only a 16-byte result record (t0, rank,
+  status) returns to the host. The result is bit-identical to the CPU
+  routine (t0, rank, pairs in order, F bytes, gamma, and the rank-failure
+  path with its log lines); the kernel documentation carries the proof.
+  Supports m <= 512 (CPU fallback with a warning above).
+  New `BWSolverConfig` fields `stage2_init_on_gpu` (default true) and
+  `stage2_init_cross_check` (default false; implied by the Stage 2 oracle),
+  which runs both routines and aborts with `Basecase InitCheck mismatch` on
+  any divergence. `bw_lingen_bench` flags `--s2_init_cpu` and
+  `--s2_init_verify`. New log line
+  `[Basecase] Init basis: path=GPU|CPU, t0=, rank=, time= ms`; the existing
+  `Initialization: t0=` line is unchanged.
+- `BWSolverConfig::stage1_force_host_S` (debug override: always keep the
+  Stage 1 host copy of S).
+- Test `tests/test_init_basis_gpu.cu`: device vs CPU initialization, bit for
+  bit, over structured cases (rank-deficient leading coefficients, t0 > 2,
+  zero columns/coefficients, dependent columns, rank failure) and 300 fuzz
+  instances.
 - Stage-boundary checkpointing for the Block Wiedemann solver
   (**experimental — not yet validated end-to-end**): save and load of the
   Stage 1 Krylov S-sequence, the Stage 2 lingen Pi polynomial, and the
@@ -19,6 +44,29 @@ project adheres to [Semantic Versioning 2.0.0](https://semver.org/).
   the stage is recomputed rather than loading stale data. Resume is
   stage-granular: a run restarts from the last *completed* stage, not
   mid-stage. GF(2) results are unchanged when checkpointing is off.
+
+### Changed
+- S is no longer downloaded to the host by default. Stage 2 downloads S only
+  when a host consumer needs it (CPU-only mode, CPU initialization or its
+  cross-check, the per-step oracle, the legacy annihilation check), and then
+  as one bulk copy instead of one synchronous copy per coefficient. Stage 1
+  makes its host copy of S only for a consumer (S not kept on the device, S
+  saved to disk, hashing, Stage 1 checkpoints) and logs
+  `[BWStage 1] S host copy: ON (...) / OFF (no consumer)`; without it the
+  generator synchronizes its compute stream before returning. The post-run
+  legacy oracle copies S device-to-device when no host copy exists.
+  Outputs are bit-identical.
+
+### Fixed
+- The bulk variant of the Stage 2 S download (previously commented out)
+  copied into empty vectors; it now assigns each coefficient.
+- Stage 2 host-upload fallback with no S available now fails with a clear
+  error instead of a zero-size allocation.
+
+### Follow-up (not in this release)
+- The Stage 1 S disk write (`save_S_to_disk`, checkpoint `_S.bin`) and its
+  FNV hash still run synchronously after generation; an asynchronous writer
+  joined before any Stage 2 use of the host copy is a possible follow-up.
 
 ## [1.0.1] - 2026-07-13
 

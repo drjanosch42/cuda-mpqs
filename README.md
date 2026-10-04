@@ -172,10 +172,10 @@ are historical and a current release would be expected to beat them.
   --autotune_stage1`.
 
 **Record RSA-100 runtime:** the full pipeline factors RSA-100 (100 decimal digits)
-end-to-end in **38.30 s** on a single NVIDIA H100 SXM under v1.0.7 — median of three
-runs, spread 37.78–38.58 s — with `--fb_bound 5500000 --sieve_bound 524288
+end-to-end in **29.18 s** on a single NVIDIA H100 SXM under v1.0.8 — median of three
+runs, spread 29.05–29.67 s — with `--fb_bound 5500000 --sieve_bound 524288
 --lp1_bound 1000000000000 --sieve_batch_size 8 --cuda_graph_unroll 0
---params11 2048,8,8,8,256,1024,1024,1024,131072,8100,260 --sieve_hc_dim 12
+--params11 2048,8,4,8,512,1024,1024,1024,131072,8100,164 --sieve_hc_dim 12
 --lp1_max_witnesses 8388608 --bw_max_solutions 64 --matrix_mode legacy
 --char_mode none`. The per-GPU breakdown is in the table below.
 
@@ -187,39 +187,40 @@ a measurement of that device at that configuration, not a device-versus-device r
 
 | GPU | Architecture (CC) | CUDA cores | RSA-100 (full pipeline) | Reps | Version |
 |-----|-------------------|-----------:|-------------------------|------|---------|
-| Jetson Orin Nano Super 8 GB (25 W) | Ampere (8.7) | 1,024 | 1,602.64 s (26 m 43 s, mean)† | n = 2 | 1.0.7 |
-| TITAN RTX 24 GB | Turing (7.5) | 4,608 | 137.76 s (median, 137.48–138.03) | n = 3 | 1.0.7 |
-| A100 SXM4 40 GB | Ampere (8.0) | 6,912 | 83.80 s (median, 83.66–87.33) | n = 3 | 1.0.7 |
-| RTX 5070 Ti 16 GB | Blackwell (12.0) | 8,960 | 66.38 s (median, 66.35–68.21) | n = 3 | 1.0.7 |
-| H100 SXM 94 GB | Hopper (9.0) | 16,896 | 38.30 s (median, 37.78–38.58) | n = 3 | 1.0.7 |
+| Jetson Orin Nano Super 8 GB (25 W) | Ampere (8.7) | 1,024 | 1,028.04 s (17 m 08 s, mean, 1,026.10–1,029.97)† | n = 2 | 1.0.8 |
+| TITAN RTX 24 GB | Turing (7.5) | 4,608 | 111.74 s (median, 111.48–112.32) | n = 3 | 1.0.8 |
+| A100 SXM4 40 GB | Ampere (8.0) | 6,912 | 57.64 s (median, 57.62–58.30) | n = 3 | 1.0.8 |
+| RTX 5070 Ti 16 GB | Blackwell (12.0) | 8,960 | 51.01 s (median, 50.97–51.05) | n = 5 | 1.0.8 |
+| H100 SXM 94 GB | Hopper (9.0) | 16,896 | 29.18 s (median, 29.05–29.67) | n = 3 | 1.0.8 |
 
 † The Jetson row was **not** re-measured under the benchmark protocol the other four
-rows share (see the next bullet), so it is not directly comparable even as a
-version-to-version figure.
+rows share (see the next bullet); it repeats the 1.0.7 Jetson command line, so it is
+a like-for-like version comparison for that board but not on the other rows' footing.
 
 How to read the table:
 
 - **The four non-Jetson rows share one benchmark protocol**: full pipeline,
   `--lp1_max_witnesses 8388608 --bw_max_solutions 64 --matrix_mode legacy
   --char_mode none`, every run product-verified. The Jetson row predates that
-  protocol by one day and runs neither cap, so its wall is not on the same footing;
-  it is quoted because it is the only 1.0.7 measurement of that board.
+  protocol and runs neither cap, so its wall is not on the same footing; it repeats
+  that board's 1.0.7 command line unchanged.
 - **Operating points differ per row.** All five rows run `--lp1_bound 1000000000000`.
   The TITAN row runs `--fb_bound 7000000 --sieve_bound 262144 --sieve_batch_size 32`,
-  the A100 and 5070 Ti rows the same bounds at `--sieve_batch_size 8`, the H100 row
+  the 5070 Ti row the same bounds at `--sieve_batch_size 8`, the A100 and H100 rows
   `--fb_bound 5500000 --sieve_bound 524288 --sieve_batch_size 8`, and the Jetson row
   `--fb_bound 7000000 --sieve_bound 131072 --sieve_batch_size 8`. Walls are comparable
   within a device, not across devices.
 - **Every row runs a pinned `--params11` tuple found by `--param_test` on that
-  device**, together with `--sieve_hc_dim 12`:
+  device** (re-searched under 1.0.8 on the A100 and H100; the TITAN, 5070 Ti and
+  Jetson tuples are their 1.0.7 search results), together with `--sieve_hc_dim 12`:
 
   | GPU | `--params11` tuple |
   |-----|--------------------|
   | Jetson Orin Nano Super | `2048,4,32,4,8,1024,1024,512,65536,1284,164` |
   | TITAN RTX | `1024,16,8,16,128,1024,1024,1024,32768,2340,164` |
-  | A100 SXM4 | `2048,8,4,8,512,1024,1024,512,65536,1284,164` |
+  | A100 SXM4 | `2048,8,4,8,512,1024,1024,1024,131072,4388,356` + `--sieve_offsets_global` |
   | RTX 5070 Ti | `2048,8,8,8,256,1024,1024,1024,65536,2820,96` |
-  | H100 SXM | `2048,8,8,8,256,1024,1024,1024,131072,8100,260` |
+  | H100 SXM | `2048,8,4,8,512,1024,1024,1024,131072,8100,164` |
 
   A tuple encodes the device's shared-memory size, multiprocessor count and
   factor-base partition, so **tuples must not be copied between GPUs**. All rows
@@ -227,11 +228,45 @@ How to read the table:
   `--cuda_graph_unroll 4 --lp_interval 1 --lp1_hash_bits 21`.
 - **The TITAN row additionally passes `--bucket_size_factor 1.0`**, which its tuple
   requires: without it the large-prime bucket on that device runs at 98 % occupancy
-  and silently discards hits. The other four rows let 1.0.7 size the bucket from the
-  predicted peak.
+  and silently discards hits. The other four rows let the binary size the bucket from
+  the predicted peak.
 - **These are measurements of the configurations shown, not each card's best
   achievable time.** No batch-size or CUDA-graph sweep has been run at these
   operating points on any of the five devices.
+
+### RSA-100 under v1.0.8
+
+v1.0.8 reworks the arithmetic in both sieve kernels and initializes
+the Block Wiedemann basis on the GPU. The table compares each device's best 1.0.7
+figure with 1.0.8 run on the same command line (the version effect alone) and with
+1.0.8's best figure, the one in the table above:
+
+| GPU | v1.0.7 | v1.0.8, same command line | v1.0.8, best | Reps |
+|-----|--------|---------------------------|--------------|------|
+| Jetson Orin Nano Super 8 GB | 1,602.64 s | 1,028.04 s (−35.9 %, sieve 1,390.63 → 813.43 s) | 1,028.04 s | n = 2 |
+| TITAN RTX 24 GB | 137.76 s | 111.74 s (−18.9 %, sieve −23 %) | 111.74 s | n = 3 |
+| A100 SXM4 40 GB | 83.80 s | not measured end to end (sieve −35 % per batch) | 57.64 s‡ | n = 3 |
+| RTX 5070 Ti 16 GB | 66.38 s | 51.01 s (−23.2 %) | 51.01 s | n = 5 |
+| H100 SXM 94 GB | 38.30 s | 31.57 s (−17.6 %, sieve 28.31 → 22.13 s) | 29.18 s (−23.8 %) | n = 3 |
+
+‡ A different operating point from the 1.0.7 A100 figure (`--fb_bound 5500000
+--sieve_bound 524288` instead of `7000000` / `262144`, fewer relations needed), so
+the A100 change mixes the version with a workload change.
+
+- **Nearly all of the gain is in the sieve**; linear algebra and square root are
+  unchanged to within noise.
+- **The H100 best figure uses a re-searched tuple** (`--param_test` under 1.0.8): in
+  the same job it runs 7.6 % faster end to end than the 1.0.7 tuple, at 2.3 % more
+  board energy. The H100 1.0.7 → 1.0.8 comparison is cross-node (the two runs were on
+  different nodes of the same type, one node each) and should be read as indicative.
+- **The 5070 Ti same-command comparison of record is an interleaved A/B** of the two
+  binaries (n = 5 per arm), in which the 1.0.7 binary read 64.23 s and the 1.0.8
+  arithmetic changes 50.87 s (−20.8 %); the later GPU basis initialization is
+  performance-neutral at RSA-100 (51.01 s for the released binary, about 0.1 % end
+  to end) and changes no output.
+- **A100 SXM4:** at the 1.0.7 pinned `--params` geometry the per-batch sieve time
+  measures **−35 %** (74.5 → 48.4 ms, n = 3).
+- **RSA-150/155 (wide path):** not re-measured on v1.0.8.
 
 ### Scaling with input size
 
@@ -252,9 +287,10 @@ chooses them at run time — rather than from a pinned tuple, and `--autotune_no
 prevents any earlier run's result being carried in. Each row is the median of three
 timed runs preceded by a discarded warm-up; every run was product-verified.
 
-The RSA-100 row reads 75.01 s here against **66.38 s** in the cross-GPU table above.
-The difference is the parameter pin, not the release: that table runs this card's
-pinned `--params11` tuple, while this one autotunes.
+The RSA-100 row reads 75.01 s here against **66.38 s** for this card's pinned
+`--params11` tuple under the same release (v1.0.7); the difference is the parameter
+pin, not the release. The cross-GPU table above is v1.0.8 (51.01 s); this input-size
+series has not been re-measured on v1.0.8.
 
 **The 70d and 80d rows are slower than the 1.0.1-era figures they replace** — 2.88 s
 against 1.60 s (+80 %) and 9.88 s against 7.72 s (+28 %). The cost is entirely
@@ -287,7 +323,7 @@ If you use cuda-mpqs in academic work, please cite it. A
 [`CITATION.cff`](CITATION.cff) file is provided for citation managers.
 
 The archived releases carry the concept DOI
-[10.5281/zenodo.21619473](https://doi.org/10.5281/zenodo.21619473), which always
+[10.5281/zenodo.22902652](https://doi.org/10.5281/zenodo.22902652), which always
 resolves to the latest cuda-mpqs release. Cite it unless you need to pin a
 specific version, in which case use that version's own DOI from the Zenodo
 record.
@@ -300,8 +336,8 @@ BibTeX:
   title   = {cuda-mpqs: A GPU-accelerated Self-Initializing Multiple Polynomial
              Quadratic Sieve},
   year    = {2026},
-  version = {1.0.7},
-  doi     = {10.5281/zenodo.21619473},
+  version = {1.0.8},
+  doi     = {10.5281/zenodo.22902652},
   url     = {https://github.com/drjanosch42/cuda-mpqs},
   license = {LGPL-3.0-only}
 }

@@ -6951,6 +6951,11 @@ void MPQSOrchestrator::LinearAlgebraStage() {
     bw_conf.m_block = (int)config_.bw_m;
     bw_conf.n_block = (int)config_.bw_n;
     bw_conf.stage3_max_solutions = config_.bw_max_solutions;
+    // Stage 2 initialization basis: device kernel by default (bit-identical to the CPU
+    // routine, no S download); --bw_init_cpu selects the CPU reference, --bw_init_verify
+    // runs both and aborts on any mismatch.
+    bw_conf.stage2_init_on_gpu = !config_.bw_init_cpu;
+    bw_conf.stage2_init_cross_check = config_.bw_init_verify;
     bw_conf.block_size_pinned = config_.isPinned("bw_m") || config_.isPinned("bw_n");
     bw_conf.stage1_gpu_batch_size = 8;
 

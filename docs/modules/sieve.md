@@ -4,11 +4,23 @@ In-tree flattened folder (demoted from a former Git submodule in Stage A — onl
 
 Large prime (LP) support is orthogonal to pipeline selection — both legacy and batch modes support LP when the orchestrator sets a threshold override via `setThresholdOverride()`.
 
-The batch sieve-and-scan kernel additionally exists in three **accumulator widths** (legacy uint8, wide uint16, wide saturating-uint8) — the RSA-155 dual-path fork; see *Dual-Path Sieve Accumulator* below. The legacy uint8 kernels were byte-for-byte untouched by the fork (enforced by a source byte-identity check in the development tree). ⚠ **v1.0.7 deliberately modifies the two narrow GATHER kernels** (small-prime mask, backward-sieve restructure), so that byte-identity check fails against any pre-v1.0.7 baseline by design and must be re-anchored at v1.0.7; the wide kernels remain untouched.
+The batch sieve-and-scan kernel additionally exists in three **accumulator widths** (legacy uint8, wide uint16, wide saturating-uint8) — the RSA-155 dual-path fork; see *Dual-Path Sieve Accumulator* below. The legacy uint8 kernels were byte-for-byte untouched by the fork (enforced by a source byte-identity check in the development tree). ⚠ **v1.0.7 deliberately modifies the two narrow GATHER kernels** (small-prime mask, backward-sieve restructure), so that byte-identity check fails against any pre-v1.0.7 baseline by design and must be re-anchored at v1.0.7. ⚠ **v1.0.8 modifies every sieve kernel family**, including code the wide path executes (the shared SCATTER kernel `globalMetaSieveBatchKernel`, `excludeNonRelations` as called by `...WideU8Sat`, the per-poly GATHER prologue of both wide kernels, and `modAdd`); only `excludeNonRelationsWide` and the wide kernels' forward/backward bands are untouched. No wide-path "untouched by construction" argument survives v1.0.8.
 
 Namespaces: `mpqs::sieve` (all sieving structures and kernels), `mpqs::postprocessing` (DoubleBuffer).
 
-**Current as of v1.0.7 (2026-09-18).** Unlike v1.0.6, v1.0.7 **does change `kernel.cu`** — but
+**Current as of v1.0.8 (2026-09-28; `CUDAMPQS_VERSION` 1.0.8, empty suffix; linalg submodule
+block-wiedemann 1.0.2).** v1.0.8 = v1.0.7 + an arithmetic rewrite of the sieve kernels + the device
+Block Wiedemann Stage-2 initialization basis (no sieve-module change). The sieve changes are an
+**arithmetic rewrite of both sieve kernel families** — SCATTER (`globalMetaSieve{,Batch}Kernel`) and
+narrow GATHER (`sieveAndScan{,Batch}Kernel`) — plus three shared helpers (`modAdd`,
+`excludeNonRelations`, `advanceRoots`) that also reach the wide kernels. No flag, no configuration
+field and no default changed; host-side the only changes are `scatterSharedMemReq()` (SCATTER dynamic
+shared memory grows by a Gray-step table) and `primeDataSIQS.reducedStart` (+4 B per prime). Output
+is designed to be bit-identical except for one documented approximation in the candidate scan. See
+*v1.0.8 — Arithmetic Rewrite of the Sieve Kernels* below; the v1.0.7 paragraph that follows is kept
+as the record of that release.
+
+**v1.0.7 (2026-09-18).** Unlike v1.0.6, v1.0.7 **does change `kernel.cu`** — but
 only the two **narrow** GATHER kernels, `sieveAndScanKernel` (legacy) and `sieveAndScanBatchKernel`
 (batch); the SCATTER kernels and both wide kernels (`...Wide`, `...WideU8Sat`) are untouched, so the
 RSA-150/155 production path (wide/u8sat) is unaffected by construction. v1.0.7 adds, **always on**
@@ -36,13 +48,13 @@ change observed relation counts — see the notes below before scoring an A/B.
 
 | File | Purpose |
 |------|---------|
-| `kernel.cu` / `kernel.cuh` | All CUDA kernels (legacy + batch variants + the wide/u8sat accumulator forks), device math helpers, polynomial/root helpers, host launch wrappers. v1.0.6 left `kernel.cu` untouched (its only change was a `kernel.cuh` *declaration* of `globalMetaSieveBatchKernel` for the occupancy preflight). **v1.0.7 changes the two narrow GATHER kernels only** — mask initialisation, the restructured backward sieve, the `recordBackwardFactor()` helper (`kernel.cu:133`) and the optional global-memory offsets slice — plus `loadSievingData` / `loadSievingDataParamTest` (allocate `dev_sieveOffsets`) and a host-side GATHER launch-error check in `runSievingBatch` (`kernel.cu:2879`) |
+| `kernel.cu` / `kernel.cuh` | All CUDA kernels (legacy + batch variants + the wide/u8sat accumulator forks), device math helpers, polynomial/root helpers, host launch wrappers. v1.0.6 left `kernel.cu` untouched (its only change was a `kernel.cuh` *declaration* of `globalMetaSieveBatchKernel` for the occupancy preflight). **v1.0.7 changes the two narrow GATHER kernels only** — mask initialisation, the restructured backward sieve, the `recordBackwardFactor()` helper (`kernel.cu:133`) and the optional global-memory offsets slice — plus `loadSievingData` / `loadSievingDataParamTest` (allocate `dev_sieveOffsets`) and a host-side GATHER launch-error check in `runSievingBatch` (now `kernel.cu:3098`). **v1.0.8 rewrites the arithmetic of both SCATTER kernels and both narrow GATHER kernels** and adds the SCATTER helpers `advanceRelRootsScatter()` (`kernel.cu:161`) and `storeDoubledBValues()` (`:177`); `initPrimeDataBatchKernel` gains a `sieveIntervalStart` argument (`:2553`) — see the v1.0.8 section |
 | `dynamicMask.cuh` | **v1.0.7.** Small-prime log mask: `generateMask()` (host; builds the periodic mask and the CRT basis, uploads both) and `findMaskOffsets()` (device; the per-sieving-block phase of the mask for each of the two root classes). See the v1.0.7 section |
-| `sieving_data_structs.h` | All data structures: primes, candidates, contexts, configs, `gpuInfo`, `DoubleBuffer`; `MAX_SHC_DIM` |
+| `sieving_data_structs.h` | All data structures: primes, candidates, contexts, configs, `gpuInfo`, `DoubleBuffer`; `MAX_SHC_DIM`. **v1.0.8:** `primeDataSIQS.reducedStart` |
 | `sieve_memory_model.h` | Single source-of-truth device-memory model: `sieveBucketBudget()` (`kSieveBudgetNum/Den` = 4/5 = 0.80·VRAM), `estimateSieveFootprint()`, `reduceNumPolysToBudget()`, `clampWideNumPolys()`/`kWideNumPolysCap` = 512 — mirrors the ten `cudaMalloc` calls in `kernel.cu` (loadSievingData), computed in 64-bit (fixes the 32-bit product wrap that OOMed M=262K/RSA-140). **v1.0.6** also puts the header-only narrow-batch geometry predicates here — `narrowBatchCoverageOk()`, `admissibleSieveBlockSize()`, `admissibleBigPrimeStart()` — so the CLI, `validateConfigs()` and the `sieve_geometry_overrides` unit test share exactly one statement of each rule |
 | `device_sieving_controller.h` / `.cpp` | Main API class: initialization, execution, batch orchestration, config loaders, accumulator-width dispatch, autotune probe harness, state management, snapshot / cluster hooks |
 | `prime_algorithms.cu` / `.h` | Factor base generation, Tonelli-Shanks, Hensel lifting, hypercube walk, batch index preparation; 64-bit number-theory primitives (`Tonelli_Shanks_u64`, `jacobi_u64`, `is_prime_u64`) for branch-fixed character columns |
-| `graycode.cuh` | Gray code enumeration: `gray()`, `advanceGray()`, `grayBitToFlip()` (all `__host__ __device__`) |
+| `graycode.cuh` | Gray code enumeration: `gray()`, `advanceGray()`, `grayBitToFlip()`; **v1.0.8** adds `struct GrayFlip {bit, nowSet}` and `advanceGrayCyclic()` (the SCATTER poly walk) (all `__host__ __device__`) |
 | `common.h` | `factoringData` struct (`mpqs::sieve` sieving state) and `AFactorsSnapshot` |
 | `json_helper.h` | Minimal `JSONString` / `JSON_IO` builder used only by the optional debug-snapshot path |
 | `debug_dump.cu` / `.cuh` / `.h` | GPU debug snapshot tooling |
@@ -51,7 +63,7 @@ change observed relation counts — see the notes below before scoring an A/B.
 
 ## Key Data Structures
 
-### primeDataSIQS -- per-prime GPU data (20 bytes)
+### primeDataSIQS -- per-prime GPU data (24 bytes since v1.0.8; 20 bytes ≤ v1.0.7)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -60,8 +72,9 @@ change observed relation counts — see the notes below before scoring an A/B.
 | `mod_inverse_a` | `uint32_t` | a⁻¹ mod p |
 | `inv_aN` | `uint32_t` | a⁻¹ · r mod p |
 | `inactive` | `uint32_t` | Set to 1 by `markInactivePrimesKernel` iff the prime divides a (skipped for this a); zero-initialized (0 = participates in sieving). Kernels consume it multiplicatively: `log2p·(1−inactive)` and `p·(1−2·inactive)` |
+| `reducedStart` | `uint32_t` | **v1.0.8.** `sieveIntervalStart mod p ∈ [0, p)`, written once per `a` by `initPrimeDataBatchKernel` (from the step's `ds_params.startIndex`, the same value the SCATTER launch gets) and by `initPrimeDataKernel`; read by SCATTER for meta-cycle 0 instead of `((S % p) + p) % p` per prime **and poly block**. The VRAM model uses `sizeof`, so the +4 B/prime is accounted automatically |
 
-**B-values are decoupled from this struct.** The per-prime Gray-code update values B_k · a⁻¹ mod p live in a separate device array `devicePointers::dev_primeBValues`, **column-major** `[k*fb_size + primeIndex]`, sized `fb_size * shc_dim * sizeof(uint32_t)` (the *actual* run shc_dim, not `MAX_SHC_DIM`). The hot meta-sieve kernels stream `primeDataSIQS` once per factor-base prime per pass; embedding `B_values[MAX_SHC_DIM]` inflated the stream stride (84→148 B at `MAX_SHC_DIM`=32) and made the sieve bandwidth-bound on padding — the v1.0.4d struct-bloat regression. Decoupling keeps the struct at 20 B for all sizes and reads only the live shc_dim B-values, coalesced.
+**B-values are decoupled from this struct.** The per-prime Gray-code update values B_k · a⁻¹ mod p live in a separate device array `devicePointers::dev_primeBValues`, **column-major** `[k*fb_size + primeIndex]`, sized `fb_size * shc_dim * sizeof(uint32_t)` (the *actual* run shc_dim, not `MAX_SHC_DIM`). The hot meta-sieve kernels stream `primeDataSIQS` once per factor-base prime per pass; embedding `B_values[MAX_SHC_DIM]` inflated the stream stride (84→148 B at `MAX_SHC_DIM`=32) and made the sieve bandwidth-bound on padding — the v1.0.4d struct-bloat regression. Decoupling keeps the struct at 20 B (24 B since v1.0.8's `reducedStart`) for all sizes and reads only the live shc_dim B-values, coalesced.
 
 `MAX_SHC_DIM = 32` (`sieving_data_structs.h:33`) bounds only per-thread B-value caches and the separate array headroom (RSA-140 needs shc_dim=19; 32 covers RSA-155 and beyond).
 
@@ -188,8 +201,9 @@ Q(x) = (ax + b)² - N where:
 | `gray(i)` | G(i) = i ^ (i >> 1) |
 | `advanceGray(i)` | Index of the bit that flips from G(i) to G(i+1) (= ctz(G(i+1)^G(i))) |
 | `grayBitToFlip(i1,i2)` | Bit position that differs between G(i1) and G(i2) |
+| `advanceGrayCyclic(j, mask, half, &g)` | **v1.0.8.** One step of a *cyclic* Gray walk over a block of `B = 2^k` codes: moves `g` from `G((j−1) mod B)` to `G(j mod B)` and returns `GrayFlip{bit, nowSet}`. `G(j) ⊕ G(j−1) = 1 ≪ ctz(j)` and the wrap `G(B−1) = B/2 → G(0) = 0` flips the top bit, so both cases are `bit = ctz((j & (B−1)) | B/2)` (for `j mod B ≠ 0` its lowest set bit is ≤ B/2). `half = max(B/2, 1)`; at `B = 1` the (discarded) step reports bit 0 |
 
-All three are `__host__ __device__ __forceinline__`.
+All are `__host__ __device__ __forceinline__`.
 
 ### Device Polynomial/Root Helpers (`kernel.cuh`)
 
@@ -199,14 +213,16 @@ The root helpers take the decoupled B-value array explicitly (post struct-bloat 
 |----------|---------|
 | `rootsFromPolyId(id, shc_dim, primeData, bvalues, primeIndex, fb_size, r1, r2)` | Reconstruct sieve roots for a specific poly ID from hypercube |
 | `bFromPolyId(id, shc_dim, B_values, result)` | Reconstruct coefficient b from poly ID |
-| `advanceRoots(id1, id2, primeData, bvalues, primeIndex, fb_size, r1, r2)` | Update roots when transitioning between Gray code states |
+| `advanceRoots(id1, id2, p, bvalues, primeIndex, fb_size, r1, r2)` | Update roots when transitioning between Gray code states (two signed `modSum`s of ±B_k per root). **v1.0.8** takes `p` instead of the `primeDataSIQS` struct (only `.p` was read); after v1.0.8 only the GATHER per-poly prologues (legacy, batch, Wide, WideU8Sat) call it |
+| `advanceRelRootsScatter(flip, p, dTable, rel1, rel2)` | **v1.0.8, SCATTER only** (`kernel.cu:161`). Applies one `GrayFlip` to both window-relative roots: `d = dTable[bit·blockDim.x] = 2B_bit mod p`; `δ = nowSet ? p − d : d`; `rel ← modAdd(rel, δ, p)`. Subtracting `d` is adding `p − d ∈ [1, p]`, exact under `modAdd`'s `b ≤ p` precondition, so the sign is a select and each root one `modAdd` (Turing SASS 20 → 17 per step) |
+| `storeDoubledBValues(dTable, bvalues, log2_pbs, i, fb_size, p)` | **v1.0.8, SCATTER only** (`:177`). Stages `2B_k mod p` for `k < log2(polyBlockSize)` into the thread's own shared-memory column (`B_k < p < 2^31`, so `2B_k` does not overflow and one conditional subtract reduces it) |
 | `advance_b(id1, id2, B_values, b)` | Update b when transitioning between Gray code states |
 
 ### Device Math Helpers (`kernel.cuh` / `kernel.cu`)
 
 | Function | Description |
 |----------|-------------|
-| `modAdd(a, b, m)` | (a + b) mod m, safe for a,b < m |
+| `modAdd(a, b, m)` | (a + b) mod m. **v1.0.8:** computed as `min(s, s − m)` in unsigned arithmetic (`s = a + b`; for `s < m`, `s − m` wraps above `s`) — IADD, IADD, IMNMX.U32, dependency chain 2 instead of compare/select/subtract. Precondition now stated: `a < m`, **`b ≤ m`** (the SCATTER root step passes `b = m` when `2B_k ≡ 0`), `m ≤ 2^31` |
 | `modSub(a, b, m)` | (a − b) mod m, safe for unsigned a,b < m |
 | `modSub_shifted(a, b, m)` | Returns result in [1, m] for computing positive sieve offsets |
 | `modSum(a, b, m)` | (a + b) mod m where b is signed (\|b\| < m) — used for Gray code root updates |
@@ -215,7 +231,7 @@ The root helpers take the decoupled B-value array explicitly (post struct-bloat 
 | `atomicByteAdd(array, idx, x)` | Byte-granularity atomic add via 32-bit word atomics (also as `ATOMIC_BYTE_ADD` / `ATOMIC_BYTE_ADD_RETURN` macros, `kernel.cu:42-46`) |
 | `ATOMIC_HALF_ADD` / `ATOMIC_HALF_ADD_RETURN` | uint16-granularity atomic add macros (2×uint16 per 32-bit word, `kernel.cu:50-54`) — wide-accumulator counterpart of the byte macros; the byte macros are untouched |
 | `atomicByteAddSat(array, idx, x)` | Saturating byte add: read-clamp-CAS on the enclosing 32-bit word, clamps at 255 without carrying into the adjacent byte lane (`kernel.cu:80-93`) — used only by the u8sat wide kernel's contended accumulation paths |
-| `excludeNonRelations(...)` | Block-strided scan for threshold-exceeding candidates (`kernel.cu:850`); each candidate thread reserves its output slot via a per-thread `atomicAdd` on a shared counter (no warp-level intrinsics — see below). Backward trial division extracts factor lists. Overflow-safe (see below). Wide fork `excludeNonRelationsWide` (`kernel.cu:921`) is a near-verbatim copy whose only diff is the `uint16_t*` blockEntries width (enforced by a source width-diff check in the development tree) |
+| `excludeNonRelations(...)` | Block-strided scan for threshold-exceeding candidates (`kernel.cu:1078`; **word-wise since v1.0.8** — see *sieveAndScanKernel Detail*); called by the legacy, narrow batch **and `...WideU8Sat`** kernels; each candidate thread reserves its output slot via a per-thread `atomicAdd` on a shared counter (no warp-level intrinsics — see below). Backward trial division extracts factor lists. Overflow-safe (see below). Wide fork `excludeNonRelationsWide` (`kernel.cu:1158`, **unchanged by v1.0.8**, still per-element) is a near-verbatim copy whose only diff is the `uint16_t*` blockEntries width (enforced by a source width-diff check in the development tree) |
 
 ## 3-Kernel Legacy Pipeline (per polynomial step)
 
@@ -234,15 +250,17 @@ Additionally, **`markInactivePrimesKernel`** sets `primeDataSIQS.inactive = 1` f
 The kernel operates in two phases per sieve block:
 
 **Forward sieve phase** (v1.0.7 layout; identical in the batch kernel):
-- **Mask primes** (index < `smallPrimesUsed`): the shared byte array (`blockEntries`) is no longer zeroed — it is initialised, one 32-bit word per thread iteration, from the precomputed periodic small-prime log mask (sum of the two root-class phases returned by `findMaskOffsets()`), after which these primes' offsets are advanced past the block end. See the v1.0.7 section.
-- Small primes (`smallPrimesUsed` ≤ index < `midPrimeStartIndex`): walked in **32-lane groups** — lane `threadIdx.x % 32` strides a prime's progression by `32·p`, and the block works on `blockDim/32` primes at once — accumulating with `ATOMIC_BYTE_ADD` and **no per-prime barriers** (≤ v1.0.6: one prime at a time across the whole block, plain adds, a `__syncthreads()` per prime).
-- Mid-range primes (`midPrimeStartIndex` ≤ index < `bigPrimeStartIndex`): each thread handles its own prime via `ATOMIC_BYTE_ADD` (no inter-thread sync needed — disjoint access).
-- Large primes (index ≥ `bigPrimeStartIndex`): applied from pre-computed global buckets filled by `globalMetaSieveKernel`.
+- **Mask primes** (index < `smallPrimesUsed`): the shared byte array (`blockEntries`) is no longer zeroed — it is initialised, one 32-bit word per thread iteration, from the precomputed periodic small-prime log mask (sum of the two root-class phases returned by `findMaskOffsets()`), after which these primes' offsets are advanced past the block end. See the v1.0.7 section. **v1.0.8:** `findMaskOffsets()` runs **once per polynomial** (was: once per sieving block, ~10 signed `%` per thread); each sieving block then advances both word offsets by `(SB/4) mod P`, and the init loop steps a per-thread index by `blockDim.x mod P` — the three residues `threadIdx.x mod P`, `blockDim.x mod P`, `(SB/4) mod P` are reduced once per kernel, so every update adds two values `< P` and one conditional subtract is exact for any `blockDim.x`, `SB`, `P` (`P` can be smaller than `blockDim.x`). Exact because the CRT shift `R` depends only on the mask primes' roots, which are constant within a polynomial (their offsets advance by multiples of `p`); with `P` odd, `o ≡ sieveStart − R (mod P)`, `o ≡ 0 (mod 4)` fix the byte offset, so moving `sieveStart` by `SB` moves the word offset by `SB/4 mod P` — exactly a fresh call's result. Bit-identical by construction.
+- **Bucket dump** (large primes, index ≥ `bigPrimeStartIndex`, applied from the global buckets filled by SCATTER). **v1.0.8:** unrolled ×4 with the four (guarded) global loads issued ahead of the four `ATOMIC_BYTE_ADD`s — four independent bucket reads in flight per thread instead of one full load latency per entry. Bit-identical.
+- Small primes (`smallPrimesUsed` ≤ index < `midPrimeStartIndex`): walked in **32-lane groups** — lane `threadIdx.x % 32` strides a prime's progression by `32·p`, and the block works on `blockDim/32` primes at once — accumulating with `ATOMIC_BYTE_ADD` and **no per-prime barriers** (≤ v1.0.6: one prime at a time across the whole block, plain adds, a `__syncthreads()` per prime). **v1.0.8 (warp-uniform, merged roots):** both roots share one loop of `numFullSteps = ⌈(blockEnd − (max(o₁,o₂) + 31p)) / 32p⌉⁺` iterations — the steps in which all 32 lanes of the *further* root are still in the block — so the body has no bound check and a warp-uniform trip count; then one conditional tail hit per root (lanes span `31p` and the roots differ by `< p`, so at most one hit per lane remains). Stride `32p ≡ 0 (mod 4)` lets nvcc hoist the byte lane of the packed atomic (Turing SASS ≈ 5 instructions/hit, unrolled ×4, vs ≈ 14). Offsets written back exactly as before.
+- Mid-range primes (`midPrimeStartIndex` ≤ index < `bigPrimeStartIndex`): each thread handles its own prime via `ATOMIC_BYTE_ADD` (no inter-thread sync needed — disjoint access). **v1.0.8:** both roots in one loop while `max(o₁, o₂) < blockEnd` (they lie `< p` apart, so the other has at most one hit left), then one conditional tail step each (Turing SASS ≈ 11.5 vs ≈ 15 per hit).
+- ⚠ The per-poly GATHER prologue (all four sieve-and-scan kernels, **incl. `...Wide` and `...WideU8Sat`**) reads `p = |primes[i]|` from the block's shared array (`±p`, sign = inactive) instead of re-loading `primeData[i]` from global memory for every prime on every polynomial (v1.0.8).
 
 This kernel family is referred to as the **GATHER** kernel in tuning reports (it gathers/dumps bucket entries and scans); the meta-sieve kernels are the **SCATTER** side (they scatter bucket writes).
 
 **Candidate extraction phase (`excludeNonRelations`):**
-- Block-strided over `blockEntries`: each thread evaluates one position, flagging `isCandidate` where the accumulated log-sum exceeds `approxPolyVal - threshold` (`approxPolyVal ≈ log₂|Q(x)|`), and overwrites `blockEntries[index]` with the boolean for the backward scan.
+- **Word-wise since v1.0.8**: thread `t` owns the 32-bit word `t` (positions `4t … 4t+3`), stride `4·blockDim.x`; one LDS.32 / STS.32 replaces four byte loads and four byte stores, and a warp touches 32 consecutive words in 32 distinct banks (conflict-free). `sievingBlockSize` is a power of two ≥ 256 and `blockEntries` is 4-byte aligned in every caller, so the words tile the block. The four bytes are tested in an unrolled register loop against `approxPolyVal − threshold` (`approxPolyVal = log2_a + ⌊log₂|x + r|⌋ + ⌊log₂|x − r|⌋ ≈ log₂|Q(x)|`, distances now `abs()`), and the four boolean flags are written back as one word for the backward scan.
+- ⚠ **Deliberate approximation — the one v1.0.8 change that is NOT bit-identical by construction.** `approxPolyVal` is evaluated **once per word, at its first position**. Across four positions the floored logs change only where a distance crosses a power of two or passes a root, so the threshold is off by at most a unit or two on a vanishing fraction of words; the candidate set is therefore not guaranteed identical to the per-byte test. **No measured run has shown a difference in `Sieved full`**: 130,316 (Quadro RTX 3000, every commit of the series), 128,786 / 129,897 (5070 Ti, 12/12 each, both binaries), 99,814 (A100, job 34564985), 130,558 (TITAN, 4/4) — all exactly the v1.0.7 values. Because `excludeNonRelations` is also called by `sieveAndScanBatchKernelWideU8Sat`, the approximation reaches the **RSA-150/155 production path**, where it is unmeasured.
 - **Per-thread slot reservation**: each candidate thread reserves its output slot with `atomicAdd(&candidateWriteHead, 1)` on a shared counter. The sieve deliberately uses **no warp-level functions** (`__ballot_sync` / `__shfl_sync`) for this compaction: at MPQS smoothness rates, candidate positions within a sieve block are too sparse for warp-level compaction to beat the simple per-thread atomic — atomic contention is already negligible when relations are rare — so the serial reservation is retained. (An earlier warp-ballot rewrite of `excludeNonRelations` was reverted in review and did not land.)
 - Writes `candidateRelation` records (b, poly_id, sieve_offset, num_factors=0) for qualifying positions.
 - **Overflow-safe clamping**: a candidate whose reserved slot `>= maxPerBlock` is dropped and its `blockEntries[index]` is reset to 0, preventing the backward scan from reading uninitialized `indexToCandidate`. The returned count is clamped so `candidatesFound` never grows past the per-block buffer limit `maxPerBlock`.
@@ -255,17 +273,20 @@ This kernel family is referred to as the **GATHER** kernel in tuning reports (it
 
 ### globalMetaSieveKernel Nested-Loop Control Flow
 
-The meta-sieve (SCATTER) bucketing logic is structured as explicit nested loops (replacing an earlier state machine): **cycles → polyBlocks → primes → polys → offsets**. See `kernel.cu:399-530` and the batch variant `globalMetaSieveBatchKernel` at `kernel.cu:988-1127` — both share the identical loop body. Note the cycles loop wraps the whole factor-base primes loop, so capping cycles multiplies FB re-reads (which is why `--sieve_meta_cycle_cap` is a locality ablation knob, not a speedup lever). ⭐ **This nesting is load-bearing for tuning, not just an implementation detail: `num_metaSieveCycles = numIntervals / blocksPerCycle`, so any `numIntervals` change that is not matched by `blocksPerCycle` silently re-traverses the entire factor base (measured ×1.892 instructions at 2 cycles). See *`num_metaSieveCycles` — why the halving price existed, and how `blocksPerCycle` removes it*.**
+The meta-sieve (SCATTER) bucketing logic is structured as explicit nested loops (replacing an earlier state machine): **cycles → polyBlocks → primes → polys → offsets**. See `kernel.cu:568-740` and the batch variant `globalMetaSieveBatchKernel` at `kernel.cu:1225-1404` — both share the identical loop body (v1.0.8 ported every batch-SCATTER change to the legacy kernel, `df04b3f` / `b5bd010`, so `--param_test`'s legacy probes stay representative; the one difference is the `reducedStart` guard below). Note the cycles loop wraps the whole factor-base primes loop, so capping cycles multiplies FB re-reads (which is why `--sieve_meta_cycle_cap` is a locality ablation knob, not a speedup lever). ⭐ **This nesting is load-bearing for tuning, not just an implementation detail: `num_metaSieveCycles = numIntervals / blocksPerCycle`, so any `numIntervals` change that is not matched by `blocksPerCycle` silently re-traverses the entire factor base (measured ×1.892 instructions at 2 cycles). See *`num_metaSieveCycles` — why the halving price existed, and how `blocksPerCycle` removes it*.**
 
 1. **Cycles loop** — `num_metaSieveCycles` iterations; each covers `num_activeBlocksPerCycle` sieving blocks starting at `currentStart`.
 2. **PolyBlocks loop** — `num_polyBlocksPerThreadBlock` iterations; zeroes the shared per-active-bucket write heads, computes `polyBlockId = blockIdx.x + num_threadBlocks * curPolyBlock`.
-3. **Primes loop** — thread-strided over `currentPrimeIndex` from `bigPrimeStartIndex` to `fb_size` (stride `blockDim.x`). Each thread seeds `polyIndex = (threadIdx.x/32) % polyBlockSize`, so the warp lane group selects its starting Gray-code polynomial. `polyId = gray(polyIndex)`, `fullPolyId = fullPolyIdPrefix | polyId`, and the per-prime roots are reconstructed via `rootsFromPolyId`. `maxOffsetCount` is computed from the *first* prime in the block to keep the inner loop length warp-uniform (constant trip count across lanes).
-4. **Polys loop** — `polyBlockSize` iterations. Each iteration emits this polynomial's bucket entries, then advances to the next Gray-code state: `polyIndex = modAdd(polyIndex, 1, polyBlockSize)`, recompute `polyId`/`fullPolyId`, and `advanceRoots(prevFullPolyId, fullPolyId, ...)` performs the O(1) root update.
-5. **Offsets loop** — for each of the two roots (`offset1`, `offset2`), strides by `+p` across `maxOffsetCount` hits, mapping each hit to a `sievingBlockHit` and atomically reserving a slot in the corresponding active bucket (drops the entry if the bucket is full).
+3. **Primes loop** — thread-strided over `currentPrimeIndex` from `bigPrimeStartIndex` to `fb_size` (stride `blockDim.x`). Each warp starts its walk at `polyWalkStart = (threadIdx.x/32) % polyBlockSize` (a kernel constant since v1.0.8), `polyId = gray(polyWalkStart)`, and the per-prime roots are reconstructed via `rootsFromPolyId`. `maxOffsetCount` is computed from the *first* prime in the block to keep the inner loop length warp-uniform (constant trip count across lanes). **v1.0.8, once per prime:** `reducedSieveStart = currentStart mod p` is read from `primeDataSIQS.reducedStart` on meta-cycle 0 (batch: `cycle == 0`; legacy: `cycle == 0 && num_sievingBlockBatches == 1`, because `initPrimeDataKernel` runs only on a new cube and so saw only the first window start — always the case on the narrow path, where `numIntervals·SB = 2M`), else recomputed; the two roots become **window-relative** `rel_{1,2} = (root_{1,2} − currentStart) mod p ∈ [0, p)` — exactly the old per-poly `offset − currentStart = p − modSub_shifted(start, root, p)`, now computed once per prime instead of per poly and root; `storeDoubledBValues()` stages `2B_k mod p` for the `log2(pbs)` bits that can flip inside a poly block; and the prime-index high word `primeIndexEntry = i ≪ 32` of every bucket entry is formed once.
+4. **Polys loop** — `polyBlockSize` iterations over the walk index `polyStep ∈ (polyWalkStart, polyWalkStart + pbs]`. Each iteration emits this polynomial's bucket entries through a per-poly base pointer `polyBucketEntries = cycleBucketEntries + polyId·polyStride`, then **(v1.0.8)** steps the Gray code directly: `flip = advanceGrayCyclic(polyStep, pbs−1, max(pbs/2,1), polyId)`, `advanceRelRootsScatter(flip, p, dTable, rel₁, rel₂)` — one shared-memory load and one `modAdd` per root, since `±2B_k` moves `rel` exactly as it moves the root. ≤ v1.0.7: `polyIndex = modAdd(polyIndex, 1, pbs)`, `gray()`, `fullPolyId`, then `advanceRoots()` (a global B-value load, an `id1 == id2` guard, `__ffs(id1 ⊕ id2)`, four signed `modSum`s) and a per-poly re-derivation of both window offsets. The step after the last poly is computed and discarded (`rel` is re-initialised per prime); at `pbs = 1` it reads table row 0, which `scatterSharedMemReq()` therefore always reserves. Visiting order, root order and `maxOffsetCount` are unchanged, so bucket contents are identical (slot order within a bucket was already atomic-order).
+5. **Offsets loop** — for each of the two roots, walks copies `r = rel, rel + p, …` across `maxOffsetCount` hits. **v1.0.8:** `sievingBlockHit = r ≫ log2(SB)` and the in-block offset `r & (SB − 1)` replace a runtime `/` and `%` by `SB` (a full unsigned division per root hit; `SB` is a power of two on every path, `validateConfigs` POW2-checks it, and `r ≥ 0`) — Turing SASS ≈ 41 → 26 instructions/root and 8 roots unrolled per pass instead of 4. A hit reserves a slot `index` via `atomicAdd` on the shared write head (dropped if `index ≥ globalBucketSize`) and stores `polyBucketEntries[sievingBlockHit·SB_stride + index] = primeIndexEntry | entry` with a **32-bit** slot (`< num_activeBlocksPerCycle·globalBucketSize`) and a `uint32_t` entry (`offset | log2p ≪ 24`) — Turing SASS 25 → 21 instructions/root on the hit path.
 
-The `polyIndex` cursor is **warp-uniform** by construction (seeded from `threadIdx.x/32`), so all lanes in a warp share the same polynomial and Gray-code transition, avoiding divergent root reconstruction.
+The walk cursor is **warp-uniform** by construction (seeded from `threadIdx.x/32`), so all lanes in a warp share the same polynomial and Gray-code transition, avoiding divergent root reconstruction.
 
-**64-bit bucket indexing (overflow fix):** the bucket-write index is formed as `long long globalIndex = ((long long)globalBucketIdPrefix + sievingBlockHit) * globalBucketSize + index` (`kernel.cu:490` legacy / `:1087` batch), and the fill-level writeback uses a `uint64_t i_globalBucketId` (`:521` / `:1118`). The original 32-bit multiply wrapped once total bucket entries exceeded 2³² (reachable on >40 GB GPUs at large M), silently corrupting bucket writes — root cause of the RSA-155 H100 M-sweep zero-yield.
+**Shared-memory layout (v1.0.8, `scatterSharedMemReq()`, `device_sieving_controller.cpp:46`):** `[write heads: num_activeBucketsPerThreadBlock int | Gray-step table: max(log2 pbs, 1) × blockDim uint32]`, the table column-major by thread (`dTable[k·blockDim.x + threadIdx.x]`) — each thread touches only its own column (no barrier), and a warp reading one row hits 32 consecutive words (conflict-free). All three loaders and the `validateConfigs()` `EQUAL_CHECK` use the function, so the ≤ v1.0.7 formula `num_activeBucketsPerThreadBlock·4 B` is gone. Measured on A100 (job 34564985): SCATTER dynamic smem **256 → 12,544 B** at the pin (`pbs 8`, `blockDim 1024`), **128 → 8,320 B** at the `w` tuple (`pbs 4`), carveout rung **8 → 32 KiB**. SCATTER is shared with the wide path, which gets the same growth (unmeasured there).
+
+**Bucket addressing (v1.0.8).** Storage is the row-major array `globalBucketEntries[polyBlockId][polyId][cycle][sievingBlock][slot]` with extents `[·][pbs][num_metaSieveCycles][num_activeBlocksPerCycle][globalBucketSize]`; strides `sievingBlockStride = globalBucketSize`, `cycleStride = num_activeBlocksPerCycle·sievingBlockStride`, `polyStride = num_metaSieveCycles·cycleStride` (all `uint32_t`), `polyBlockStride = pbs·polyStride` (`size_t`). The 64-bit part — `polyBlockId·polyBlockStride + cycle·cycleStride` — is formed once per poly block and cycle (`cycleBucketEntries`), `polyId·polyStride` once per poly (widened to `size_t`); a hit only adds its 32-bit slot. The same addresses as before (on Turing nvcc still re-derives part of the base from the kernel parameter, 7 → 5 instructions/poly, `a552e7c`). ⚠ `polyStride` is a 32-bit product: it is one polynomial's buckets across all cycles of a call, `numIntervals · globalBucketSize ≤ (2M/SB) · globalBucketSize` (an RSA-155-scale wide geometry `M = 8,388,608`, `SB = gBS = 131,072` bounds it by `128 · 131,072 = 2^24`), far below 2³² — the multi-GB total that wrapped the pre-fix 32-bit index is formed in `size_t`.
+**64-bit bucket indexing (overflow fix, ≤ v1.0.7 form):** the bucket-write index was `long long globalIndex = ((long long)globalBucketIdPrefix + sievingBlockHit) * globalBucketSize + index`; the fill-level writeback still uses a `uint64_t i_globalBucketId` (`kernel.cu:731` legacy / `:1395` batch). The original 32-bit multiply wrapped once total bucket entries exceeded 2³² (reachable on >40 GB GPUs at large M), silently corrupting bucket writes — root cause of the RSA-155 H100 M-sweep zero-yield.
 
 **Bucket-overflow flag:** the per-bucket fill count is encoded as `min(amountWritten, globalBucketSize) | (overflowed ? 0x80000000 : 0)` (`:523` / `:1120`). The GATHER kernels mask bit 31 off when dumping, so overflow (silently dropped hits past `globalBucketSize`) is otherwise invisible; `DeviceSievingController::getBucketOverflowStats()` surfaces it host-side (wide paths only).
 
@@ -836,6 +857,122 @@ plus SM-derived rungs for the grids and `np` (read from the device, never hardco
   launch and logs `[Sieve] GATHER launch FAILED` at `LOG_ERROR_CRITICAL` (host-side, no sync). It
   does not abort.
 
+## v1.0.8 — Arithmetic Rewrite of the Sieve Kernels
+
+Scope: 14 changes (2026-09-23 → 09-28). Files: `kernel.cu`,
+`kernel.cuh`, `graycode.cuh`, `sieving_data_structs.h`, `device_sieving_controller.cpp`
+(`scatterSharedMemReq()` only). The sieve code of 1.0.8a (the sieve changes alone) and 1.0.8 is
+identical; 1.0.8 adds only the linear-algebra change (device Stage-2 initialization
+basis, block-wiedemann 1.0.2, see [linalg.md](linalg.md)). **No CLI flag, config field, loader default
+or validation rule changed.** Every item is an instruction-count reduction; the mechanisms are
+documented per helper and per loop above, summarised here:
+
+| # | Kernel(s) | Change | Identity |
+|---|---|---|---|
+| 1 | `excludeNonRelations` (legacy, batch, **WideU8Sat**) | word-wise candidate scan, one threshold per word | ⚠ approximation (see *sieveAndScanKernel Detail*) |
+| 2 | narrow GATHER (legacy + batch) | mask offsets once per poly; modulo-free mask indexing | bit-identical by construction |
+| 3 | SCATTER (legacy + batch) | `≫ log2 SB` / `& (SB−1)` instead of `/` `%` | exact (SB pow2, `r ≥ 0`) |
+| 4 | SCATTER (legacy + batch) | window-relative roots `rel`; `2B_k mod p` table in shared memory; `scatterSharedMemReq()` | bucket contents identical |
+| 5 | `initPrimeData{,Batch}Kernel`, SCATTER, all four GATHER prologues | `reducedStart` precomputed; prologue `p` from shared `primes[]`; `advanceRoots(…, p, …)` | identical |
+| 6 | batch SCATTER | per-poly bucket base + 32-bit slot + precomputed high word | same addresses |
+| 7 | batch GATHER | warp-uniform merged-root small band; merged-root mid band | bit-identical |
+| 8 | legacy SCATTER + GATHER | port of 5–7 | bit-identical (80d composite, `--sieve_batch_size 0`) |
+| 9 | batch GATHER | bucket dump unrolled ×4, loads first | bit-identical |
+| 10 | batch GATHER | backward scan via `recordBackwardFactor()`; `abs()` distances | SASS-identical inner loop |
+| 11 | batch SCATTER | branch-free Gray step (`p − d`); named-stride addressing | exact |
+| 12 | batch SCATTER, `graycode.cuh` | `advanceGrayCyclic()` walks `polyId` directly | identical |
+| 13 | everything using `modAdd` | `min(s, s − m)` | exact under stated ranges |
+| 14 | legacy SCATTER + GATHER | port of 9, 11, 12 | bit-identical |
+
+**Not changed:** `excludeNonRelationsWide`, the forward/backward prime bands of `...Wide` and
+`...WideU8Sat` (they get only the shared prologue, `modAdd`, and — WideU8Sat — `excludeNonRelations`),
+the backward-band loop structure (a warp-uniform/merged-root backward band plus a ×4 rescan was tried
+on the Quadro RTX 3000 and measured **+1.4 %**, the rescan alone +0.6 %, not kept), the
+bucket fill-count encoding, and the auto-bucket sizing (the per-call sizing defect is untouched: A100
+`w` 41,104 / 41,216 = 99.7 %, identical on both binaries).
+
+### Measured (all RSA-100, `cgu 0`, relation work identical to v1.0.7)
+
+- **Development series, Quadro RTX 3000 (Turing, n = 1 per step):** sieve **311.17 → 221.27 s
+  (−28.9 %)** across the 14 commits (`--params11 2048,16,8,16,256,1024,1024,1024,32768,2212,228`,
+  `bs 16`); largest single steps: #3 −7.2 %, #4 −6.1 %,
+  #7 −6.3 %, #1 −5.2 %, #9 −3.6 %; #6, #11 are at the noise edge (−0.4 %, −0.5 %).
+- **RTX 5070 Ti (sm_120), interleaved binary A/B v1.0.7 vs v1.0.8a, n = 5/arm**: `win` tuple (`--params11 2048,8,8,8,256,1024,1024,1024,65536,2820,96`,
+  `bs 8`) Total **64.23 → 50.87 s (−20.80 %)**, sieve **−26.63 %**, N2 119.7 → 87.6 ms/batch, board
+  energy −22.80 % / above-idle −22.91 %; `rec` pin (`--params 560,8,8,8,70,1024,280,1024`, `bs 32`)
+  Total −17.68 %, sieve −22.45 %, board −20.77 % / above-idle −20.97 %. `Sieved full` bit-identical
+  across binaries 12/12 per tuple. The in-session A/B is the comparison of record.
+  v1.0.8 vs 1.0.8a: sieve ±0.00 %, Total −0.20 % — the LA change is neutral
+  at RSA-100 (Stage-2 init ≈ −76 ms).
+- **A100 (sm_80), ncu + nsys roofline** (within-run A/B, n = 3):
+  at the pin (`--params 864,8,8,8,108,1024,864,1024`, F = 7M, M = 262,144, `bs 8`) sieve **74.500 →
+  48.4–48.5 ms/batch (−35.0 %)**, GATHER −48.1 % / SCATTER −20.9 % per batch (GATHER carries 75.4 % of
+  the delta); at the tuple `w` (`--params11 2048,8,4,8,512,1024,1024,1024,131072,4388,356
+  --sieve_offsets_global`, F = 5.5M, M = 524,288) sieve 67.84 → 43.99 s (−35.16 %). Thread-inst:
+  **GATHER −42.27 % / −40.22 %, SCATTER −48.48 % / −42.40 %** (pin / `w`) at **unchanged** shared
+  atomics, bank-conflict wavefronts, GATHER DRAM reads and SCATTER DRAM writes — a pure work cut; the
+  bucket stream is not reduced. Energy (within-job): pin board −29.47 % / above-idle −28.74 %; `w`
+  −26.99 % / −24.87 % at mean power +11.4 %. Full-pipeline receipts (n = 1): Total −27.15 % (pin) /
+  −29.28 % (`w`), LinAlg flat.
+- **TITAN RTX (sm_75)** (the v1.0.7 `win` argv verbatim, n = 3):
+  Total **137.76 → 111.74 s (−18.89 %)**, sieve 112.59 → 86.64 s (**−23.05 %**), N2 −23.1 %; board
+  −20.5 % / above-idle −20.7 % (vs the same-day v1.0.7 control). 99.6 % of the gain is the sieve. The
+  per-kernel split on sm_75 is **unmeasured** (no ncu); attributing it to GATHER instruction removal
+  is inferred from the A100 data.
+- **A100 full pipeline** (F = 5.5M / M = 524,288): 57.64 s. This is a different operating point from
+  the v1.0.7 A100 figures (F = 7M / M = 262,144) and is not a version comparison.
+- **H100 (sm_90), full pipeline** (n = 3): the v1.0.7 H100 command line
+  verbatim (`--params11 2048,8,8,8,256,1024,1024,1024,131072,8100,260 --sieve_hc_dim 12`, F = 5.5M,
+  M = 524,288, `bs 8`, `cgu 0`, auto bucket) — Total **38.30 → 31.57 s (−17.57 %)**, sieve
+  **28.31 → 22.13 s (−21.8 %)**, ≈ 92 % of the delta in the sieve, LinAlg/sqrt flat within spread;
+  relation work identical (`Sieved full` 99,814, 285 batches, bucket fill 99.93 % as in v1.0.7). The
+  v1.0.7 figure is from a different node (cross-node comparison), so the comparison and the energy figures (board −20.3 % /
+  above-idle −20.6 %; H100 cross-node energy spread ≈ 4 %) are indicative only.
+  H100 registers and residency for v1.0.8 are not measured. With the v1.0.8 `--param_test` winner
+  (`--params11 2048,8,4,8,512,1024,1024,1024,131072,8100,164`, same job, n = 3) Total is **29.18 s**
+  (−7.57 % vs the v1.0.7 tuple, board energy +2.33 % / above-idle +3.63 %) — the best H100 figure.
+- RSA-150/155 (wide/u8sat): **unmeasured**.
+
+### ⚠ Residency, registers and the new SCATTER regime (A100)
+
+- **GATHER (`sieveAndScanBatchKernel`) stays 64 registers / 0 spills / `STACK 0`** on `sm_80` in both
+  binaries (static and runtime); legacy `sieveAndScanKernel` 64, wide kernels 63, unchanged. The
+  zero-margin fits therefore **persist, not relax**: `2 × 512 × 64 = 65,536` for the 512-thread A100
+  v1.0.7 winner (2 blk/SM), and `1 × 1024 × 64 = 65,536` for 1024-thread tuples (where
+  `__launch_bounds__(1024)` would force a spill rather than a 65th register). One more register
+  anywhere in GATHER still silently halves the residency of every 512-thread 2-blk/SM tuple with no
+  diagnostic (`--params11` skips `preflightKernelLaunch`). `sm_90` / `sm_75` / `sm_120` register counts
+  for v1.0.8 are **not measured**.
+- **SCATTER (`globalMetaSieveBatchKernel`) drops 40 → 32 registers ⇒ 2 blk/SM** (was 1, register-
+  limited; now smem 2 / regs 2 / warps 2 at the pin). At `metaBlockDim 1024`, `2 × 1024 × 32 = 65,536`
+  is itself an **exact register-file fit** (arithmetic from the measured counts): a 33rd register
+  returns SCATTER to 1 blk/SM, again silently.
+- **SCATTER changes regime:** from ALU-issue-bound (SM SoL 72 %, stall budget 7.7 cyc/issue) to
+  **latency-bound** (`long_scoreboard` 1.5 → 5.4 at the pin, 2.1 → 14.8 at `w`; budget ×1.8 / ×3.8).
+  Its instructions roughly halve but its wall falls only 13–23 %; the bucket store stream and the
+  shared-atomic bank conflicts are now its floor. **SCATTER is the largest kernel at the A100 pin**
+  (50.2 % of the window, GATHER 44.1 %).
+- ⚠ **The SM-aligned pins under-fill SCATTER now.** The A100 pin's `metaGridDim = 108` is one wave at
+  1 blk/SM but **0.5 wave at 2 blk/SM** (achieved occupancy 50 % of a 100 % theoretical). Raising
+  `metaGridDim` (e.g. 216) is an untested candidate. The `--param_test` SCATTER faces were tuned
+  against v1.0.7 residency.
+- ⭐ **SCATTER is no longer a free control.** Through v1.0.7 its thread-inst were bit-identical across
+  binaries and it served as the control kernel of every profiling A/B; from v1.0.8 on it is a
+  treatment kernel. Use `initPrimeData*` (unchanged, 2.60 ms/batch both binaries on A100) or the
+  work-identity series instead.
+- The larger SCATTER dynamic smem moves the A100 carveout rung 8 → 32 KiB, i.e. ≈ 24 KiB/SM less L1
+  while SCATTER runs (SCATTER L1 hit 65.4 → 65.3 %, no measured effect).
+
+### Wide path exposure (RSA-150/155) — changed code, no measurement
+
+v1.0.8 is **not** wide-neutral: the production kernel `sieveAndScanBatchKernelWideU8Sat` runs the
+word-wise `excludeNonRelations` (with its threshold approximation) and the shared-`primes[]`
+prologue; the shared SCATTER kernel runs every SCATTER change including the larger Gray-step table
+(`log2(pbs) × blockDim × 4 B` more dynamic smem per block); `modAdd` is changed everywhere. No
+RSA-150/155 run, wide profile or wide A/B exists on v1.0.8. **Treat v1.0.8 as unvalidated at
+RSA-150/155** until a wide-path regression run passes; the sanctioned frozen production binary is
+unaffected.
+
 ## Batch Sieving (GPU-Only Mode)
 
 Selected when `sieve_batch_size > 0`. Eliminates CPU-GPU synchronization in the inner loop by pre-uploading K polynomial configurations and running all steps on-device:
@@ -846,7 +983,7 @@ Selected when `sieve_batch_size > 0`. Eliminates CPU-GPU synchronization in the 
 
 2. **`runSievingBatch(num_steps, start_batch_index)`** (host) — launches the GPU inner loop, which for each step executes:
    - `resetBatchCountersKernel` — zero bucket counters and per-block relation counts
-   - `initPrimeDataBatchKernel` — compute per-prime inverses for this step's a
+   - `initPrimeDataBatchKernel` — compute per-prime inverses for this step's a; **v1.0.8:** also `reducedStart = sieveIntervalStart mod p` from the new `sieveIntervalStart` argument (`ds_params.startIndex`, the value the SCATTER launch below gets)
    - `markInactivePrimesBatchKernel` — mark primes dividing a
    - `globalMetaSieveBatchKernel` — large-prime bucket pre-computation
    - `sieveAndScanBatchKernel` / `...Wide` / `...WideU8Sat` — sieve, scan, trial divide (width selected by the host dispatch, see above)

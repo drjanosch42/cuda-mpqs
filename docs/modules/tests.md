@@ -175,6 +175,8 @@ When explicit `--autotune_stage{0-3}` flags are provided, only those stages run 
 | `--bw_max_solutions <N>` | `-1` (ALL) | Stop BW Stage-3 reconstruction after `N` solutions; wires the submodule's `stage3_max_solutions`. ⚠ A solution-**COUNT** stop, **not** a batch cap — an under-delivering config still *enters* a later reconstruction batch and can burn hours there for zero yield |
 | `--bw_checkpoint_dir <path>` | `""` (off) | Save the Krylov S-sequence / lingen Π / final solutions at stage boundaries under `<path>/bw*`. **Save only** — it never loads without `--bw_resume` |
 | `--bw_resume` | off | Load previously-**completed**-stage artifacts from `--bw_checkpoint_dir` and skip those stages. **Stage boundaries only:** resumes from the last completed stage, never mid-stage, so a crash inside Stage 3 restarts Stage 3 from scratch. **NOT validated end-to-end** — only the *save* side has ever run in production |
+| `--bw_init_cpu` | off | Stage-2 initialization basis on the CPU reference routine (`stage2_init_on_gpu = false`); downloads S. Default is the bit-identical device kernel (block-wiedemann 1.0.2) |
+| `--bw_init_verify` | off | Run device and CPU Stage-2 init, compare t0 / rank / pairs / F_init / gamma, abort with `Basecase InitCheck mismatch` on divergence (`stage2_init_cross_check`); downloads S |
 
 Parsed at `tests/cuda-mpqs.cpp:926-945`, wired at `src/orchestrator/orchestrator.cpp:6894-6920`;
 config fields `include/orchestrator.h:292-296`. See [linalg.md](linalg.md) for the block-width
@@ -240,15 +242,16 @@ test on every recorded large prime**. Per relation (smooths and partials) it che
 Compiled as CUDA (for the `__host__ __device__` math headers) but launches no kernels; parallelised
 with OpenMP. Not registered as a CTest target (it takes a relations-file argument).
 
-## CTest Targets (16)
+## CTest Targets (17)
 
-**Sixteen** regression tests are registered with CTest (`add_test` in `tests/CMakeLists.txt`;
+**Seventeen** regression tests are registered with CTest (`add_test` in `tests/CMakeLists.txt`;
 counted directly from that file, 2026-08-25 — the previous count of 13 predated
 `admissible_geometry`, `sieve_geometry_overrides` and `graph_capture_scope` and is **superseded**).
 All are compiled as CUDA (for the `__host__ __device__` math headers) and are deterministic. All but
 two launch no kernels and need no CUDA device; the exceptions are `packed_char_device_parity`
 (drives the real M9v2 packed GPU pipeline) and `oom_guard` (queries device properties) — both of
-which **skip cleanly with exit 0** when no CUDA device is present.
+which **skip cleanly with exit 0** when no CUDA device is present. `bw_init_basis` (v1.0.8) also launches
+kernels and **requires** a CUDA device.
 
 **Branch-fixed character columns, Stages 1–6** (7 tests):
 
@@ -289,6 +292,12 @@ that lives there only) and commit the result. *(Corrected 2026-08-25: the earlie
 | `work_pool_cursor` | `WorkPool::completedPrefixCursor()` returns the completed contiguous prefix (min over in-flight ∪ returned), not `nextCursor()` |
 | `cluster_resume` | `computeResumeTrim` per-node initial-range trim (+ re-sieve-last-hypercube guard), `clusterResumeTopologyOk` N2 topology guard, re-inject ordering (`addRelations` rebuilds dedup before partial combines) |
 | `work_assign_hash` | v2 `WORK_ASSIGN` wire format: FB-hash round-trip with fb_size-independent payload (the 64 MiB frame-cap fix), `generateFactorBase(N, F)` regen-equivalence, mismatch detection (fail-loud worker path) |
+
+**Block Wiedemann Stage-2 initialization** (1 test, v1.0.8 / block-wiedemann 1.0.2, source `src/linalg/tests/test_init_basis_gpu.cu`):
+
+| Test | Certifies |
+|------|-----------|
+| `bw_init_basis` | The device initialization basis (`k_find_init_basis` / `k_build_f_init`, `src/linalg/src/lingen/stage2/init_basis.cu`) against the CPU reference, bit for bit: t0, rank, status, the pairs in order, the pivot mask on rank failure, the F_init bytes (plus an untouched guard coefficient) and gamma. Cases: random S for (m, n) ∈ {64,128,256}² ∪ {(256,64), (64,256), (512,512)} and non-multiple-of-64 shapes; rank-deficient S_0 (t0 = 2); t0 > 2 (rank m/4 per coefficient, n = 64 with m = 256/512); zero columns and coefficients; XOR-dependent columns across coefficients; rank never reached (all-zero S, a rank m−1 hyperplane); resolution only at the last column; 300 seeded fuzz instances. Needs a CUDA device; exit 0 iff all match |
 
 **Graph-capture scope** (1 test, v1.0.6, source `tools/sqrt_failure/test_graph_capture_scope.cu`):
 

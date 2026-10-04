@@ -294,6 +294,8 @@ struct MPQSConfig {
     int32_t bw_max_solutions = -1;       // BW Stage 3 solution cap (-1 = ALL)
     std::string bw_checkpoint_dir = "";  // BW stage-boundary checkpoint dir ("" = off)
     bool bw_resume = false;              // Load BW stage checkpoints and resume
+    bool bw_init_cpu = false;            // BW Stage 2 init basis on the CPU reference path (downloads S)
+    bool bw_init_verify = false;         // BW Stage 2 init: run device + CPU, abort on mismatch (downloads S)
 
     // Component Configs
     postprocessing::PostProcConfig pp_config;

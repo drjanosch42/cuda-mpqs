@@ -142,6 +142,47 @@ void recordBackwardFactor(uint8_t* __restrict__ blockEntries,
     atomicAdd((uint32_t*)&candidates[globalIdx].num_factors, 1);
 }
 
+/*
+ * SCATTER Gray-code step of a prime's two window-relative roots (rel = (root - start) mod p).
+ *
+ * A Gray step to the next poly flips one hypercube bit k (a GrayFlip) and moves both roots by -+2*B_k
+ * (B_k = b_k * a^-1 mod p): minus when bit k becomes 1, plus when it becomes 0 -- the same step
+ * advanceRoots takes as two +-B_k modSums per root. Here 2*B_k is reduced mod p ONCE (< p), so
+ * each root needs one 32-bit modAdd with a single conditional correction; adding 2*B_k
+ * unreduced would need two corrections.
+ *
+ * Inside a SCATTER poly block only bits 0 .. log2(polyBlockSize)-1 ever flip. Their 2*B_k mod p
+ * are staged per prime in shared memory, dTable[k * blockDim.x] = this thread's column (written
+ * by storeDoubledBValues), so every step reads shared memory instead of the global B-value table,
+ * for any polyBlockSize. Each thread only touches its own column: no barrier needed, and a warp
+ * reading one row hits 32 consecutive words (conflict-free).
+ */
+__device__ __forceinline__
+void advanceRelRootsScatter(GrayFlip flip, uint32_t p, const uint32_t* dTable, uint32_t& rel1, uint32_t& rel2)
+{
+    const uint32_t d = dTable[flip.bit * blockDim.x]; // 2*B_bit mod p
+    // The roots move by -d when the flipped bit became 1 and by +d when it became 0. Subtracting d is
+    // adding p - d (in [1, p]; modAdd is exact for a summand == p), so each root is one modAdd.
+    const uint32_t delta = flip.nowSet ? p - d : d;
+    rel1 = modAdd(rel1, delta, p);
+    rel2 = modAdd(rel2, delta, p);
+}
+
+/*
+ * Stages 2*B_k mod p, k < log2(polyBlockSize), of this thread's prime into its column of the
+ * SCATTER shared Gray-step table (see advanceRelRootsScatter). B_k < p < 2^31, so 2*B_k does not
+ * overflow and one conditional subtract reduces it.
+ */
+__device__ __forceinline__
+void storeDoubledBValues(uint32_t* dTable, const uint32_t* __restrict__ bvalues, uint32_t log2_polyBlockSize,
+                         uint32_t primeIndex, uint32_t fb_size, uint32_t p)
+{
+    for (uint32_t k = 0; k < log2_polyBlockSize; k++) {
+        uint32_t d = bvalues[(size_t)k * fb_size + primeIndex] << 1;
+        dTable[k * blockDim.x] = (d >= p) ? d - p : d;
+    }
+}
+
 __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_pointers, fixedSievingParams fs_params, dynamicSievingParams ds_params, generalSievingConfig gs_conf, sieveAndScanConfig ss_conf)//We want gridDim.x blocks with size of blockDim.x
 {
     primeDataSIQS* primeData = dev_pointers.dev_primeData;
@@ -183,6 +224,13 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
     else{
         candidatesFound = dev_pointers.dev_blockRelationCounts[blockIdx.x];
     }
+    // Small-prime mask index arithmetic, reduced mod period ONCE per kernel (blockDim.x, SB and
+    // period are launch constants). Every later index update adds two values < period and so
+    // needs a single conditional subtract -- whatever blockDim.x, SB and period are (period is
+    // only bounded above, 4*period < 64 KiB, so it can be smaller than blockDim.x).
+    const uint32_t maskTid    = threadIdx.x % fs_params.period;                               // thread's first word
+    const uint32_t maskStride = blockDim.x % fs_params.period;                                // per init-loop step
+    const uint32_t maskStep   = (uint32_t)(gs_conf.sievingBlockSize / 4) % fs_params.period;  // per sieve block
     int subCube = ds_params.subCube;
     polyData p_data;
     p_data.approxPolyRoot = fs_params.approxPolyRoot;
@@ -229,8 +277,9 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
         if (poly > 0) {
             __syncthreads();
             for (int i = threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
-                primeDataSIQS curPrimeData = primeData[i];
-		        int p = (int)curPrimeData.p; // Explicit cast
+                // p from the block's own primes[] (+-p, sign = inactive; written in the setup loop)
+                // instead of re-reading primeData[i] from global memory every polynomial.
+                int p = abs(primes[i]);
 
                 // Recalculate current roots based on offsets
                 // ((offset % p) + p) % p ensures positive residue
@@ -238,7 +287,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
                 uint32_t root2 = (uint32_t)(((offsets2[i] % p) + p) % p);
 
                 // Update roots for Gray code step (uses uint32_t internally)
-                advanceRoots(prevPolyId, polyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
+                advanceRoots(prevPolyId, polyId, (uint32_t)p, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
 
                 reducedSieveStart = ((sieveIntervalStart % p) + p) % p;
 
@@ -251,20 +300,34 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
         }
         __syncthreads();
 
+        // Small-prime mask word offsets, found ONCE per polynomial. findMaskOffsets returns the
+        // unique byte offset o in [0, 4*period) with o = sieveStart - R (mod period) and
+        // o = 0 (mod 4), where R is the CRT combination of the mask primes' roots (period is odd,
+        // so the two congruences fix o). R is constant across the sieve blocks of a polynomial:
+        // the mask primes' offsets only ever advance by multiples of p. Moving sieveStart on by
+        // SB (a multiple of 4) therefore moves o on by SB mod 4*period, i.e. the word offset
+        // o/4 on by SB/4 mod period -- exactly what a fresh findMaskOffsets call would return.
+        uint32_t* smallPrimeMask = dev_pointers.dev_smallPrimeMask;
+        uint32_t* CRT_baseElements = dev_pointers.dev_CRT_baseElements;
+        uint32_t maskOffset1;
+        uint32_t maskOffset2;
+        findMaskOffsets(sieveIntervalStart,  offsets1, offsets2, primes, maskOffset1, maskOffset2, fs_params.smallPrimesUsed, fs_params.period, CRT_baseElements);
+
         for (int sieveBlock = 0; sieveBlock < gs_conf.num_sievingBlocksPerSieveCall; sieveBlock++) {
             int sieveBlockStart = sieveIntervalStart + sieveBlock * gs_conf.sievingBlockSize;
             int sieveBlockEnd = sieveBlockStart + gs_conf.sievingBlockSize;
 
-            uint32_t* smallPrimeMask = dev_pointers.dev_smallPrimeMask;
-            uint32_t* CRT_baseElements = dev_pointers.dev_CRT_baseElements;
-            uint32_t maskOffset1;
-            uint32_t maskOffset2;
-            findMaskOffsets(sieveBlockStart,  offsets1, offsets2, primes, maskOffset1, maskOffset2, fs_params.smallPrimesUsed, fs_params.period, CRT_baseElements);
-
             uint32_t* blockEntries32 = reinterpret_cast<uint32_t*>(blockEntries);
+            uint32_t maskIdx1 = maskOffset1 + maskTid; if (maskIdx1 >= fs_params.period) maskIdx1 -= fs_params.period;
+            uint32_t maskIdx2 = maskOffset2 + maskTid; if (maskIdx2 >= fs_params.period) maskIdx2 -= fs_params.period;
             for (int i = threadIdx.x; i < gs_conf.sievingBlockSize/4; i += blockDim.x) {
-                blockEntries32[i] = smallPrimeMask[(maskOffset1 + i) % fs_params.period] + smallPrimeMask[(maskOffset2 + i) % fs_params.period];
+                blockEntries32[i] = smallPrimeMask[maskIdx1] + smallPrimeMask[maskIdx2];
+                maskIdx1 += maskStride; if (maskIdx1 >= fs_params.period) maskIdx1 -= fs_params.period;
+                maskIdx2 += maskStride; if (maskIdx2 >= fs_params.period) maskIdx2 -= fs_params.period;
             }
+            // Advance to the next sieve block (before any 'continue' below).
+            maskOffset1 += maskStep; if (maskOffset1 >= fs_params.period) maskOffset1 -= fs_params.period;
+            maskOffset2 += maskStep; if (maskOffset2 >= fs_params.period) maskOffset2 -= fs_params.period;
             __syncthreads();
             if(threadIdx.x < fs_params.smallPrimesUsed){
                 offsets1[threadIdx.x] = offsets1[threadIdx.x] + ((sieveBlockEnd - offsets1[threadIdx.x] + primes[threadIdx.x] - 1) / primes[threadIdx.x]) * primes[threadIdx.x];
@@ -276,12 +339,22 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
             uint64_t* currentBucketEntries = globalBucketEntries + listStart;
             //dump globalBucketEntries into the current sieving block
             uint32_t currentFillLevel = (dev_pointers.dev_globalBucketCounts[globalBucketId]) & (16777216 - 1);
-            for (int i = threadIdx.x; i < currentFillLevel; i += blockDim.x) {
-                uint32_t val = (uint32_t)currentBucketEntries[i];
-                ATOMIC_BYTE_ADD(blockEntries, val & ((1 << 24) - 1), val >> 24);
+            // Unrolled x4, loads first: four independent bucket reads in flight per thread instead of one
+            // (each atomic needs its entry, so the plain loop waited a full global-load latency per entry).
+            for (int i = threadIdx.x; i < currentFillLevel; i += 4 * blockDim.x) {
+                uint32_t val0 = (uint32_t)currentBucketEntries[i];
+                uint32_t val1 = (i +     blockDim.x < currentFillLevel) ? (uint32_t)currentBucketEntries[i +     blockDim.x] : 0;
+                uint32_t val2 = (i + 2 * blockDim.x < currentFillLevel) ? (uint32_t)currentBucketEntries[i + 2 * blockDim.x] : 0;
+                uint32_t val3 = (i + 3 * blockDim.x < currentFillLevel) ? (uint32_t)currentBucketEntries[i + 3 * blockDim.x] : 0;
+                ATOMIC_BYTE_ADD(blockEntries, val0 & ((1 << 24) - 1), val0 >> 24);
+                if (i +     blockDim.x < currentFillLevel) ATOMIC_BYTE_ADD(blockEntries, val1 & ((1 << 24) - 1), val1 >> 24);
+                if (i + 2 * blockDim.x < currentFillLevel) ATOMIC_BYTE_ADD(blockEntries, val2 & ((1 << 24) - 1), val2 >> 24);
+                if (i + 3 * blockDim.x < currentFillLevel) ATOMIC_BYTE_ADD(blockEntries, val3 & ((1 << 24) - 1), val3 >> 24);
             }
             int midPrimeStart = gs_conf.midPrimeStartIndex;
             __syncthreads();
+            // Small primes [smallPrimesUsed, midPrimeStart) (the ones below come from the mask): one warp per
+            // prime, its parNum lanes interleaved.
             constexpr uint32_t parNum = 32;
             for (int i = fs_params.smallPrimesUsed + (threadIdx.x / parNum); i < midPrimeStart; i += blockDim.x / parNum) {
                 int p = primes[i];
@@ -295,25 +368,34 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
                 // p = abs(p);
                 int offset1 = offsets1[i];
                 int offset2 = offsets2[i];
-		        // Forward Sieve: Offset is signed int, loop terminates when offset >= sieveBlockEnd
-                int offset = offset1 + (threadIdx.x % parNum) * p;
-                for (; offset < sieveBlockEnd; offset += parNum * p) {
-                    //blockEntries[offset - sieveBlockStart] += log_p;
-                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
+                const int offsetStep = parNum * p;
+                int span = sieveBlockEnd - (max(offset1, offset2) + (int)(parNum - 1) * p);
+                int numFullSteps = (span > 0) ? (span + offsetStep - 1) / offsetStep : 0; //Number of steps where 32 consecutive offsets fully fit into the interval
+                int curOffset1 = offset1 + (threadIdx.x % parNum) * p;
+                int curOffset2 = offset2 + (threadIdx.x % parNum) * p;
+                for (int k = 0; k < numFullSteps; k++) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset1 - sieveBlockStart, log_p);
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset2 - sieveBlockStart, log_p);
+                    curOffset1 += offsetStep;
+                    curOffset2 += offsetStep;
                 }
-                if (offset - p < sieveBlockEnd) {
-                    offsets1[i] = offset; //exactly one thread has the correct "last" offset, keep it for the next iteration
+                if (curOffset1 < sieveBlockEnd) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset1 - sieveBlockStart, log_p);
+                    curOffset1 += offsetStep;
                 }
-                offset = offset2 + (threadIdx.x % parNum) * p;
-                for (; offset < sieveBlockEnd; offset += parNum * p) {
-                    //blockEntries[offset - sieveBlockStart] += log_p;
-                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
+                if (curOffset2 < sieveBlockEnd) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset2 - sieveBlockStart, log_p);
+                    curOffset2 += offsetStep;
                 }
-                if (offset - p < sieveBlockEnd) {
-                    offsets2[i] = offset; //exactly one thread has the correct "last" offset, keep it for the next iteration
+                if (curOffset1 - p < sieveBlockEnd) {
+                    offsets1[i] = curOffset1; //exactly one thread has the correct "last" offset, keep it for the next iteration
+                }
+                if (curOffset2 - p < sieveBlockEnd) {
+                    offsets2[i] = curOffset2; //exactly one thread has the correct "last" offset, keep it for the next iteration
                 }
             }
-	    // Small primes handling
+            // Mid primes [midPrimeStart, bigPrimeStartIndex): one thread per prime (the primes above come from
+            // the global buckets, dumped above).
             for (int i = midPrimeStart + threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
                 int p = primes[i];
                 uint8_t log_p = (p <= 0) ? 0 : log2(p);
@@ -321,16 +403,24 @@ __global__ void __launch_bounds__(1024) sieveAndScanKernel(devicePointers dev_po
                 int offset1 = offsets1[i];
                 int offset2 = offsets2[i];
                 //__syncthreads(); //NO SYNC NEEDED HERE, threads access disjoint data
-                int offset = offset1;
-                for (; offset < sieveBlockEnd; offset += p) {
-                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
+                // Both roots in one loop: they lie less than p apart, so once the further one has left the
+                // block the other has at most one hit left.
+                int curOffset1 = offset1;
+                int curOffset2 = offset2;
+                for (; max(curOffset1, curOffset2) < sieveBlockEnd; curOffset1 += p, curOffset2 += p) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset1 - sieveBlockStart, log_p);
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset2 - sieveBlockStart, log_p);
                 }
-                offsets1[i] = offset; //keep the offset for the next iteration
-                offset = offset2;
-                for (; offset < sieveBlockEnd; offset += p) {
-                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
+                if (curOffset1 < sieveBlockEnd) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset1 - sieveBlockStart, log_p);
+                    curOffset1 += p;
                 }
-                offsets2[i] = offset; //keep the offset for the next iteration
+                if (curOffset2 < sieveBlockEnd) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset2 - sieveBlockStart, log_p);
+                    curOffset2 += p;
+                }
+                offsets1[i] = curOffset1; //keep the offset for the next iteration
+                offsets2[i] = curOffset2;
             }
             __syncthreads();
 
@@ -489,6 +579,26 @@ __global__ void globalMetaSieveKernel(devicePointers dev_pointers, fixedSievingP
 
     extern __shared__ int sharedData[];
     int* global_bucket_write_head = sharedData;
+    // Gray-step table after the write heads (layout: scatterSharedMemReq, device_sieving_controller.cpp);
+    // this thread's column.
+    uint32_t* dTable = (uint32_t*)(sharedData + gms_conf.num_activeBucketsPerThreadBlock) + threadIdx.x;
+
+    // Bucket storage is a row-major array
+    //   globalBucketEntries[polyBlockId][polyId][cycle][sievingBlock][slot]
+    // with extents [.][polyBlockSize][num_metaSieveCycles][num_activeBlocksPerCycle][globalBucketSize].
+    // Each stride is the product of the extents to its right; every term of a bucket address is
+    // formed in the outermost loop where it is constant.
+    const uint32_t sievingBlockStride = gs_conf.globalBucketSize;                              // one bucket
+    const uint32_t cycleStride        = gms_conf.num_activeBlocksPerCycle * sievingBlockStride;
+    const uint32_t polyStride         = gms_conf.num_metaSieveCycles      * cycleStride;
+    const size_t   polyBlockStride    = (size_t)gms_conf.polyBlockSize    * polyStride;
+
+    // Cyclic Gray walk through a poly block (advanceGrayCyclic); each warp starts at walk index
+    // polyWalkStart. For pbs == 1 there is no step; polyBlockHalf = 1 then keeps the (discarded)
+    // trailing step on table row 0, which scatterSharedMemReq always provides.
+    const uint32_t polyWalkStart = (threadIdx.x / 32) % gms_conf.polyBlockSize;
+    const uint32_t polyBlockMask = gms_conf.polyBlockSize - 1;
+    const uint32_t polyBlockHalf = max(gms_conf.polyBlockSize >> 1, 1u);
 
     /*
     ---------------------------------------------------------------------------
@@ -511,6 +621,8 @@ __global__ void globalMetaSieveKernel(devicePointers dev_pointers, fixedSievingP
             __syncthreads();
             int polyBlockId = blockIdx.x + gms_conf.num_threadBlocks * curPolyBlock;
             int fullPolyIdPrefix = (subCube * gs_conf.num_polysPerSieveCall) + (polyBlockId << gms_conf.log2_polyBlockSize);
+            // This poly block's buckets in the current cycle (see the bucket layout above).
+            uint64_t* cycleBucketEntries = globalBucketEntries + polyBlockId * polyBlockStride + (size_t)cycle * cycleStride;
 
             /*
             -------------------------------------------------------------------
@@ -518,29 +630,47 @@ __global__ void globalMetaSieveKernel(devicePointers dev_pointers, fixedSievingP
             -------------------------------------------------------------------
             */
             for(int currentPrimeIndex = threadIdx.x + gs_conf.bigPrimeStartIndex; currentPrimeIndex < fs_params.fb_size; currentPrimeIndex += blockDim.x){
-                int polyIndex = ((threadIdx.x/32) % gms_conf.polyBlockSize);
-                int polyId = gray(polyIndex);
+                uint32_t polyId = gray(polyWalkStart);
                 int fullPolyId = fullPolyIdPrefix | polyId;
                 primeDataSIQS curPrimeData = primeData[currentPrimeIndex];
                 uint32_t p = curPrimeData.p;
                 int log2p = (31 - __clz(p)) * (1 - curPrimeData.inactive);
+                // High word of every bucket entry this prime writes (the prime index; see the store below).
+                uint64_t primeIndexEntry = ((uint64_t)currentPrimeIndex) << 32;
                 uint32_t root1;
                 uint32_t root2;
                 rootsFromPolyId(fullPolyId, shc_dim, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)currentPrimeIndex, fs_params.fb_size, root1, root2);
                 int maxOffsetCount = ((gms_conf.num_activeBlocksPerCycle * gs_conf.sievingBlockSize) / (primeData[currentPrimeIndex - threadIdx.x].p)) + 1; //using the first prime as an upper bound to have a constant inner loop length
-                int reducedSieveStart = ((currentStart % (int)p) + (int)p ) % (int)p;// Formula: ((S % p) + p) % p ensures result is in [0, p-1]
+                // currentStart mod p in [0, p). initPrimeDataKernel precomputed it for the startIndex it saw,
+                // which (it runs only on a new cube) equals currentStart only for meta-cycle 0 of a single
+                // sieving-block batch -- always the case on the narrow path (numIntervals * SB == 2M).
+                int reducedSieveStart = (cycle == 0 && gs_conf.num_sievingBlockBatches == 1)
+                    ? (int)curPrimeData.reducedStart
+                    : ((currentStart % (int)p) + (int)p ) % (int)p;// Formula: ((S % p) + p) % p ensures result is in [0, p-1]
+                // Track each root as its distance from the window start, rel = (root - currentStart) mod p
+                // in [0, p), instead of as an absolute residue. This is exactly the old per-poly
+                // (offset - currentStart) = p - modSub_shifted(start, root, p), computed once per prime
+                // instead of per poly and root. advanceRoots adds +-2B mod p, which moves rel exactly as
+                // it moves the root, so rel is advanced in place and never needs re-deriving (it is
+                // re-initialised here whenever currentStart changes, i.e. per meta-sieve cycle).
+                uint32_t rel1 = modSub(root1, (uint32_t)reducedSieveStart, p);
+                uint32_t rel2 = modSub(root2, (uint32_t)reducedSieveStart, p);
+                // 2*B_k mod p for the bits that flip inside the poly block, staged once per prime.
+                storeDoubledBValues(dTable, dev_pointers.dev_primeBValues, gms_conf.log2_polyBlockSize, (uint32_t)currentPrimeIndex, fs_params.fb_size, p);
 
                 /*
                 ---------------------------------------------------------------
                 POLYS LOOP
                 ---------------------------------------------------------------
                 */
-                for(int polyCounter = 0; polyCounter < gms_conf.polyBlockSize; polyCounter++){
-                    int globalBucketIdPrefix = ((((long long)polyBlockId) * gms_conf.polyBlockSize + polyId) * gms_conf.num_metaSieveCycles + cycle) * gms_conf.num_activeBlocksPerCycle;
+                for(uint32_t polyStep = polyWalkStart + 1; polyStep <= polyWalkStart + gms_conf.polyBlockSize; polyStep++){
+                    // This poly's buckets; a hit then only needs its 32-bit slot within them.
+                    uint64_t* polyBucketEntries = cycleBucketEntries + (size_t)polyId * polyStride;
                     int offsetCounter = 0;
-		            // Advance roots from previous to next poly
-                    int offset1 = currentStart - (int)modSub_shifted((uint32_t)reducedSieveStart, root1, p) + (int)p;
-                    int offset2 = currentStart - (int)modSub_shifted((uint32_t)reducedSieveStart, root2, p) + (int)p;
+                    // Hits of each root relative to currentStart: rel, rel + p, rel + 2p, ... (copies, so
+                    // rel itself stays in [0, p) for advanceRoots).
+                    uint32_t r1 = rel1;
+                    uint32_t r2 = rel2;
 
                     /*
                     -----------------------------------------------------------
@@ -548,42 +678,43 @@ __global__ void globalMetaSieveKernel(devicePointers dev_pointers, fixedSievingP
                     -----------------------------------------------------------
                     */
                     for(offsetCounter = 0; offsetCounter < maxOffsetCount; offsetCounter++){
-                        int curOffset = offset1;
+                        uint32_t curRel = r1;
                         for (int i = 0; i < 2; i++) {
-                            // Logic: curOffset is a coordinate >= currentStart.
-                            // Subtraction yields a non-negative relative index.
-                            int sievingBlockHit = (curOffset - currentStart) / gs_conf.sievingBlockSize;
+                            // curRel is the hit's position relative to currentStart (>= 0).
+                            // SB is a power of two on every path (validateConfigs POW2_CHECKs it), so the
+                            // block index and in-block offset are a shift and a mask. A runtime '/' and '%'
+                            // by SB cost a full unsigned division per root hit in this innermost loop.
+                            int sievingBlockHit = (int)(curRel >> gs_conf.log2_sievingBlockSize);
                             if (sievingBlockHit < gms_conf.num_activeBlocksPerCycle) {
                                 int activeBucketId =  polyId * gms_conf.num_activeBlocksPerCycle + sievingBlockHit;
                                 int index = atomicAdd(&global_bucket_write_head[activeBucketId], 1); // reserve an index
                                 if (index < gs_conf.globalBucketSize) {
                                     // the bucket is not full yet, so write in it
-                                    int sievingBlock_offset = (curOffset - currentStart) % gs_conf.sievingBlockSize; // no subtract needed if currentStart is a multiple of the blockSize
-                                    int entry = sievingBlock_offset | (log2p << 24); // leading 8 bits store the log2 value and the other 24 the offset
+                                    int sievingBlock_offset = curRel & offsetMask; // no subtract needed if currentStart is a multiple of the blockSize
+                                    uint32_t entry = sievingBlock_offset | (log2p << 24); // leading 8 bits store the log2 value and the other 24 the offset
                                     /*
                                     The activeBucketId is given by;
                                     activeBucketId = [polyId] [sievingBlock]
                                     The global bucket id is given by:
                                     globalBucketId = [polyBlockId] [polyId] [cycle] [sievingBlock]
                                     */
-                                    long long int globalIndex = ((long long)globalBucketIdPrefix + sievingBlockHit) * gs_conf.globalBucketSize + index;
+                                    uint32_t bucketIndex = (uint32_t)sievingBlockHit * sievingBlockStride + index; // slot within this poly's buckets
                                     // If we want to store the prime value, we do:
-                                    // globalBucketEntries[globalIndex] = (((uint64_t)p) << 32) | entry;
+                                    // polyBucketEntries[bucketIndex] = (((uint64_t)p) << 32) | entry;
                                     // But we store the index instead:
-                                    globalBucketEntries[globalIndex] = (((uint64_t)currentPrimeIndex) << 32) | entry;
+                                    polyBucketEntries[bucketIndex] = primeIndexEntry | entry;
                                 }
                             }
-                            curOffset = offset2;
+                            curRel = r2;
                         }
-                        offset1 += (int)p; // Signed increment
-                        offset2 += (int)p;
+                        r1 += p;
+                        r2 += p;
                     }
                     //Offsets loop finished, prepare offsets of the next polynomial for the same prime
-                    int prevFullPolyId = fullPolyId;
-                    polyIndex = modAdd(polyIndex, 1, gms_conf.polyBlockSize);
-                    polyId = gray(polyIndex);
-                    fullPolyId = fullPolyIdPrefix | polyId;
-                    advanceRoots(prevFullPolyId, fullPolyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)currentPrimeIndex, fs_params.fb_size, root1, root2);
+                    // Next poly of the walk (after the last poly the step is wasted but harmless: rel is
+                    // re-initialised for the next prime). polyId stays the Gray code of the walk index.
+                    const GrayFlip flip = advanceGrayCyclic(polyStep, polyBlockMask, polyBlockHalf, polyId);
+                    advanceRelRootsScatter(flip, p, dTable, rel1, rel2);
                 }
                 //poly loop finished, nothing to do here
             }
@@ -671,6 +802,8 @@ __global__ void initPrimeDataKernel(devicePointers dev_pointers, generalSievingC
         }
 
         tmpPrimeData.p = p;
+        // ds_params.startIndex mod p in [0, p), read by globalMetaSieveKernel (see its guard there).
+        tmpPrimeData.reducedStart = (uint32_t)(((ds_params.startIndex % (int)p) + (int)p) % (int)p);
         tmpPrimeData.inv_aN = (uint32_t)(((uint64_t)result * rootN[i]) % p);
 
         //save the initialized primData to global memory
@@ -873,7 +1006,7 @@ Updates roots when moving between adjacent Gray codes.
 Uses the precalculated B_value for the flipped bit.
 */
 __device__ __forceinline__
-void advanceRoots(uint32_t id1, uint32_t id2, const primeDataSIQS& primeData,
+void advanceRoots(uint32_t id1, uint32_t id2, uint32_t p,
                   const uint32_t* __restrict__ bvalues, uint32_t primeIndex, uint32_t fb_size,
                   uint32_t& root1, uint32_t& root2) {
     // No Gray-code transition (id1 == id2, e.g. when polyBlockSize == 1): the roots
@@ -895,13 +1028,13 @@ void advanceRoots(uint32_t id1, uint32_t id2, const primeDataSIQS& primeData,
     // B_values are column-major in the separate array: bvalues[bitToFlip*fb_size + primeIndex].
     int32_t delta = sign * (int32_t)bvalues[(size_t)bitToFlip * fb_size + primeIndex];
 
-    root1 = modSum(root1, delta, primeData.p);
-    root1 = modSum(root1, delta, primeData.p); // Applied twice (original logic?) - Yes, usually for N/A vs -N/A shift?
+    root1 = modSum(root1, delta, p);
+    root1 = modSum(root1, delta, p); // Applied twice (original logic?) - Yes, usually for N/A vs -N/A shift?
     // Actually in MPQS hypercube, root update is typically +/- 2*B_val.
     // The original code did it twice. We preserve this exact control flow.
 
-    root2 = modSum(root2, delta, primeData.p);
-    root2 = modSum(root2, delta, primeData.p);
+    root2 = modSum(root2, delta, p);
+    root2 = modSum(root2, delta, p);
 }
 
 /*
@@ -961,43 +1094,52 @@ int excludeNonRelations(
     if (threadIdx.x == 0) candidateWriteHead = candidatesFound;
     __syncthreads();
 
-    for(int i = 0; i < sievingBlockSize; i += blockDim.x){
-        int index = i + threadIdx.x;
+    // Word-wise scan: thread t starts at the 32-bit word t, i.e. positions 4t..4t+3. One LDS.32 and
+    // one STS.32 replace four byte loads and four byte stores, and a warp touches 32 distinct
+    // words in 32 distinct banks (conflict-free). sievingBlockSize is a power of two >= 256 and
+    // blockEntries is 4-byte aligned in every caller, so the words tile the block exactly.
+    //
+    // approxPolyVal = log2_a + log2|x - r| + log2|x + r| is evaluated ONCE per word, at its
+    // first position x = globalIndex. Across 4 consecutive positions the floored logs change
+    // only where a distance crosses a power of two or passes a root, so the threshold is off by
+    // at most a unit or two on a vanishing fraction of words. This is a deliberate approximation
+    // of the per-position test; the candidate set is therefore NOT bit-identical to the
+    // per-byte version.
+    const int posRoot = (int)approxPolyRoot;
+    const int negRoot = -posRoot;
+    uint32_t* blockEntries32 = reinterpret_cast<uint32_t*>(blockEntries);
+    for(int index = 4 * threadIdx.x; index < sievingBlockSize; index += 4 * blockDim.x){
+        int globalIndex = startOffset + index;
 
-        bool isCandidate = false;
-        if(index < sievingBlockSize){
-            int globalIndex = startOffset + index;
+        // Distances to the two real roots +-approxPolyRoot (|x| <= M, so everything fits in int).
+        int dist1 = abs(globalIndex - negRoot);
+        int dist2 = abs(globalIndex - posRoot);
 
-            // Manual distance calculation to replace abs()
-            // dist = |globalIndex - approxPolyRoot| and dist = |globalIndex - (-approxPolyRoot)|
-            uint32_t dist_minus = (globalIndex >= (int)approxPolyRoot) ? (globalIndex - approxPolyRoot) : (approxPolyRoot - globalIndex); // absolute distane to "left" root
-            uint32_t dist_plus  = (globalIndex >= -(int)approxPolyRoot) ? (globalIndex + approxPolyRoot) : (-approxPolyRoot - globalIndex); // absolute distance to "right" root
+        int approxPolyVal = log2_a + log2(dist1) + log2(dist2);// our log2 returns 0 if distance is 0
 
-            int approxPolyVal = log2_a + log2((int)dist_minus) + log2((int)dist_plus);// our log2 returns 0 if distance is 0
-            isCandidate = blockEntries[index] > (approxPolyVal - threshold);
-            blockEntries[index] = isCandidate;
-        }
+        uint32_t entries = blockEntries32[index >> 2];
+        uint32_t result = 0; // candidate flags, one byte per position, written back in one store
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            // Unsigned comparison exactly as before (threshold is uint32_t).
+            bool isCandidate = ((entries >> (8 * k)) & 0xFFu) > (approxPolyVal - threshold);
+            if (isCandidate) {
+                int candidateIndex = atomicAdd(&candidateWriteHead, 1);
 
-        if (isCandidate) {
-            int candidateIndex = atomicAdd(&candidateWriteHead, 1);
-            
-            if(candidateIndex < maxPerBlock) { // Prevent buffer overflow.
-                indexToCandidate[index] = candidateIndex;
+                if(candidateIndex < maxPerBlock) { // Prevent buffer overflow.
+                    indexToCandidate[index + k] = candidateIndex;
 
-                candidates[candidateIndex].b = b;
-                candidates[candidateIndex].poly_id = poly_id;
-                candidates[candidateIndex].sieve_offset = startOffset + index;
-                candidates[candidateIndex].num_factors = 0; // Initialize counter
+                    candidates[candidateIndex].b = b;
+                    candidates[candidateIndex].poly_id = poly_id;
+                    candidates[candidateIndex].sieve_offset = globalIndex + k;
+                    candidates[candidateIndex].num_factors = 0; // Initialize counter
+                    result |= 1u << (8 * k);
+                }
+                // else: buffer full -- the byte stays 0. CRITICAL: the backward scan must not see
+                // this entry, or it would read uninitialized indexToCandidate data (Illegal Access).
             }
-            else
-            {
-                // CRITICAL:
-                // If buffer is full, we MUST mark this entry as false.
-                // Otherwise, the backward scan will try to process it using
-                // uninitialized data from indexToCandidate, causing Illegal Access.
-                blockEntries[index] = 0;
-            }
         }
+        blockEntries32[index >> 2] = result;
     }
     __syncthreads();
     // Return only candidates actually stored, not those dropped due to buffer overflow.
@@ -1103,6 +1245,26 @@ __global__ void globalMetaSieveBatchKernel(
     extern __shared__ int sharedData[];
     int* global_bucket_write_head = sharedData;
 
+    // Bucket storage is a row-major array
+    //   globalBucketEntries[polyBlockId][polyId][cycle][sievingBlock][slot]
+    // with extents [.][polyBlockSize][num_metaSieveCycles][num_activeBlocksPerCycle][globalBucketSize].
+    // Each stride is the product of the extents to its right; every term of a bucket address is
+    // formed in the outermost loop where it is constant.
+    const uint32_t sievingBlockStride = gs_conf.globalBucketSize;                              // one bucket
+    const uint32_t cycleStride        = gms_conf.num_activeBlocksPerCycle * sievingBlockStride;
+    const uint32_t polyStride         = gms_conf.num_metaSieveCycles      * cycleStride;
+    const size_t   polyBlockStride    = (size_t)gms_conf.polyBlockSize    * polyStride;
+
+    // Cyclic Gray walk through a poly block (advanceGrayCyclic); each warp starts at walk index
+    // polyWalkStart. For pbs == 1 there is no step; polyBlockHalf = 1 then keeps the (discarded)
+    // trailing step on table row 0, which scatterSharedMemReq always provides.
+    const uint32_t polyWalkStart = (threadIdx.x / 32) % gms_conf.polyBlockSize;
+    const uint32_t polyBlockMask = gms_conf.polyBlockSize - 1;
+    const uint32_t polyBlockHalf = max(gms_conf.polyBlockSize >> 1, 1u);
+    // Gray-step table after the write heads (layout: scatterSharedMemReq, device_sieving_controller.cpp);
+    // this thread's column.
+    uint32_t* dTable = (uint32_t*)(sharedData + gms_conf.num_activeBucketsPerThreadBlock) + threadIdx.x;
+
     /*
     ---------------------------------------------------------------------------
     CYCLES LOOP
@@ -1124,6 +1286,8 @@ __global__ void globalMetaSieveBatchKernel(
             __syncthreads();
             int polyBlockId = blockIdx.x + gms_conf.num_threadBlocks * curPolyBlock;
             int fullPolyIdPrefix = (subCube * gs_conf.num_polysPerSieveCall) + (polyBlockId << gms_conf.log2_polyBlockSize);
+            // This poly block's buckets in the current cycle (see the bucket layout above).
+            uint64_t* cycleBucketEntries = globalBucketEntries + polyBlockId * polyBlockStride + (size_t)cycle * cycleStride;
 
             /*
             -------------------------------------------------------------------
@@ -1131,29 +1295,46 @@ __global__ void globalMetaSieveBatchKernel(
             -------------------------------------------------------------------
             */
             for(int currentPrimeIndex = threadIdx.x + gs_conf.bigPrimeStartIndex; currentPrimeIndex < fs_params.fb_size; currentPrimeIndex += blockDim.x){
-                int polyIndex = ((threadIdx.x/32) % gms_conf.polyBlockSize);
-                int polyId = gray(polyIndex);
+                uint32_t polyId = gray(polyWalkStart);
                 int fullPolyId = fullPolyIdPrefix | polyId;
                 primeDataSIQS curPrimeData = primeData[currentPrimeIndex];
                 uint32_t p = curPrimeData.p;
                 int log2p = (31 - __clz(p)) * (1 - curPrimeData.inactive);
+                // High word of every bucket entry this prime writes (the prime index; see the store below).
+                uint64_t primeIndexEntry = ((uint64_t)currentPrimeIndex) << 32;
                 uint32_t root1;
                 uint32_t root2;
                 rootsFromPolyId(fullPolyId, shc_dim, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)currentPrimeIndex, fs_params.fb_size, root1, root2);
                 int maxOffsetCount = ((gms_conf.num_activeBlocksPerCycle * gs_conf.sievingBlockSize) / (primeData[currentPrimeIndex - threadIdx.x].p)) + 1; //using the first prime as an upper bound to have a constant inner loop length
-                int reducedSieveStart = ((currentStart % (int)p) + (int)p ) % (int)p;// Formula: ((S % p) + p) % p ensures result is in [0, p-1]
+                // currentStart mod p in [0, p). For meta-cycle 0 currentStart == sieveIntervalStart, whose
+                // residue initPrimeDataBatchKernel precomputed once per step; later cycles recompute.
+                int reducedSieveStart = (cycle == 0)
+                    ? (int)curPrimeData.reducedStart
+                    : ((currentStart % (int)p) + (int)p ) % (int)p;// Formula: ((S % p) + p) % p ensures result is in [0, p-1]
+                // Track each root as its distance from the window start, rel = (root - currentStart) mod p
+                // in [0, p), instead of as an absolute residue. This is exactly the old per-poly
+                // (offset - currentStart) = p - modSub_shifted(start, root, p), computed once per prime
+                // instead of per poly and root. advanceRoots adds +-2B mod p, which moves rel exactly as
+                // it moves the root, so rel is advanced in place and never needs re-deriving (it is
+                // re-initialised here whenever currentStart changes, i.e. per meta-sieve cycle).
+                uint32_t rel1 = modSub(root1, (uint32_t)reducedSieveStart, p);
+                uint32_t rel2 = modSub(root2, (uint32_t)reducedSieveStart, p);
+                // 2*B_k mod p for the bits that flip inside the poly block, staged once per prime.
+                storeDoubledBValues(dTable, dev_pointers.dev_primeBValues, gms_conf.log2_polyBlockSize, (uint32_t)currentPrimeIndex, fs_params.fb_size, p);
 
                 /*
                 ---------------------------------------------------------------
                 POLYS LOOP
                 ---------------------------------------------------------------
                 */
-                for(int polyCounter = 0; polyCounter < gms_conf.polyBlockSize; polyCounter++){
-                    int globalBucketIdPrefix = ((((long long)polyBlockId) * gms_conf.polyBlockSize + polyId) * gms_conf.num_metaSieveCycles + cycle) * gms_conf.num_activeBlocksPerCycle;
+                for(uint32_t polyStep = polyWalkStart + 1; polyStep <= polyWalkStart + gms_conf.polyBlockSize; polyStep++){
+                    // This poly's buckets; a hit then only needs its 32-bit slot within them.
+                    uint64_t* polyBucketEntries = cycleBucketEntries + (size_t)polyId * polyStride;
                     int offsetCounter = 0;
-		            // Advance roots from previous to next poly
-                    int offset1 = currentStart - (int)modSub_shifted((uint32_t)reducedSieveStart, root1, p) + (int)p;
-                    int offset2 = currentStart - (int)modSub_shifted((uint32_t)reducedSieveStart, root2, p) + (int)p;
+                    // Hits of each root relative to currentStart: rel, rel + p, rel + 2p, ... (copies, so
+                    // rel itself stays in [0, p) for advanceRoots).
+                    uint32_t r1 = rel1;
+                    uint32_t r2 = rel2;
 
                     /*
                     -----------------------------------------------------------
@@ -1161,42 +1342,43 @@ __global__ void globalMetaSieveBatchKernel(
                     -----------------------------------------------------------
                     */
                     for(offsetCounter = 0; offsetCounter < maxOffsetCount; offsetCounter++){
-                        int curOffset = offset1;
+                        uint32_t curRel = r1;
                         for (int i = 0; i < 2; i++) {
-                            // Logic: curOffset is a coordinate >= currentStart.
-                            // Subtraction yields a non-negative relative index.
-                            int sievingBlockHit = (curOffset - currentStart) / gs_conf.sievingBlockSize;
+                            // curRel is the hit's position relative to currentStart (>= 0).
+                            // SB is a power of two on every path (validateConfigs POW2_CHECKs it), so the
+                            // block index and in-block offset are a shift and a mask. A runtime '/' and '%'
+                            // by SB cost a full unsigned division per root hit in this innermost loop.
+                            int sievingBlockHit = (int)(curRel >> gs_conf.log2_sievingBlockSize);
                             if (sievingBlockHit < gms_conf.num_activeBlocksPerCycle) {
                                 int activeBucketId =  polyId * gms_conf.num_activeBlocksPerCycle + sievingBlockHit;
                                 int index = atomicAdd(&global_bucket_write_head[activeBucketId], 1); // reserve an index
                                 if (index < gs_conf.globalBucketSize) {
                                     // the bucket is not full yet, so write in it
-                                    int sievingBlock_offset = (curOffset - currentStart) % gs_conf.sievingBlockSize; // no subtract needed if currentStart is a multiple of the blockSize
-                                    int entry = sievingBlock_offset | (log2p << 24); // leading 8 bits store the log2 value and the other 24 the offset
+                                    int sievingBlock_offset = curRel & offsetMask; // no subtract needed if currentStart is a multiple of the blockSize
+                                    uint32_t entry = sievingBlock_offset | (log2p << 24); // leading 8 bits store the log2 value and the other 24 the offset
                                     /*
                                     The activeBucketId is given by;
                                     activeBucketId = [polyId] [sievingBlock]
                                     The global bucket id is given by:
                                     globalBucketId = [polyBlockId] [polyId] [cycle] [sievingBlock]
                                     */
-                                    long long int globalIndex = ((long long)globalBucketIdPrefix + sievingBlockHit) * gs_conf.globalBucketSize + index;
+                                    uint32_t bucketIndex = (uint32_t)sievingBlockHit * sievingBlockStride + index; // slot within this poly's buckets
                                     // If we want to store the prime value, we do:
-                                    // globalBucketEntries[globalIndex] = (((uint64_t)p) << 32) | entry;
+                                    // polyBucketEntries[bucketIndex] = (((uint64_t)p) << 32) | entry;
                                     // But we store the index instead:
-                                    globalBucketEntries[globalIndex] = (((uint64_t)currentPrimeIndex) << 32) | entry;
+                                    polyBucketEntries[bucketIndex] = primeIndexEntry | entry;
                                 }
                             }
-                            curOffset = offset2;
+                            curRel = r2;
                         }
-                        offset1 += (int)p; // Signed increment
-                        offset2 += (int)p;
+                        r1 += p;
+                        r2 += p;
                     }
                     //Offsets loop finished, prepare offsets of the next polynomial for the same prime
-                    int prevFullPolyId = fullPolyId;
-                    polyIndex = modAdd(polyIndex, 1, gms_conf.polyBlockSize);
-                    polyId = gray(polyIndex);
-                    fullPolyId = fullPolyIdPrefix | polyId;
-                    advanceRoots(prevFullPolyId, fullPolyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)currentPrimeIndex, fs_params.fb_size, root1, root2);
+                    // Next poly of the walk (after the last poly the step is wasted but harmless: rel is
+                    // re-initialised for the next prime). polyId stays the Gray code of the walk index.
+                    const GrayFlip flip = advanceGrayCyclic(polyStep, polyBlockMask, polyBlockHalf, polyId);
+                    advanceRelRootsScatter(flip, p, dTable, rel1, rel2);
                 }
                 //poly loop finished, nothing to do here
             }
@@ -1286,6 +1468,13 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
 
     int polyIdPrefix = blockIdx.x * (gs_conf.num_polysPerSieveCall) / gridDim.x;
 
+    // Small-prime mask index arithmetic, reduced mod period ONCE per kernel (blockDim.x, SB and
+    // period are launch constants). Every later index update adds two values < period and so
+    // needs a single conditional subtract -- whatever blockDim.x, SB and period are (period is
+    // only bounded above, 4*period < 64 KiB, so it can be smaller than blockDim.x).
+    const uint32_t maskTid    = threadIdx.x % fs_params.period;                               // thread's first word
+    const uint32_t maskStride = blockDim.x % fs_params.period;                                // per init-loop step
+    const uint32_t maskStep   = (uint32_t)(gs_conf.sievingBlockSize / 4) % fs_params.period;  // per sieve block
     mpqs::uint512 b((uint32_t)0);
     // Use s_B_values (Shared) instead of global pointer
     bFromPolyId(polyIdPrefix, fs_params.shc_dim, s_B_values, b);
@@ -1326,8 +1515,9 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
         if (poly > 0) {
             __syncthreads();
             for (int i = threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
-                primeDataSIQS curPrimeData = primeData[i];
-		int p = (int)curPrimeData.p; // Explicit cast
+                // p from the block's own primes[] (+-p, sign = inactive; written in the setup loop)
+                // instead of re-reading primeData[i] from global memory every polynomial.
+                int p = abs(primes[i]);
 
                 // Recalculate current roots based on offsets
                 // ((offset % p) + p) % p ensures positive residue
@@ -1335,7 +1525,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                 uint32_t root2 = (uint32_t)(((offsets2[i] % p) + p) % p);
 
                 // Update roots for Gray code step (uses uint32_t internally)
-                advanceRoots(prevPolyId, polyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
+                advanceRoots(prevPolyId, polyId, (uint32_t)p, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
 
                 reducedSieveStart = ((sieveIntervalStart % p) + p) % p;
 
@@ -1348,20 +1538,34 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
         }
         __syncthreads();
 
+        // Small-prime mask word offsets, found ONCE per polynomial. findMaskOffsets returns the
+        // unique byte offset o in [0, 4*period) with o = sieveStart - R (mod period) and
+        // o = 0 (mod 4), where R is the CRT combination of the mask primes' roots (period is odd,
+        // so the two congruences fix o). R is constant across the sieve blocks of a polynomial:
+        // the mask primes' offsets only ever advance by multiples of p. Moving sieveStart on by
+        // SB (a multiple of 4) therefore moves o on by SB mod 4*period, i.e. the word offset
+        // o/4 on by SB/4 mod period -- exactly what a fresh findMaskOffsets call would return.
+        uint32_t* smallPrimeMask = dev_pointers.dev_smallPrimeMask;
+        uint32_t* CRT_baseElements = dev_pointers.dev_CRT_baseElements;
+        uint32_t maskOffset1;
+        uint32_t maskOffset2;
+        findMaskOffsets(sieveIntervalStart,  offsets1, offsets2, primes, maskOffset1, maskOffset2, fs_params.smallPrimesUsed, fs_params.period, CRT_baseElements);
+
         for (int sieveBlock = 0; sieveBlock < gs_conf.num_sievingBlocksPerSieveCall; sieveBlock++) {
             int sieveBlockStart = sieveIntervalStart + sieveBlock * gs_conf.sievingBlockSize;
             int sieveBlockEnd = sieveBlockStart + gs_conf.sievingBlockSize;
 
-            uint32_t* smallPrimeMask = dev_pointers.dev_smallPrimeMask;
-            uint32_t* CRT_baseElements = dev_pointers.dev_CRT_baseElements;
-            uint32_t maskOffset1;
-            uint32_t maskOffset2;
-            findMaskOffsets(sieveBlockStart,  offsets1, offsets2, primes, maskOffset1, maskOffset2, fs_params.smallPrimesUsed, fs_params.period, CRT_baseElements);
-
             uint32_t* blockEntries32 = reinterpret_cast<uint32_t*>(blockEntries);
+            uint32_t maskIdx1 = maskOffset1 + maskTid; if (maskIdx1 >= fs_params.period) maskIdx1 -= fs_params.period;
+            uint32_t maskIdx2 = maskOffset2 + maskTid; if (maskIdx2 >= fs_params.period) maskIdx2 -= fs_params.period;
             for (int i = threadIdx.x; i < gs_conf.sievingBlockSize/4; i += blockDim.x) {
-                blockEntries32[i] = smallPrimeMask[(maskOffset1 + i) % fs_params.period] + smallPrimeMask[(maskOffset2 + i) % fs_params.period];
+                blockEntries32[i] = smallPrimeMask[maskIdx1] + smallPrimeMask[maskIdx2];
+                maskIdx1 += maskStride; if (maskIdx1 >= fs_params.period) maskIdx1 -= fs_params.period;
+                maskIdx2 += maskStride; if (maskIdx2 >= fs_params.period) maskIdx2 -= fs_params.period;
             }
+            // Advance to the next sieve block (before any 'continue' below).
+            maskOffset1 += maskStep; if (maskOffset1 >= fs_params.period) maskOffset1 -= fs_params.period;
+            maskOffset2 += maskStep; if (maskOffset2 >= fs_params.period) maskOffset2 -= fs_params.period;
             __syncthreads();
             if(threadIdx.x < fs_params.smallPrimesUsed){
                 offsets1[threadIdx.x] = offsets1[threadIdx.x] + ((sieveBlockEnd - offsets1[threadIdx.x] + primes[threadIdx.x] - 1) / primes[threadIdx.x]) * primes[threadIdx.x];
@@ -1373,12 +1577,22 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
             uint64_t* currentBucketEntries = globalBucketEntries + listStart;
             //dump globalBucketEntries into the current sieving block
             uint32_t currentFillLevel = (dev_pointers.dev_globalBucketCounts[globalBucketId]) & (16777216 - 1);
-            for (int i = threadIdx.x; i < currentFillLevel; i += blockDim.x) {
-                uint32_t val = (uint32_t)currentBucketEntries[i];
-                ATOMIC_BYTE_ADD(blockEntries, val & ((1 << 24) - 1), val >> 24);
+            // Unrolled x4, loads first: four independent bucket reads in flight per thread instead of one
+            // (each atomic needs its entry, so the plain loop waited a full global-load latency per entry).
+            for (int i = threadIdx.x; i < currentFillLevel; i += 4 * blockDim.x) {
+                uint32_t val0 = (uint32_t)currentBucketEntries[i];
+                uint32_t val1 = (i +     blockDim.x < currentFillLevel) ? (uint32_t)currentBucketEntries[i +     blockDim.x] : 0;
+                uint32_t val2 = (i + 2 * blockDim.x < currentFillLevel) ? (uint32_t)currentBucketEntries[i + 2 * blockDim.x] : 0;
+                uint32_t val3 = (i + 3 * blockDim.x < currentFillLevel) ? (uint32_t)currentBucketEntries[i + 3 * blockDim.x] : 0;
+                ATOMIC_BYTE_ADD(blockEntries, val0 & ((1 << 24) - 1), val0 >> 24);
+                if (i +     blockDim.x < currentFillLevel) ATOMIC_BYTE_ADD(blockEntries, val1 & ((1 << 24) - 1), val1 >> 24);
+                if (i + 2 * blockDim.x < currentFillLevel) ATOMIC_BYTE_ADD(blockEntries, val2 & ((1 << 24) - 1), val2 >> 24);
+                if (i + 3 * blockDim.x < currentFillLevel) ATOMIC_BYTE_ADD(blockEntries, val3 & ((1 << 24) - 1), val3 >> 24);
             }
             int midPrimeStart = gs_conf.midPrimeStartIndex;
             __syncthreads();
+            // Small primes [smallPrimesUsed, midPrimeStart) (the ones below come from the mask): one warp per
+            // prime, its parNum lanes interleaved.
             constexpr uint32_t parNum = 32;
             for (int i = fs_params.smallPrimesUsed + (threadIdx.x / parNum); i < midPrimeStart; i += blockDim.x / parNum) {
                 int p = primes[i];
@@ -1392,25 +1606,34 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                 // p = abs(p);
                 int offset1 = offsets1[i];
                 int offset2 = offsets2[i];
-		        // Forward Sieve: Offset is signed int, loop terminates when offset >= sieveBlockEnd
-                int offset = offset1 + (threadIdx.x % parNum) * p;
-                for (; offset < sieveBlockEnd; offset += parNum * p) {
-                    //blockEntries[offset - sieveBlockStart] += log_p;
-                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
+                const int offsetStep = parNum * p;
+                int span = sieveBlockEnd - (max(offset1, offset2) + (int)(parNum - 1) * p);
+                int numFullSteps = (span > 0) ? (span + offsetStep - 1) / offsetStep : 0; //Number of steps where 32 consecutive offsets fully fit into the interval
+                int curOffset1 = offset1 + (threadIdx.x % parNum) * p;
+                int curOffset2 = offset2 + (threadIdx.x % parNum) * p;
+                for (int k = 0; k < numFullSteps; k++) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset1 - sieveBlockStart, log_p);
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset2 - sieveBlockStart, log_p);
+                    curOffset1 += offsetStep;
+                    curOffset2 += offsetStep;
                 }
-                if (offset - p < sieveBlockEnd) {
-                    offsets1[i] = offset; //exactly one thread has the correct "last" offset, keep it for the next iteration
+                if (curOffset1 < sieveBlockEnd) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset1 - sieveBlockStart, log_p);
+                    curOffset1 += offsetStep;
                 }
-                offset = offset2 + (threadIdx.x % parNum) * p;
-                for (; offset < sieveBlockEnd; offset += parNum * p) {
-                    //blockEntries[offset - sieveBlockStart] += log_p;
-                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
+                if (curOffset2 < sieveBlockEnd) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset2 - sieveBlockStart, log_p);
+                    curOffset2 += offsetStep;
                 }
-                if (offset - p < sieveBlockEnd) {
-                    offsets2[i] = offset; //exactly one thread has the correct "last" offset, keep it for the next iteration
+                if (curOffset1 - p < sieveBlockEnd) {
+                    offsets1[i] = curOffset1; //exactly one thread has the correct "last" offset, keep it for the next iteration
+                }
+                if (curOffset2 - p < sieveBlockEnd) {
+                    offsets2[i] = curOffset2; //exactly one thread has the correct "last" offset, keep it for the next iteration
                 }
             }
-	    // Small primes handling
+            // Mid primes [midPrimeStart, bigPrimeStartIndex): one thread per prime (the primes above come from
+            // the global buckets, dumped above).
             for (int i = midPrimeStart + threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
                 int p = primes[i];
                 uint8_t log_p = (p <= 0) ? 0 : log2(p);
@@ -1418,16 +1641,24 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                 int offset1 = offsets1[i];
                 int offset2 = offsets2[i];
                 //__syncthreads(); //NO SYNC NEEDED HERE, threads access disjoint data
-                int offset = offset1;
-                for (; offset < sieveBlockEnd; offset += p) {
-                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
+                // Both roots in one loop: they lie less than p apart, so once the further one has left the
+                // block the other has at most one hit left.
+                int curOffset1 = offset1;
+                int curOffset2 = offset2;
+                for (; max(curOffset1, curOffset2) < sieveBlockEnd; curOffset1 += p, curOffset2 += p) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset1 - sieveBlockStart, log_p);
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset2 - sieveBlockStart, log_p);
                 }
-                offsets1[i] = offset; //keep the offset for the next iteration
-                offset = offset2;
-                for (; offset < sieveBlockEnd; offset += p) {
-                    ATOMIC_BYTE_ADD(blockEntries, offset - sieveBlockStart, log_p);
+                if (curOffset1 < sieveBlockEnd) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset1 - sieveBlockStart, log_p);
+                    curOffset1 += p;
                 }
-                offsets2[i] = offset; //keep the offset for the next iteration
+                if (curOffset2 < sieveBlockEnd) {
+                    ATOMIC_BYTE_ADD(blockEntries, curOffset2 - sieveBlockStart, log_p);
+                    curOffset2 += p;
+                }
+                offsets1[i] = curOffset1; //keep the offset for the next iteration
+                offsets2[i] = curOffset2;
             }
             __syncthreads();
 
@@ -1511,7 +1742,8 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                     }
                 }
             }
-            __syncthreads();	    // Small primes backward scan
+            __syncthreads();
+            // Mid primes [midPrimeStart, bigPrimeStartIndex) backward scan: one thread per prime.
             for (int i = midPrimeStart + threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
                 int p = primes[i];
                 bool active = p > 0;
@@ -1523,43 +1755,24 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernel(
                     int offset = offset1 - p;
                     for (; offset >= sieveBlockStart; offset -= p) {
                         int localOffset = offset - sieveBlockStart;
-                        if (blockEntries[localOffset]) {
-                            int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
-			    int globalIdx = indexToCandidate[localOffset];
-			    // Store factor
-			    candidates[globalIdx].factors[31 & newPrimeIndex] = i;
-			    // Update count
-			    atomicAdd((uint32_t*)&candidates[globalIdx].num_factors, 1);
-                        }
+                        if (blockEntries[localOffset])
+                            recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
                     }
                     offset = offset2 - p;
                     for (; offset >= sieveBlockStart; offset -= p) {
                         int localOffset = offset - sieveBlockStart;
-                        if (blockEntries[localOffset]) {
-                            int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
-			    int globalIdx = indexToCandidate[localOffset];
-			    // Store factor
-			    candidates[globalIdx].factors[31 & newPrimeIndex] = i;
-			    // Update count
-			    atomicAdd((uint32_t*)&candidates[globalIdx].num_factors, 1);
-                        }
+                        if (blockEntries[localOffset])
+                            recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, i);
                     }
                 }
             }
 
             for (int i = threadIdx.x; i < currentFillLevel; i += blockDim.x) {
                 uint64_t val = currentBucketEntries[i];
-		if (val == 0) continue; // <- ignore illegal entries
+                if (val == 0) continue; // <- ignore illegal entries
                 int localOffset = val & ((1 << 24) - 1);
-                int prime_index = val >> 32;
-                if (blockEntries[localOffset]) {
-                    int newPrimeIndex = ATOMIC_BYTE_ADD_RETURN(blockEntries, localOffset, 1) - 1;
-		    int globalIdx = indexToCandidate[localOffset];
-		    // Store factor
-		    candidates[globalIdx].factors[31 & newPrimeIndex] = prime_index;
-		    // Update count
-		    atomicAdd((uint32_t*)&candidates[globalIdx].num_factors, 1);
-                }
+                if (blockEntries[localOffset])
+                    recordBackwardFactor(blockEntries, indexToCandidate, candidates, localOffset, (int)(val >> 32));
             }
             __syncthreads();
         }
@@ -1673,8 +1886,9 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernelWide(
         if (poly > 0) {
             __syncthreads();
             for (int i = threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
-                primeDataSIQS curPrimeData = primeData[i];
-		int p = (int)curPrimeData.p; // Explicit cast
+                // p from the block's own primes[] (+-p, sign = inactive; written in the setup loop)
+                // instead of re-reading primeData[i] from global memory every polynomial.
+                int p = abs(primes[i]);
 
                 // Recalculate current roots based on offsets
                 // ((offset % p) + p) % p ensures positive residue
@@ -1682,7 +1896,7 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernelWide(
                 uint32_t root2 = (uint32_t)(((offsets2[i] % p) + p) % p);
 
                 // Update roots for Gray code step (uses uint32_t internally)
-                advanceRoots(prevPolyId, polyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
+                advanceRoots(prevPolyId, polyId, (uint32_t)p, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
 
                 reducedSieveStart = ((sieveIntervalStart % p) + p) % p;
 
@@ -1971,13 +2185,14 @@ __global__ void __launch_bounds__(1024) sieveAndScanBatchKernelWideU8Sat(
         if (poly > 0) {
             __syncthreads();
             for (int i = threadIdx.x; i < gs_conf.bigPrimeStartIndex; i += blockDim.x) {
-                primeDataSIQS curPrimeData = primeData[i];
-		int p = (int)curPrimeData.p;
+                // p from the block's own primes[] (+-p, sign = inactive; written in the setup loop)
+                // instead of re-reading primeData[i] from global memory every polynomial.
+                int p = abs(primes[i]);
 
                 uint32_t root1 = (uint32_t)(((offsets1[i] % p) + p) % p);
                 uint32_t root2 = (uint32_t)(((offsets2[i] % p) + p) % p);
 
-                advanceRoots(prevPolyId, polyId, curPrimeData, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
+                advanceRoots(prevPolyId, polyId, (uint32_t)p, dev_pointers.dev_primeBValues, (uint32_t)i, fs_params.fb_size, root1, root2);
 
                 reducedSieveStart = ((sieveIntervalStart % p) + p) % p;
 
@@ -2340,7 +2555,8 @@ __global__ void initPrimeDataBatchKernel(
     generalSievingConfig gs_conf,
     fixedSievingParams fs_params,
     const mpqs::uint512* __restrict__ batch_a_array,
-    uint32_t step_index
+    uint32_t step_index,
+    int32_t sieveIntervalStart // the step's SCATTER window start (ds_params.startIndex, usually -M)
 )
 {
     // --- 1. Shared Memory Setup ---
@@ -2420,6 +2636,8 @@ __global__ void initPrimeDataBatchKernel(
         }
 
         tmpPrimeData.p = p;
+        // sieveIntervalStart mod p in [0, p), read by SCATTER (meta-cycle 0) for every poly block.
+        tmpPrimeData.reducedStart = (uint32_t)(((sieveIntervalStart % (int)p) + (int)p) % (int)p);
         // D. Calculate inv_aN = (inv_a * rootN) % p
         tmpPrimeData.inv_aN = (uint32_t)(((uint64_t)result * rootN[i]) % p);
 
@@ -2772,7 +2990,8 @@ void runSievingBatch(
             *gs_conf_ptr,
             *fs_params_ptr,
             dev_pointers_ptr->dev_job_a_array, // Pointer to pre-calc 'a' array
-            current_step
+            current_step,
+            ds_params_ptr->startIndex          // same window start the SCATTER launch below gets
         );
 
         #ifdef SIEVING_DEBUG_FLAG

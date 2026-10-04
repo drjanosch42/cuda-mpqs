@@ -200,10 +200,11 @@ against the earlier release and the note that the 70d and 80d rows are slower
 than their 1.0.1-era figures, with the added cost falling entirely outside the
 sieve. Treat the README as the authoritative copy and update both together.
 
-RSA-100 factors in **38.30 s** on an NVIDIA H100 SXM and **66.38 s** on the
-RTX 5070 Ti, each with that device's pinned parameter tuple — faster than the
-75.01 s above, which autotunes instead; the cross-GPU record table and
-per-stage breakdowns are in [`README.md`](../README.md).
+Under v1.0.8, RSA-100 factors in **29.18 s** on an NVIDIA H100 SXM and **51.01 s**
+on the RTX 5070 Ti, each with that device's pinned parameter tuple. The 75.01 s
+above is a v1.0.7 measurement that autotunes instead (the same card read 66.38 s
+with its pinned tuple under v1.0.7); the cross-GPU record table and per-stage
+breakdowns are in [`README.md`](../README.md).
 
 Below ~85 digits the large prime variant is disabled; above that threshold,
 enabling LP dramatically increases relation yield.

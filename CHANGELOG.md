@@ -7,6 +7,149 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-09-28
+This release rewrites the arithmetic of both sieve kernel families — the
+bucket-scattering and the gathering/scanning kernels — for fewer instructions
+per hit, and moves the
+last CPU step of the Block Wiedemann Stage 2 onto the GPU. **The linear-algebra
+submodule advances from block-wiedemann 1.0.1 to 1.0.2** (`lingen 1.0.2` in
+`--version`). No command-line flag, default or configuration field of the sieve
+changed; the sieve finds the same relations in every measured run. At RSA-100
+the sieve stage is 21–35 % faster depending on device and configuration, and
+end-to-end time drops by 17.6–36 % on the four devices benchmarked end to end
+at an unchanged command line. Best RSA-100 end-to-end times on this release:
+**H100 SXM 29.18 s, RTX 5070 Ti 51.01 s, A100 SXM4 57.64 s, TITAN RTX 111.74 s,
+Jetson Orin Nano Super 1,028.04 s** (each at that device's own tuned configuration;
+see the README).
+
+### Changed
+- **Sieve kernels (GATHER and SCATTER, batch and legacy) rewritten for fewer
+  instructions per hit; the relations found are unchanged.** SCATTER
+  keeps each bucket prime's root as a window-relative residue advanced in
+  place instead of re-deriving an absolute offset per polynomial, steps the
+  Gray code directly on the polynomial index instead of an id-based
+  derivation, replaces the meta-sieve's runtime division/modulo with
+  shift/mask (block size is always a power of two), and forms bucket
+  addresses from a per-poly base plus a 32-bit slot instead of full 64-bit
+  arithmetic per hit. GATHER's forward pass merges both roots of the
+  small- and mid-prime bands into one warp-uniform loop with a short
+  tail, precomputes the small-prime mask's CRT offset once per polynomial
+  instead of once per block, scans `excludeNonRelations` a 32-bit word at a
+  time instead of four byte accesses, unrolls the bucket dump ×4 with loads
+  issued ahead of their atomics, reads each prime's `p` from shared memory
+  in the per-poly prologue instead of re-reading it from global memory, and
+  precomputes `sieveIntervalStart mod p` once per step (new `reducedStart`
+  field in `primeDataSIQS`, +4 B) instead of twice per prime per poly block.
+  `modAdd` reduces via `min(s, s - p)` instead of a compare/select/subtract.
+  The scattering kernel stages `2·B_k mod p` for the Gray-code bits that flip
+  inside a polynomial block in a per-thread shared-memory column, so its
+  dynamic shared memory grows by `log2(polyBlockSize) × blockDim × 4` bytes.
+  All of the above is now shared between the batch and legacy kernels, so
+  `--param_test` (which probes through the legacy kernels) stays
+  representative of the batch path. On a Quadro RTX 3000 (RSA-100) the sieve
+  wall drops from 311.17 s to 221.27 s (−28.9 %) with identical relation
+  counts (up to the ±1 jitter of the single-GPU large-prime path).
+- **The wide-accumulator path (RSA-150/155) runs changed code and has not been
+  re-measured.** It shares the scattering kernel, `modAdd` and the per-poly
+  prologue change, and its saturating-8-bit kernel calls the same
+  `excludeNonRelations`; only the 16-bit candidate scan and the wide kernels'
+  prime bands are untouched. No RSA-150/155 run exists on this release.
+- `excludeNonRelations`'s word-wise candidate scan uses a per-word threshold
+  approximation, so its candidate set is not guaranteed bit-identical to
+  the old per-byte test (downstream relation counts are unaffected in every
+  measured run).
+- **Register use and residency (A100, measured).** The scattering kernel drops
+  from 40 to 32 registers per thread and now fits two 1024-thread blocks per
+  multiprocessor instead of one; it changes from instruction-issue-bound to
+  latency-bound and becomes the largest sieve kernel at the A100 `--params`
+  pin, whose 108-block scattering grid now fills only half of the doubled
+  residency (a larger grid is an untested retune). The gathering kernel stays
+  at 64 registers with no spills, so the zero-margin register fits noted for
+  1.0.7 still hold: one more register would silently halve the residency of
+  512-thread two-blocks-per-multiprocessor configurations. Register counts on
+  other architectures are not measured for this release.
+
+### Performance
+All figures are RSA-100. Version comparisons use the same relation work as 1.0.7;
+the best-figure lines say where they do not. Energy is GPU board energy, quoted
+with the above-idle figure.
+- **Best end-to-end times (median):** H100 SXM **29.18 s** (n=3), RTX 5070 Ti
+  **51.01 s** (n=5), A100 SXM4 **57.64 s** (n=3), TITAN RTX **111.74 s** (n=3),
+  Jetson Orin Nano Super **1,028.04 s** (n=2). The H100 and A100 figures use
+  `--params11` tuples re-searched with `--param_test` on this release; the A100
+  figure is also at a different operating point from 1.0.7 (`--fb_bound 5500000
+  --sieve_bound 524288` with `--sieve_offsets_global`), so it is not a version
+  comparison against the 1.0.7 A100 figure of 83.80 s.
+- **RTX 5070 Ti** (interleaved binary A/B, n=5 per arm): end-to-end **64.23 → 50.87 s
+  (−20.80 %)** for the sieve arithmetic change, sieve −26.63 %, board energy
+  −22.80 % / above-idle −22.91 % at the device's `--params11` tuple; −17.68 %
+  end-to-end, −22.45 % sieve at the `--params` pin. The released 1.0.8 binary
+  reads 51.01 s on the same command line (the linear-algebra change is neutral
+  here), −23.2 % against the 1.0.7 figure of 66.38 s.
+- **TITAN RTX** (1.0.7 command line verbatim, n=3): end-to-end
+  **137.76 → 111.74 s (−18.89 %)**, sieve −23.05 %, board energy −20.5 % /
+  above-idle −20.7 %; 99.6 % of the gain is in the sieve.
+- **A100 SXM4** (n=3 per arm): at the `--params` pin the sieve
+  runs **74.5 → 48.4 ms per batch (−35.0 %)**, the gathering kernel −48 % and
+  the scattering kernel −21 % per batch, with gathering-kernel instructions
+  −42 % at unchanged memory traffic; board energy −29.5 % / above-idle
+  −28.7 %; end-to-end −27 % (single run).
+- **H100 SXM** (the 1.0.7 command line verbatim, n=3, compared
+  with the 1.0.7 measurement on a different node): end-to-end
+  **38.30 → 31.57 s (−17.57 %)**, sieve 28.31 → 22.13 s (−21.8 %); about 92 %
+  of the gain is in the sieve, the linear algebra and square root are flat
+  within run-to-run spread. Board energy −20.3 % / above-idle −20.6 %
+  (cross-node, so indicative only). With the `--param_test` winner
+  `2048,8,4,8,512,1024,1024,1024,131072,8100,164` in place of the 1.0.7 tuple the
+  same job reads **29.18 s** (−7.6 % against the 1.0.7 tuple, at +2.3 % board
+  energy), −23.8 % against 38.30 s.
+- **A100 SXM4, full pipeline** at `--fb_bound 5500000 --sieve_bound 524288`
+  with the `--param_test` winner `2048,8,4,8,512,1024,1024,1024,131072,4388,356`
+  and `--sieve_offsets_global` (n=3): **57.64 s**.
+- **Jetson Orin Nano Super** (the 1.0.7 command line verbatim, n=2): end-to-end
+  **1,602.64 → 1,028.04 s (−35.85 %)**, sieve 1,390.63 → 813.43 s (−41.4 %);
+  the linear algebra is unchanged.
+- The Block Wiedemann change is performance-neutral at RSA-100 (about −76 ms
+  of Stage 2 on the 5070 Ti).
+
+### Linear algebra
+- **block-wiedemann 1.0.1 → 1.0.2** (`src/linalg`, released 2026-09-28; its
+  own changelog has the full entry). In summary: device kernels for the Stage 2
+  initialization basis and initial generator, bit-identical to the CPU routine,
+  with new solver configuration fields and `bw_lingen_bench` flags
+  (`--s2_init_cpu`, `--s2_init_verify`) and a device-vs-CPU bit-identity test;
+  experimental stage-boundary checkpointing of the solver (not yet validated
+  end to end); the Krylov sequence copied to the host only when a consumer
+  needs it; and two fixes — the bulk Stage 2 S download now actually fills its
+  coefficients, and the Stage 2 host-upload fallback with no S available fails
+  with a clear error instead of a zero-size allocation.
+- **Block Wiedemann Stage 2 initialization basis on the GPU
+  (block-wiedemann 1.0.2).** The Coppersmith/Thomé start (t0 and the m basis
+  pairs, then the initial generator F and gamma) now runs as a dedicated
+  single-warp device kernel directly on the device-resident Krylov sequence,
+  with F and gamma written straight into the solver's device buffers; only a
+  16-byte record returns to the host. The output is bit-identical to the CPU
+  routine, including the rank-failure path and its log lines (the kernel
+  documentation carries the equivalence proof). The
+  `[Basecase] Initialization: t0=` line is unchanged; a new
+  `[Basecase] Init basis: path=GPU|CPU, t0=, rank=, time= ms` line follows.
+- New flags `--bw_init_cpu` (CPU reference routine) and `--bw_init_verify`
+  (run both and abort on any mismatch, logging
+  `[Basecase] [InitCheck] GPU vs CPU init: MATCH` otherwise); both download
+  the Krylov sequence.
+- The Krylov sequence S no longer reaches the host by default. Stage 2
+  downloads it only for a host consumer, as one bulk copy instead of one
+  synchronous copy per coefficient; Stage 1 keeps its host copy only for a
+  consumer (disk save, hashing, `--bw_checkpoint_dir`) and logs
+  `[BWStage 1] S host copy: ON (...) / OFF (no consumer)`. This removes a
+  host copy of S (about 16 MB at RSA-100, about 1 GB at RSA-150/155) and the
+  per-coefficient download before the Stage 2 loop.
+- New CTest target `bw_init_basis` (device vs CPU initialization, bit for
+  bit, structured cases plus 300 fuzz instances; needs a CUDA device).
+- Follow-up, not in this release: the Stage 1 S disk write under
+  `--bw_checkpoint_dir` is still synchronous; an asynchronous writer is a
+  possible later change.
+
 ## [1.0.7] - 2026-09-18
 This release speeds up the narrow (8-bit) sieve with a precomputed small-prime
 mask and a restructured backward sieve, and adds a new parameter search together

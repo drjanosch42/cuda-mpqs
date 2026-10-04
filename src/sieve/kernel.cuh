@@ -113,13 +113,16 @@ void getDeviceInfo(gpuInfo& gInfo, int device);
 
 /**
  * @brief Modular Addition: (a + b) % modulus
- * Safe for unsigned inputs where a, b < modulus.
- * Replaces sign-bit logic with conditional subtraction.
+ * Requires a < modulus, b <= modulus and modulus <= 2^31 (so a + b cannot wrap); the result is then
+ * in [0, modulus).
+ * min(s, s - modulus) in unsigned arithmetic is the reduction: for s < modulus, s - modulus wraps
+ * above s. One IADD, one IADD3 and one IMNMX instead of add, compare, select, subtract.
  */
 __device__ __forceinline__
 uint32_t modAdd(uint32_t a, uint32_t b, uint32_t modulus) {
     uint32_t tmp = a + b;
-    return (tmp >= modulus) ? (tmp - modulus) : tmp;
+    uint32_t reduced = tmp - modulus;
+    return (reduced < tmp) ? reduced : tmp; // min(tmp, tmp - modulus)
 }
 
 /**
@@ -210,7 +213,7 @@ void bFromPolyId(uint32_t id, int shc_dim, mpqs::uint512* B_values, mpqs::uint51
  * Uses modSum to handle signed updates (+/- B_val) on unsigned roots.
  */
 __device__ __forceinline__
-void advanceRoots(uint32_t id1, uint32_t id2, const primeDataSIQS& primeData,
+void advanceRoots(uint32_t id1, uint32_t id2, uint32_t p,
                   const uint32_t* __restrict__ bvalues, uint32_t primeIndex, uint32_t fb_size,
                   uint32_t& root1, uint32_t& root2);
 

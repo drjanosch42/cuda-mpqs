@@ -22,6 +22,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <string>
+#include <chrono>
 
 namespace lingen {
 namespace stage2 {
@@ -423,134 +424,16 @@ void BasecaseSolver::xor_bit(uint64_t* data, int rows, int cols, int r, int c) {
 // -----------------------------------------------------------------------------
 
 BasecaseSolver::InitResult BasecaseSolver::find_initialization_basis(const std::vector<std::vector<uint64_t>>& S_host) {
-    int m = config_.m_block;
-    int n = config_.n_block;
-    int len_seq = (int)S_host.size();
-    
-    // Basis storage: map pivot_index -> vector (of m bits)
-    // For m > 64, we store vectors as std::vector<uint64_t>
-    int m_words = (m + 63) / 64;
-    std::vector<std::vector<uint64_t>> basis_vecs(m); 
-    std::vector<bool> pivot_found(m, false);
-    
-    std::vector<std::pair<int, int>> pairs;
-    int rank = 0;
-    int t0 = 0;
-
-    // Iterate i (time) then j (column) - STRICT Python Order
-    for (int i = 0; i < len_seq; ++i) {
-        for (int j = 0; j < n; ++j) {
-            // Extract column vector v = S[i][:, j]
-            std::vector<uint64_t> v(m_words, 0);
-            for(int r = 0; r < m; ++r) {
-                if (get_bit(S_host[i].data(), m, n, r, j)) {
-                    v[r / 64] |= (1ULL << (r % 64));
-                }
-            }
-
-            // Reduce v against basis
-            for(int p = 0; p < m; ++p) {
-                if (pivot_found[p]) {
-                    // Check if v has bit p set
-                    if ((v[p / 64] >> (p % 64)) & 1ULL) {
-                        // XOR basis vector into v
-                        for(int w = 0; w < m_words; ++w) v[w] ^= basis_vecs[p][w];
-                    }
-                }
-            }
-
-            // Check if v is zero
-            int first_bit = -1;
-            for(int r = 0; r < m; ++r) {
-                if ((v[r / 64] >> (r % 64)) & 1ULL) {
-                    first_bit = r;
-                    break;
-                }
-            }
-
-            if (first_bit != -1) {
-                // New pivot found
-                pivot_found[first_bit] = true;
-                basis_vecs[first_bit] = v;
-                pairs.push_back({i, j});
-                rank++;
-
-                if (rank == m) {
-                    t0 = i + 1;
-                    return {t0, pairs};
-                }
-            }
-        }
-    }
-
-    if (rank < m) {
-        std::vector<int> missing;
-        for(int p=0; p<m; ++p) if(!pivot_found[p]) missing.push_back(p);
-        
-        std::ostringstream oss;
-        oss << "[";
-        for(size_t k=0; k<std::min((size_t)32, missing.size()); ++k) {
-            oss << missing[k];
-            if (k + 1 < missing.size()) oss << ", ";
-        }
-        if(missing.size() > 32) oss << "...";
-        oss << "]";
-        
-        LOG(LOG_ERROR_CRITICAL) << "[Basecase] Rank condition failed! Rank=" << rank << " < m=" << m;
-        LOG(LOG_ERROR_CRITICAL) << "[Basecase] Missing pivot indices: " << oss.str();
-        return {0, {}};
-    }
-    
-    // Should be unreachable due to check above
-    return {0, {}};
-    
-    LOG(LOG_ERROR_CRITICAL) << "[Basecase] Rank condition failed! Rank=" << rank << " < m=" << m;
-    return {0, {}};
+    InitResult init = find_init_basis_cpu(S_host, config_.m_block, config_.n_block);
+    if (init.rank < config_.m_block)
+        log_init_rank_failure(init.rank, config_.m_block, init.pivot_mask);
+    return init;
 }
 
 BasecaseSolver::FInitResult BasecaseSolver::build_f_init(const InitResult& init) {
-    int t0 = init.t0;
-    int dim = dim_;
-    int n = config_.n_block;
-    int m = config_.m_block;
-    
-    // Allocate F_poly
-    // Storage: currently dim x dim for compatibility with legacy solver logic,
-    // although logically it is dim x n.
-    // Stride must match what `solve` loop expects: `(dim + 63)/64`.
-    int stride_F = (dim + 63) / 64; 
-    int words_per_mat = dim * stride_F;
-    
-    std::vector<std::vector<uint64_t>> F(t0 + 1, std::vector<uint64_t>(words_per_mat, 0));
-    std::vector<int> gamma(dim, t0);
-
-    // 1. Top n rows: Identity at degree 0
-    // F[0][j, j] = 1 for j < n
-    for (int j = 0; j < n; ++j) {
-        set_bit(F[0].data(), dim, dim, j, j, true);
-    }
-
-    // 2. Bottom m rows: Monomials from basis
-    // Row index in F: n + k (where k is index in basis_pairs 0..m-1)
-    // Col index: j_k
-    // Degree: t0 - i_k
-    for (int k = 0; k < m; ++k) {
-        if (k >= (int)init.basis_pairs.size()) break; // Should not happen if rank=m
-        
-        int i_k = init.basis_pairs[k].first;
-        int j_k = init.basis_pairs[k].second;
-        int deg = t0 - i_k;
-        int row_idx = n + k;
-        
-        // Sanity check
-        if (deg < 0 || deg > t0) {
-            LOG(LOG_ERROR_CRITICAL) << "Logic Error: deg=" << deg << " out of bounds";
-        }
-        
-        set_bit(F[deg].data(), dim, dim, row_idx, j_k, true);
-    }
-    
-    return {F, gamma};
+    FInitResult res;
+    build_f_init_cpu(init, config_.m_block, config_.n_block, res.F_poly, res.gamma);
+    return res;
 }
 
 // -----------------------------------------------------------------------------
@@ -1790,49 +1673,111 @@ void BasecaseSolver::solve(const uint64_t* d_S, cudaStream_t stream) {
         return;
     }
 
-    LOG(LOG_DEBUG_1) << "[Basecase] Downloading sequence of length " << len << " from GPU...";
-    
-    // Download sequence
+    // --- Initialization path (decided first: it determines whether S must reach the host) ---
+    const bool gpu_init_requested = config_.gpu_mode && config_.init_on_gpu;
+    const bool gpu_init = gpu_init_requested && init_basis_gpu_supported(m, n);
+    if (gpu_init_requested && !gpu_init) {
+        LOG(LOG_WARNING) << "[Basecase] Init basis: m=" << m << " exceeds the device path limit (m <= "
+                         << INIT_BASIS_GPU_MAX_M << "); using the CPU routine.";
+    }
+
+    // --- Host copy of S: only when a host consumer needs it ---
+    // Consumers: the CPU-only loop, the CPU initialization (off / unsupported device path,
+    // or cross-check), the per-step oracle and the legacy annihilation check. The main GPU
+    // loop and the GPU annihilation check read d_S only. One bulk copy + one sync.
+    const bool need_S_host = !config_.gpu_mode || !gpu_init || config_.init_cross_check
+                          || config_.internal_oracle_verification || config_.check_annihilation_legacy;
+
     // S_k is m x n. Stride is determined by n.
     size_t words_per_row = (n + 63) / 64;
     size_t words_per_mat = m * words_per_row;
-    std::vector<std::vector<uint64_t>> S_host(len);
-    std::vector<uint64_t> temp_buf(words_per_mat);
+    std::vector<std::vector<uint64_t>> S_host;
+    auto require_S_host = [&](const char* consumer) {
+        if ((int)S_host.size() != len)
+            throw std::runtime_error(std::string("Basecase: host copy of S required by ") + consumer
+                                     + " but not downloaded");
+    };
 
-    // Download loop
-    for (int k = 0; k < len; ++k) {
-        const uint64_t* src_ptr = d_S + k * words_per_mat;
-        cudaMemcpyAsync(temp_buf.data(), src_ptr, words_per_mat * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream); 
-        S_host[k] = temp_buf;
+    if (need_S_host) {
+        LOG(LOG_DEBUG_1) << "[Basecase] Downloading sequence of length " << len << " from GPU...";
+        std::vector<uint64_t> large_host_buf((size_t)len * words_per_mat);
+        CHECK_CUDA_BC(cudaMemcpyAsync(large_host_buf.data(), d_S,
+                                      large_host_buf.size() * sizeof(uint64_t),
+                                      cudaMemcpyDeviceToHost, stream));
+        CHECK_CUDA_BC(cudaStreamSynchronize(stream));
+        S_host.resize(len);
+        for (int k = 0; k < len; ++k) {
+            S_host[k].assign(large_host_buf.begin() + (size_t)k * words_per_mat,
+                             large_host_buf.begin() + (size_t)(k + 1) * words_per_mat);
+        }
+    } else {
+        LOG(LOG_DEBUG_1) << "[Basecase] S host download skipped (device-resident init, no host consumer).";
     }
 
-    /* 
-    // 1. Allocate a single large buffer on the host (preferably pinned)
-    std::vector<uint64_t> large_host_buf(len * words_per_mat);
-
-    // 2. Transfer everything in one call
-    CHECK_CUDA_BC(cudaMemcpyAsync(large_host_buf.data(), d_S, 
-				  len * words_per_mat * sizeof(uint64_t), 
-				  cudaMemcpyDeviceToHost, stream));
-    CHECK_CUDA_BC(cudaStreamSynchronize(stream));
-
-    // 3. Distribute to S_host structure (pure CPU operation)
-    for (int k = 0; k < len; ++k) {
-        std::copy(large_host_buf.begin() + k * words_per_mat, 
-                  large_host_buf.begin() + (k + 1) * words_per_mat, 
-                  S_host[k].begin());
-    }*/
-    
+    // --- Initialization basis (t0, pairs), F_init, gamma ---
+    // Device path (default in GPU mode): k_find_init_basis scans d_S in place and
+    // k_build_f_init writes F_init / gamma straight into d_F_buf[0] / d_Gamma; only the
+    // 16-byte meta record {t0, rank, status} returns. Bit-identical to the CPU reference
+    // (equivalence lemma in init_basis.cu). The CPU routine runs when the device path is
+    // off / unsupported, and additionally under init_cross_check (silently: the device
+    // path owns the rank-failure log lines, so they appear exactly once).
     LOG(LOG_DEBUG_2) << "[Basecase] Initializing basis, f...";
-    auto init_generic = find_initialization_basis(S_host);
-    auto finit_generic = build_f_init(init_generic);
+    const bool cpu_init = !gpu_init || config_.init_cross_check;
 
-    std::vector<std::vector<uint64_t>> F_poly = finit_generic.F_poly;
-    gamma_ = finit_generic.gamma;
-    int t0 = init_generic.t0;
+    auto t_init_start = std::chrono::steady_clock::now();
+    InitResult init_cpu;
+    FInitResult finit_cpu;
+    if (cpu_init) {
+        require_S_host("the CPU initialization");
+        init_cpu = gpu_init ? find_init_basis_cpu(S_host, m, n) : find_initialization_basis(S_host);
+        finit_cpu = build_f_init(init_cpu);
+    }
+
+    std::vector<std::vector<uint64_t>> F_poly;
+    int t0 = 0;
+    int init_rank = 0;
+    int* d_init_meta = nullptr;       // {t0, rank, status, -}
+    int* d_init_pairs = nullptr;      // 2m ints: (i_k, j_k)
+    uint64_t* d_init_pivmask = nullptr;
+    std::vector<uint64_t> gpu_pivmask;
+    if (gpu_init) {
+        const int mw = (m + 63) / 64;
+        CHECK_CUDA_BC(cudaMalloc(&d_init_meta, INIT_META_WORDS * sizeof(int)));
+        CHECK_CUDA_BC(cudaMalloc(&d_init_pairs, (size_t)2 * m * sizeof(int)));
+        CHECK_CUDA_BC(cudaMalloc(&d_init_pivmask, (size_t)mw * sizeof(uint64_t)));
+        launch_find_init_basis_gpu(d_S, len, m, n, d_init_meta, d_init_pairs, d_init_pivmask, stream);
+
+        int meta[INIT_META_WORDS];
+        CHECK_CUDA_BC(cudaMemcpyAsync(meta, d_init_meta, sizeof(meta), cudaMemcpyDeviceToHost, stream));
+        CHECK_CUDA_BC(cudaStreamSynchronize(stream));
+        t0 = meta[INIT_META_T0];
+        init_rank = meta[INIT_META_RANK];
+        if (meta[INIT_META_STATUS] != 0) {
+            gpu_pivmask.resize(mw);
+            CHECK_CUDA_BC(cudaMemcpy(gpu_pivmask.data(), d_init_pivmask, mw * sizeof(uint64_t),
+                                     cudaMemcpyDeviceToHost));
+            log_init_rank_failure(init_rank, m, gpu_pivmask);
+        }
+        gamma_.assign(dim, t0);
+        // Host F_poly carries content only when a host consumer (oracle) needs it;
+        // otherwise t0+1 empty coefficients keep the Deg= bookkeeping unchanged.
+        if (cpu_init) F_poly = finit_cpu.F_poly;
+        else          F_poly.assign(t0 + 1, {});
+    } else {
+        t0 = init_cpu.t0;
+        init_rank = init_cpu.rank;
+        F_poly = finit_cpu.F_poly;
+        gamma_ = finit_cpu.gamma;
+    }
+    double t_init_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_init_start).count();
 
     LOG(LOG_STATS) << "[Basecase] Initialization: t0=" << t0 << ", Basis rank=" << m;
+    LOG(LOG_STATS) << "[Basecase] Init basis: path=" << (gpu_init ? "GPU" : "CPU")
+                   << (gpu_init && cpu_init ? " (+CPU cross-check)" : "")
+                   << ", t0=" << t0 << ", rank=" << init_rank
+                   << ", time=" << std::fixed << std::setprecision(3) << t_init_ms << " ms"
+                   << std::defaultfloat;
     
     // --- Hybrid GPU Setup ---
     // Double-buffer F and preallocated G for sync-free hot loop.
@@ -1866,11 +1811,13 @@ void BasecaseSolver::solve(const uint64_t* d_S, cudaStream_t stream) {
         CHECK_CUDA_BC(cudaMemset(d_F_buf[0], 0, max_F_bytes));
         CHECK_CUDA_BC(cudaMemset(d_F_buf[1], 0, max_F_bytes));
 
-        // Upload initial F into buffer 0
+        // Upload initial F into buffer 0 (CPU init only; the device path builds it below)
         std::vector<uint64_t> flat_host;
-        for(const auto& mat : F_poly) flat_host.insert(flat_host.end(), mat.begin(), mat.end());
-        CHECK_CUDA_BC(cudaMemcpyAsync(d_F_buf[0], flat_host.data(),
-            flat_host.size() * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+        if (!gpu_init) {
+            for(const auto& mat : F_poly) flat_host.insert(flat_host.end(), mat.begin(), mat.end());
+            CHECK_CUDA_BC(cudaMemcpyAsync(d_F_buf[0], flat_host.data(),
+                flat_host.size() * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+        }
 
         // Preallocate G buffer (reused every iteration for Tau * F product)
         size_t max_G_bytes = (size_t)(max_F_len - 1) * mat_stride * sizeof(uint64_t);
@@ -1885,8 +1832,75 @@ void BasecaseSolver::solve(const uint64_t* d_S, cudaStream_t stream) {
         CHECK_CUDA_BC(cudaMalloc(&d_Gamma, dim * sizeof(int)));
         CHECK_CUDA_BC(cudaMalloc(&d_Shifts, dim * sizeof(int)));
 
-        // Init Gamma on Device
-        CHECK_CUDA_BC(cudaMemcpyAsync(d_Gamma, gamma_.data(), dim * sizeof(int), cudaMemcpyHostToDevice, stream));
+        // Init F_init / Gamma on Device
+        if (gpu_init) {
+            // OR identity + monomials into the zeroed F[0..t0], gamma = t0. The stream-ordered
+            // memset of those t0+1 coefficients makes the kernel independent of the
+            // default-stream memset above (the loop stream may be non-blocking).
+            CHECK_CUDA_BC(cudaMemsetAsync(d_F_buf[0], 0, (size_t)(t0 + 1) * mat_stride * sizeof(uint64_t), stream));
+            launch_build_f_init_gpu(d_F_buf[0], d_Gamma, d_init_meta, d_init_pairs, m, n, stream);
+
+            if (config_.init_cross_check) {
+                // [InitCheck] device result vs CPU reference: t0, rank, pairs, F_init, gamma.
+                const size_t f_words = (size_t)(t0 + 1) * mat_stride;
+                const int n_pairs = (init_rank == m) ? m : 0;
+                std::vector<int> pairs_gpu((size_t)2 * n_pairs);
+                std::vector<uint64_t> f_gpu(f_words);
+                std::vector<int> gamma_gpu(dim);
+                if (n_pairs > 0)
+                    CHECK_CUDA_BC(cudaMemcpyAsync(pairs_gpu.data(), d_init_pairs, pairs_gpu.size() * sizeof(int),
+                                                  cudaMemcpyDeviceToHost, stream));
+                CHECK_CUDA_BC(cudaMemcpyAsync(f_gpu.data(), d_F_buf[0], f_words * sizeof(uint64_t),
+                                              cudaMemcpyDeviceToHost, stream));
+                CHECK_CUDA_BC(cudaMemcpyAsync(gamma_gpu.data(), d_Gamma, dim * sizeof(int),
+                                              cudaMemcpyDeviceToHost, stream));
+                CHECK_CUDA_BC(cudaStreamSynchronize(stream));
+
+                std::vector<uint64_t> f_cpu;
+                for (const auto& mat : finit_cpu.F_poly) f_cpu.insert(f_cpu.end(), mat.begin(), mat.end());
+
+                bool ok = true;
+                if (t0 != init_cpu.t0 || init_rank != init_cpu.rank) {
+                    LOG(LOG_ERROR_CRITICAL) << "[Basecase] [InitCheck] t0/rank MISMATCH: GPU t0=" << t0
+                                            << " rank=" << init_rank << " vs CPU t0=" << init_cpu.t0
+                                            << " rank=" << init_cpu.rank;
+                    ok = false;
+                }
+                if (ok && init_rank < m && gpu_pivmask != init_cpu.pivot_mask) {
+                    LOG(LOG_ERROR_CRITICAL) << "[Basecase] [InitCheck] pivot mask MISMATCH";
+                    ok = false;
+                }
+                if (ok && (size_t)n_pairs != init_cpu.pairs.size()) {
+                    LOG(LOG_ERROR_CRITICAL) << "[Basecase] [InitCheck] pair count MISMATCH: GPU " << n_pairs
+                                            << " vs CPU " << init_cpu.pairs.size();
+                    ok = false;
+                }
+                for (int k = 0; ok && k < n_pairs; ++k) {
+                    if (pairs_gpu[2 * k] != init_cpu.pairs[k].first ||
+                        pairs_gpu[2 * k + 1] != init_cpu.pairs[k].second) {
+                        LOG(LOG_ERROR_CRITICAL) << "[Basecase] [InitCheck] pair " << k << " MISMATCH: GPU ("
+                                                << pairs_gpu[2 * k] << ", " << pairs_gpu[2 * k + 1] << ") vs CPU ("
+                                                << init_cpu.pairs[k].first << ", " << init_cpu.pairs[k].second << ")";
+                        ok = false;
+                    }
+                }
+                if (ok && (f_cpu.size() != f_words ||
+                           std::memcmp(f_cpu.data(), f_gpu.data(), f_words * sizeof(uint64_t)) != 0)) {
+                    LOG(LOG_ERROR_CRITICAL) << "[Basecase] [InitCheck] F_init MISMATCH";
+                    ok = false;
+                }
+                if (ok && gamma_gpu != finit_cpu.gamma) {
+                    LOG(LOG_ERROR_CRITICAL) << "[Basecase] [InitCheck] gamma MISMATCH";
+                    ok = false;
+                }
+                if (!ok) throw std::runtime_error("Basecase InitCheck mismatch");
+                LOG(LOG_STATS) << "[Basecase] [InitCheck] GPU vs CPU init: MATCH (t0=" << t0
+                               << ", rank=" << init_rank << ", " << n_pairs << " pairs, "
+                               << f_words << " F words, gamma)";
+            }
+        } else {
+            CHECK_CUDA_BC(cudaMemcpyAsync(d_Gamma, gamma_.data(), dim * sizeof(int), cudaMemcpyHostToDevice, stream));
+        }
 
         LOG(LOG_DEBUG_1) << "[Basecase] Preallocated double-buffer F ("
                          << (2 * max_F_bytes / 1024) << " KiB) + G ("
@@ -1931,6 +1945,7 @@ void BasecaseSolver::solve(const uint64_t* d_S, cudaStream_t stream) {
             if (config_.internal_oracle_verification) {
      
                 // Validate Delta
+                require_S_host("the oracle");
                 delta_ref = compute_discrepancy(F_poly, S_host, t);
                 std::vector<uint64_t> delta_gpu(dim * ((m+63)/64));
                 cudaMemcpy(delta_gpu.data(), d_Delta, delta_gpu.size()*8, cudaMemcpyDeviceToHost);
@@ -2074,6 +2089,7 @@ void BasecaseSolver::solve(const uint64_t* d_S, cudaStream_t stream) {
         } else {
             // CPU ONLY Path
             // 1. Discrepancy (CPU)
+            require_S_host("the CPU-only path");
             auto delta = compute_discrepancy(F_poly, S_host, t);
             // 2. Elimination (CPU)
             step_res_host = compute_elimination_step(delta);
@@ -2136,6 +2152,9 @@ void BasecaseSolver::solve(const uint64_t* d_S, cudaStream_t stream) {
         CHECK_CUDA_BC(cudaFree(d_ReducedDelta));
         CHECK_CUDA_BC(cudaFree(d_Gamma));
         CHECK_CUDA_BC(cudaFree(d_Shifts));
+        if (d_init_meta)    CHECK_CUDA_BC(cudaFree(d_init_meta));
+        if (d_init_pairs)   CHECK_CUDA_BC(cudaFree(d_init_pairs));
+        if (d_init_pivmask) CHECK_CUDA_BC(cudaFree(d_init_pivmask));
     }    
     
     // Store result
@@ -2158,6 +2177,7 @@ void BasecaseSolver::solve(const uint64_t* d_S, cudaStream_t stream) {
         LOG(LOG_DEBUG_1) << "[Basecase] GPU Annihilation Verification SKIPPED.";
     }
     if (config_.check_annihilation_legacy) {
+        require_S_host("the legacy annihilation check");
         if (!check_annihilation_legacy(S_host, F_poly)) {
              LOG(LOG_ERROR_CRITICAL) << "[Basecase] Legacy Annihilation Verification Failed!";
         } else {

@@ -36,6 +36,21 @@
 namespace mpqs {
 namespace sieve {
 
+/*
+ * SCATTER (globalMetaSieve*Kernel) dynamic shared memory:
+ *   [ write heads: num_activeBucketsPerThreadBlock ints ]
+ *   [ Gray-step table: max(log2_polyBlockSize, 1) x num_threadsPerBlock uint32, 2*B_k mod p of each
+ *     thread's current prime, column-major by thread (see advanceRelRootsScatter, kernel.cu) ]
+ * Requires polyBlockSize and num_threadsPerBlock (hence log2_polyBlockSize) to be final.
+ */
+static inline uint32_t scatterSharedMemReq(const globalMetaSieveConfig& gms)
+{
+    // At least one table row: the batch kernel's trailing (discarded) Gray step reads row 0 even
+    // when polyBlockSize == 1.
+    return (gms.num_activeBucketsPerThreadBlock
+            + std::max(gms.log2_polyBlockSize, 1u) * gms.num_threadsPerBlock) * (uint32_t)sizeof(int);
+}
+
 DeviceSievingController::DeviceSievingController(int device, cudaStream_t stream)
     : device(device), stream(stream)
 {
@@ -2104,7 +2119,7 @@ void DeviceSievingController::loadStandardConfig()
     applyMetaCycleCap();  // A2: optional SCATTER cycle cap (no-op when meta_cycle_cap_ == 0)
     gms_conf.num_metaSieveCycles = gs_conf.num_sievingBlocksPerSieveCall/gms_conf.num_activeBlocksPerCycle;
     gms_conf.num_activeBucketsPerThreadBlock = gms_conf.num_activeBlocksPerCycle*gms_conf.polyBlockSize;
-    gms_conf.sharedMemReq = gms_conf.num_activeBucketsPerThreadBlock * sizeof(int);
+    gms_conf.sharedMemReq = scatterSharedMemReq(gms_conf);
 
     /* sieveAndScanConfig */
     ss_conf.num_threadsPerBlock = 256;
@@ -2357,7 +2372,7 @@ void DeviceSievingController::loadPartialCustomConfig(uint32_t totalPolys, uint3
     applyMetaCycleCap();  // A2: optional SCATTER cycle cap (no-op when meta_cycle_cap_ == 0)
     gms_conf.num_metaSieveCycles = gs_conf.num_sievingBlocksPerSieveCall/gms_conf.num_activeBlocksPerCycle;
     gms_conf.num_activeBucketsPerThreadBlock = gms_conf.num_activeBlocksPerCycle*gms_conf.polyBlockSize;
-    gms_conf.sharedMemReq = gms_conf.num_activeBucketsPerThreadBlock * sizeof(int);
+    gms_conf.sharedMemReq = scatterSharedMemReq(gms_conf);
 
     /* sieveAndScanConfig */
     ss_conf.num_threadsPerBlock = sasT;
@@ -2516,7 +2531,7 @@ void DeviceSievingController::loadPartialCustomConfigDynamic(const ParamSet& p)
     gms_conf.num_metaSieveCycles = gms_conf.num_activeBlocksPerCycle
         ? gs_conf.num_sievingBlocksPerSieveCall/gms_conf.num_activeBlocksPerCycle : 0;
     gms_conf.num_activeBucketsPerThreadBlock = gms_conf.num_activeBlocksPerCycle*gms_conf.polyBlockSize;
-    gms_conf.sharedMemReq = gms_conf.num_activeBucketsPerThreadBlock * sizeof(int);
+    gms_conf.sharedMemReq = scatterSharedMemReq(gms_conf);
 
     /* sieveAndScanConfig */
     set(P_SAS_BLOCK_DIM, ss_conf.num_threadsPerBlock);
@@ -2899,7 +2914,7 @@ bool DeviceSievingController::validateConfigs() {
     // kernel has a FIXED trip count and no `if (id < n)` guard, so under-coverage silently
     // drops polynomials (yield collapse) and over-coverage writes out of bounds.
     EQUAL_CHECK(gms_conf.num_polyBlocksPerThreadBlock*gms_conf.polyBlockSize*gms_conf.num_threadBlocks, gs_conf.num_polysPerSieveCall, validFlag);
-    EQUAL_CHECK(gms_conf.sharedMemReq, (gms_conf.num_activeBucketsPerThreadBlock * sizeof(int)), validFlag);
+    EQUAL_CHECK(gms_conf.sharedMemReq, scatterSharedMemReq(gms_conf), validFlag);
     // Width-aware: accumElemBytes() is 2 for the uint16 wide path, 1 for narrow AND the
     // saturating-uint8 wide path. The narrow path RHS is byte-identical to before.
     const size_t expected_ss_sharedMemReq =

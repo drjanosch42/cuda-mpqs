@@ -267,8 +267,10 @@ void KrylovSequenceGenerator::generate(
     const std::vector<uint64_t>& h_Z,
     std::vector<uint64_t>& out_seq,
     cudaStream_t user_stream, // Unused, we use internal streams
-    uint64_t* d_S_target
+    uint64_t* d_S_target,
+    bool host_copy
 ) {
+    host_copy |= (d_S_target == nullptr);   // S must land somewhere
     LOG(LOG_STATS) << "[KrylovGen] Generating " << length << " terms (Pipeline Batch=" << batch_size_ << ")...";
 
     // 1. Initial Uploads
@@ -282,7 +284,12 @@ void KrylovSequenceGenerator::generate(
     
     // Resize Output (use output layout — transposed or native)
     size_t s_words = s_output_mat_bytes_ / sizeof(uint64_t);
-    out_seq.resize(length * s_words);
+    if (host_copy) {
+        out_seq.resize(length * s_words);
+    } else {
+        out_seq.clear();
+        out_seq.shrink_to_fit();
+    }
 
     // Initial sync to ensure setup is done
     CHECK_CUDA(cudaStreamSynchronize(compute_stream_));
@@ -298,7 +305,8 @@ void KrylovSequenceGenerator::generate(
 
         // --- Stream 0: COMPUTE ---
         // Wait until previous Copy on this buffer is done
-        if (batch_idx >= 2) {
+        // (Without the host copy, buffer reuse is ordered by compute_stream_ alone.)
+        if (host_copy && batch_idx >= 2) {
              CHECK_CUDA(cudaStreamWaitEvent(compute_stream_, copy_done_[buf_idx], 0));
         }
 
@@ -415,6 +423,13 @@ void KrylovSequenceGenerator::generate(
                 compute_stream_));
         }
 
+        if (!host_copy) {
+            if (batch_idx % 2 == 0) {
+                LOG(LOG_DEBUG_2) << "[KrylovGen] Batch " << batch_idx << "/" << total_batches;
+            }
+            continue;
+        }
+
         // Record Compute Done
         CHECK_CUDA(cudaEventRecord(compute_done_[buf_idx], compute_stream_));
 
@@ -454,6 +469,16 @@ void KrylovSequenceGenerator::generate(
         if (batch_idx % 2 == 0) {
              LOG(LOG_DEBUG_2) << "[KrylovGen] Batch " << batch_idx << "/" << total_batches;
         }
+    }
+
+    if (!host_copy) {
+        // Mandatory: the D2D copies into d_S_target run on compute_stream_, which the
+        // caller's stream does not cover; without the copy-event syncs this is the
+        // only point that completes S before Stage 2 reads it.
+        CHECK_CUDA(cudaStreamSynchronize(compute_stream_));
+        LOG(LOG_DEBUG_1) << "[KrylovGen] S kept on device only (no host copy).";
+        LOG(LOG_STATS) << "[KrylovGen] Generation complete.";
+        return;
     }
 
     // Flush last batch

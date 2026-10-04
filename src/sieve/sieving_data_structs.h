@@ -51,6 +51,11 @@ struct primeDataSIQS {
      */
     uint32_t inactive;
 
+    /// sieveIntervalStart mod p, in [0, p). Written once per 'a' by initPrimeDataBatchKernel /
+    /// initPrimeDataKernel and read by globalMetaSieveBatchKernel / globalMetaSieveKernel (meta-cycle 0)
+    /// instead of recomputing ((start % p) + p) % p per prime and poly block.
+    uint32_t reducedStart;
+
     // NOTE: The per-prime Gray-code update values B_values[k] = (b_k * a^-1) mod p
     // were REMOVED from this struct and moved to a separate device array
     // (devicePointers::dev_primeBValues), column-major [k*fb_size + primeIndex],

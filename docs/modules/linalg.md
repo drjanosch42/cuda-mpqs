@@ -31,6 +31,7 @@ src/linalg/
 │   │   ├── basecase_solver.cu/.h          # GPU/CPU hybrid Block Berlekamp-Massey
 │   │   ├── basecase_solver_reference.cu/.h # CPU reference implementation
 │   │   ├── basecase_ops.cu/.h             # Basecase helper operations
+│   │   ├── init_basis.cu/.h               # Initialization basis + F_init (CPU reference + device kernels)
 │   │   └── device_poly.h                  # Device-side polynomial types
 │   └── stage3/
 │       └── solution_reconstructor.cu/.h   # Kernel vector reconstruction
@@ -63,6 +64,10 @@ Computes the sequence S_k = X^T · B^(k+1) · Z for k = 0..L-1, where B is A or 
 ### Stage 2: Block Berlekamp-Massey (Lingen)
 
 Finds generator polynomial Pi(x) in F_2[x]^((m+n) × (m+n)) such that S(x) · Pi(x) ≡ 0 mod x^L. Coppersmith/Thomé basecase algorithm on (m+n) × (m+n) dense matrices over GF(2). The submodule default is the CPU reference (`stage2_gpu_mode = false`); hybrid GPU mode (`stage2_gpu_mode = true`, which the parent orchestrator always sets) offloads discrepancy computation and elimination to the GPU while pivot decisions remain CPU-resident. Receives S directly from Stage 1 device buffer (zero-copy) or loads from disk (`stage2_load_S_from_disk`). Verification options: GPU and CPU annihilation checks, step-by-step oracle verification, post-run legacy comparison. The `k_eliminationN` fallback kernel (512 threads vs. 1024 for the primary `k_elimination`) is selected automatically via `cudaOccupancyMaxActiveBlocksPerMultiprocessor` on GPUs with insufficient register pressure.
+
+**Initialization basis on the device (block-wiedemann 1.0.2, cuda-mpqs 1.0.8).** The Coppersmith/Thomé start — scan the columns S_i[:, j] in strict (i, j) order, accept every column independent of the accepted ones, stop at rank m ⇒ `t0` and the m pairs (i_k, j_k); F_init = identity on the top n rows plus x^(t0−i_k) at (n+k, j_k), gamma = t0 — was the last CPU step of Stage 2 and forced a full download of S. In GPU mode it now runs on the device (`src/lingen/stage2/init_basis.cu`): `k_find_init_basis<MW>` (one warp, m ≤ 512) keeps a fully reduced (Gauss-Jordan) basis in shared memory and scans `d_S` in place; `k_build_f_init` writes F_init / gamma straight into `d_F_buf[0]` / `d_Gamma`; only a 16-byte record {t0, rank, status} returns. The kernel doc comment proves that its reduced candidate equals the CPU echelon reduction bit for bit, so t0, rank, the pairs (in order), F_init, gamma and the rank-failure path (t0 = 0, identity F, the same two `Rank condition failed!` / `Missing pivot indices` lines) are identical to the CPU routine. Log: `[Basecase] Initialization: t0=…, Basis rank=…` is unchanged; `[Basecase] Init basis: path=GPU|CPU, t0=, rank=, time= ms` follows. Config: `stage2_init_on_gpu` (default true), `stage2_init_cross_check` (default false; implied by the Stage 2 oracle) — orchestrator flags `--bw_init_cpu` / `--bw_init_verify` (below). Test: `ctest -R bw_init_basis` (`src/linalg/tests/test_init_basis_gpu.cu`).
+
+**S host copies are consumer-gated (same release).** Stage 2 downloads S only for a host consumer (CPU-only mode, CPU init or its cross-check, per-step oracle, legacy annihilation check), as one bulk copy. Stage 1 makes its host copy `hS_` only when S is not kept on the device, saved to disk, hashed, or checkpointed (`--bw_checkpoint_dir` ⇒ ON), or under the debug override `stage1_force_host_S`; it logs `[BWStage 1] S host copy: ON (reasons) / OFF (no consumer)`. With the copy off the generator synchronizes its compute stream before returning (the D2D copies into `d_S_sequence_` are otherwise unordered against the solver stream). The post-run legacy oracle copies S device-to-device. At the parent defaults (no checkpoint dir) S therefore never reaches the host. The Stage 1 S disk write stays synchronous — making it asynchronous is a noted follow-up.
 
 ### Stage 3: Solution Reconstruction
 
@@ -102,13 +107,13 @@ Single source of truth. Field naming convention: no prefix = invariant, `autotun
 | AutoTune (GPU pipeline) | `autotune_gpu_only`, `autotune_m4rm_rows`, `autotune_skip_m4rm_benchmark`, `autotune_block_growth` (FIXED/EXPONENTIAL) | true, 8, false, EXPONENTIAL |
 | AutoTune (block sizes) | `autotune_initial_block_size`, `autotune_max_block_size` | 8, 65536 |
 | AutoTune (per-format) | `autotune_enable_tiled_coo`, `autotune_enable_delta16`, `autotune_enable_pfor_be`, `autotune_enable_golomb` | true, true, true, true (but Golomb disabled in GPUAutoTuner::Config) |
-| Stage 1 | `stage1_skip`, `stage1_seq_len`, `stage1_gpu_batch_size`, `stage1_prefer_faster_op`, `stage1_keep_S_on_device`, `stage1_save_S_to_disk` | false, 0 (auto), 64, true, true, false |
+| Stage 1 | `stage1_skip`, `stage1_seq_len`, `stage1_gpu_batch_size`, `stage1_prefer_faster_op`, `stage1_keep_S_on_device`, `stage1_save_S_to_disk`, `stage1_force_host_S` | false, 0 (auto), 64, true, true, false, false |
 | Stage 1 I/O | checkpoints (load/save), hash validation, file suffixes | load=true, save=false, hashing=false |
-| Stage 2 | `stage2_skip`, `stage2_seq_len`, `stage2_delta`, `stage2_gpu_mode`, `stage2_load_S_from_disk` | false, 0, 0 (auto: L/2), false, false |
+| Stage 2 | `stage2_skip`, `stage2_seq_len`, `stage2_delta`, `stage2_gpu_mode`, `stage2_load_S_from_disk`, `stage2_init_on_gpu`, `stage2_init_cross_check` | false, 0, 0 (auto: L/2), false, false, true, false |
 | Stage 2 verification | annihilation checks (GPU/legacy), oracle verification, post-run legacy check | all false |
 | Stage 3 | `stage3_skip`, `stage3_batch_mode`, `stage3_max_solutions`, `stage3_perform_unpermutation`, `stage3_history_depth`, `stage3_check_interval`, `stage3_stripping_limit` | false, true, -1 (all), true, 64, 16, 0 (heuristic) |
 
-**Parent project overrides** (`MPQSOrchestrator::LinearAlgebraStage()`, `src/orchestrator/orchestrator.cpp:6883-6941`): `m_block = n_block = 256` from `--bw_m`/`--bw_n` (submodule default: 64), adaptively downscaled to 64 (matrix dim < 4000) or 128 (dim < 16000) when neither flag is pinned (`block_size_pinned` records CLI pinning); `stage2_gpu_mode = true`; `solve_transposed = true`; `stage1_gpu_batch_size = 8`; `autotune_tune_spmm = false` when matrix dim < 100000 (autotune overhead dominates); `checkpoint_prefix = <work_dir>/bw`; `stage3_save_solutions = true` under `--dump_kernel_vectors`.
+**Parent project overrides** (`MPQSOrchestrator::LinearAlgebraStage()`, `src/orchestrator/orchestrator.cpp:6883-6941`): `m_block = n_block = 256` from `--bw_m`/`--bw_n` (submodule default: 64), adaptively downscaled to 64 (matrix dim < 4000) or 128 (dim < 16000) when neither flag is pinned (`block_size_pinned` records CLI pinning); `stage2_gpu_mode = true`; `stage2_init_on_gpu = !--bw_init_cpu`, `stage2_init_cross_check = --bw_init_verify`; `solve_transposed = true`; `stage1_gpu_batch_size = 8`; `autotune_tune_spmm = false` when matrix dim < 100000 (autotune overhead dominates); `checkpoint_prefix = <work_dir>/bw`; `stage3_save_solutions = true` under `--dump_kernel_vectors`.
 
 **Note on the Stage 1 I/O row above:** the submodule's own default is `stage1_load_checkpoints = true` (`stage2_load_checkpoints`/`stage3_load_checkpoints` default `false`), but as of the `--bw_checkpoint_dir`/`--bw_resume` wiring (`orchestrator.cpp:6894-6907`) the parent now forces **all three** (`stage1/2/3_load_checkpoints`) to `false` unless `--bw_resume` is explicitly passed — this closes a latent hazard where a default work-dir checkpoint prefix plus the submodule's own `load=true` default could silently consume a stale/partial checkpoint. So in the shipped pipeline, loading never happens implicitly; see below.
 
@@ -121,6 +126,8 @@ Three orchestrator-level flags (parsed `tests/cuda-mpqs.cpp:926-945`, wired `src
 | `--bw_max_solutions <N>` | `bw_max_solutions` (int32) | `-1` (ALL) | Stop BW Stage-3 reconstruction after `N` solutions; wires the submodule's pre-existing `stage3_max_solutions`. A solution-**count** stop, not a batch-count cap — reconstruction batches (`ceil((m+n)/n)`) run regardless of `N`; this only limits how many candidate columns are converted to solutions. |
 | `--bw_checkpoint_dir <path>` | `bw_checkpoint_dir` (string) | `""` (off) | Save Krylov S-sequence / lingen Π-polynomial / final solutions at stage boundaries under `<path>/bw*`. Sets `checkpoint_prefix` and enables the save flags for all three stages. |
 | `--bw_resume` | `bw_resume` (bool) | `false` | Load previously-completed-stage artifacts from `--bw_checkpoint_dir` and skip them. Without this flag, `--bw_checkpoint_dir` alone only **saves** — it never loads (see the note above). |
+| `--bw_init_cpu` | `bw_init_cpu` (bool) | `false` | Stage 2 initialization basis on the CPU reference routine (`stage2_init_on_gpu = false`); downloads S. Bit-identical output. |
+| `--bw_init_verify` | `bw_init_verify` (bool) | `false` | Run the device and the CPU initialization and compare t0, rank, pairs, F_init and gamma (`stage2_init_cross_check`); aborts with `Basecase InitCheck mismatch` on divergence, logs `[Basecase] [InitCheck] GPU vs CPU init: MATCH` otherwise; downloads S. |
 
 **Scope — stage boundaries only:** resumes from the last **completed** stage, not mid-stage — a crash partway through a multi-hour Stage-3 reconstruction still restarts Stage 3 from scratch; it only saves re-running Stage 1 and/or Stage 2 if those had already finished. Integrity is checked via an FNV-1a `_ckpt_tag.bin` hash on load (mismatch → recompute, never load stale data).
 
@@ -260,7 +267,7 @@ Vector width templated via `VecType<BITS>` (32, 64, 128, 256, 512 bits). SpMM tu
 | `BwOperatorA` / `BwOperatorAT` | Concrete B = A and B = A^T operators |
 | `BwOperatorColAtA` / `BwOperatorRowAAt` | Operators B = P^T A^T A P and B = A A^T for rectangular matrices |
 | `KrylovSequenceGenerator` | Stage 1: double-buffered Krylov pipeline |
-| `BasecaseSolver` | Stage 2: CPU/GPU hybrid Block BM (default: CPU reference) |
+| `BasecaseSolver` | Stage 2: CPU/GPU hybrid Block BM (default: CPU reference); initialization basis on the device in GPU mode (`init_basis.h`) |
 | `BasecaseSolverReference` | Stage 2: independent CPU reference for post-run verification |
 | `SolutionReconstructor` | Stage 3: batch kernel vector reconstruction with backtracking |
 | `BlockWiedemannSpMM` | SpMM lifecycle: permute, preprocess, tune, execute for A and A^T |

@@ -88,6 +88,8 @@ Full Block Wiedemann pipeline benchmark. Generates a random sparse matrix and ru
 | `--s2_sequence_length <N>` | int  | 0 (auto) | Input sequence length to consume |
 | `--s2_delta <N>`           | int  | 0 (auto) | Explicit degree bound delta |
 | `--s2_cpu_mode`            | bool |    false | Force CPU-only basecase (disable GPU default) |
+| `--s2_init_cpu`            | bool |    false | Initialization basis (t0, pairs, F_init, gamma) on the CPU reference path; downloads S |
+| `--s2_init_verify`         | bool |    false | Run the device and CPU initialization and abort on any mismatch (t0, rank, pairs, F_init, gamma); downloads S |
 | `--s2_verify_gpu`          | bool |    false | Enable GPU annihilation check |
 | `--s2_verify_legacy`       | bool |    false | Enable slow CPU legacy annihilation check |
 | `--s2_post_run_legacy`     | bool |    false | Run full legacy solver after main run for comparison |

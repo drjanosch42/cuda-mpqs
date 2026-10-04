@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include "lingen/types.h"
 #include "bw_solver.h"
+#include "lingen/stage2/init_basis.h"
 
 namespace lingen {
 namespace stage2 {
@@ -98,18 +99,15 @@ private:
                             
     void log_matrix_snippet(const std::string& label, const std::vector<uint64_t>& mat, int rows, int cols, int r_lim=4, int c_lim=4);
 
-    // --- General Initialization Helpers ---
-    struct InitResult {
-        int t0;
-        std::vector<std::pair<int, int>> basis_pairs;
-    };
+    // --- General Initialization Helpers (CPU reference; see init_basis.h) ---
+    using InitResult = InitBasisResult;
 
     struct FInitResult {
         std::vector<std::vector<uint64_t>> F_poly;
         std::vector<int> gamma;
     };
 
-  InitResult find_initialization_basis(const std::vector<std::vector<uint64_t>>& S_host);
+    InitResult find_initialization_basis(const std::vector<std::vector<uint64_t>>& S_host);
     FInitResult build_f_init(const InitResult& init);
 
     // --- General Discrepancy computation ---

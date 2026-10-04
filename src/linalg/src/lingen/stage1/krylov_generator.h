@@ -38,6 +38,14 @@ public:
 
     /**
      * @brief Execute the generation loop.
+     *
+     * @param out_seq     host copy of S (length coefficients), filled iff host_copy.
+     * @param d_S_target  optional device destination of S (D2D per batch).
+     * @param host_copy   download S into out_seq through the pinned double buffer on
+     *                    copy_stream_. Forced true when d_S_target is null. When false,
+     *                    out_seq is cleared, no D2H is issued, and the call ends with
+     *                    cudaStreamSynchronize(compute_stream_) so that d_S_target is
+     *                    complete on return (the copy-event waits no longer imply it).
      */
     void generate(
         int length,
@@ -45,7 +53,8 @@ public:
         const std::vector<uint64_t>& h_Z,
         std::vector<uint64_t>& out_seq,
         cudaStream_t stream = 0,
-        uint64_t* d_S_target = nullptr
+        uint64_t* d_S_target = nullptr,
+        bool host_copy = true
     );
 
 private:

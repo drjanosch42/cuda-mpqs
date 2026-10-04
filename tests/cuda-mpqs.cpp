@@ -313,6 +313,8 @@ void print_usage(const char* prog_name) {
               << "  --bw_max_solutions <N> Stop BW reconstruction after N solutions; -1 = ALL [Default: -1]\n"
               << "  --bw_checkpoint_dir <path> Save BW stage outputs (S/Pi/solutions) under path for resume [Default: off]\n"
               << "  --bw_resume      Load BW stage checkpoints from --bw_checkpoint_dir and resume [Default: off]\n"
+              << "  --bw_init_cpu    Stage-2 init basis on CPU (reference/oracle path; downloads S) [Default: device]\n"
+              << "  --bw_init_verify Run device and CPU Stage-2 init, abort on mismatch; downloads S [Default: off]\n"
             #ifdef SIEVING_DEBUG_FLAG
               << "\n--- Debug (SIEVING_DEBUG_MODE) ---\n"
               << "  --metaSnapshot <k> Snapshot of metaSieve buckets at step k\n"
@@ -984,6 +986,14 @@ ParsedArgs parse_args(int argc, char** argv) {
         else if (arg == "--bw_resume") {
             args.config.bw_resume = true;
             args.mark("bw_resume");
+        }
+        else if (arg == "--bw_init_cpu") {
+            args.config.bw_init_cpu = true;
+            args.mark("bw_init_cpu");
+        }
+        else if (arg == "--bw_init_verify") {
+            args.config.bw_init_verify = true;
+            args.mark("bw_init_verify");
         }
 
         #ifdef SIEVING_DEBUG_FLAG
